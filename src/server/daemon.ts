@@ -7,9 +7,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { homedir } from "node:os";
 import { initBridge, send, shutdownBridge } from "./bridge.js";
 import type { BridgeAction } from "../shared/protocol.js";
+
+export { getDaemonPaths } from "../shared/daemonPaths.js";
+export type { DaemonPaths } from "../shared/daemonPaths.js";
+import { getDaemonPaths } from "../shared/daemonPaths.js";
 
 interface RequestMessage {
   id: string;
@@ -23,21 +26,10 @@ const readyPromise: Promise<void> = new Promise((resolve) => {
   resolveReady = resolve;
 });
 
-export interface DaemonPaths {
-  socketPath: string;
-  pidPath: string;
-}
-
-export function getDaemonPaths(): DaemonPaths {
-  const runtimeDir = process.env.XDG_RUNTIME_DIR;
-  const base = runtimeDir
-    ? `${runtimeDir}/ai-browser`
-    : `${homedir()}/.cache/ai-browser`;
-  return {
-    socketPath: `${base}/daemon.sock`,
-    pidPath: `${base}/daemon.pid`,
-  };
-}
+// Track all accepted client sockets so shutdown can explicitly close them.
+// Without this, attached MCP bridges can keep writing to a stale socket
+// during the brief window between server.close() and process exit.
+const liveSockets = new Set<Socket>();
 
 export function isProcessAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
@@ -186,6 +178,18 @@ export async function runDaemon(): Promise<void> {
     shuttingDown = true;
     console.error(`[daemon] shutting down (${signal})`);
     server.close();
+    // End every accepted client socket so attached bridges (e.g. MCP daemon
+    // mode) immediately observe a clean close instead of writing into a
+    // stale FD during process teardown.
+    for (const sock of liveSockets) {
+      try {
+        sock.end();
+        sock.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+    liveSockets.clear();
     try {
       await shutdownBridge();
     } catch (err) {
@@ -211,6 +215,7 @@ export async function runDaemon(): Promise<void> {
 }
 
 function handleConnection(socket: Socket): void {
+  liveSockets.add(socket);
   let buffer = "";
   socket.setEncoding("utf8");
 
@@ -227,6 +232,10 @@ function handleConnection(socket: Socket): void {
 
   socket.on("error", (err) => {
     console.error("[daemon] socket error:", err.message);
+  });
+
+  socket.on("close", () => {
+    liveSockets.delete(socket);
   });
 }
 

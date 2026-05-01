@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { send } from "../bridge.js";
-import { getSecretStore, redact } from "../secrets.js";
+import { redact, type SecretRecord } from "../secrets.js";
 import { parseCsv } from "../utils/csv.js";
 import {
   createBridgeTextResult,
@@ -10,9 +10,22 @@ import {
   createTextResult,
 } from "./toolResult.js";
 
-export function registerSecretTools(server: McpServer): void {
-  const secrets = getSecretStore();
+async function putSecret(value: string, label?: string): Promise<SecretRecord> {
+  const res = await send("secrets.put", { value, label });
+  if (!res.success) {
+    throw new Error(res.error ?? "secrets.put failed");
+  }
+  return res.data as SecretRecord;
+}
 
+async function deleteSecret(id: string): Promise<void> {
+  const res = await send("secrets.delete", { id });
+  if (!res.success) {
+    throw new Error(res.error ?? "secrets.delete failed");
+  }
+}
+
+export function registerSecretTools(server: McpServer): void {
   server.tool(
     "secret_store_put",
     "Store a sensitive value and return a secret handle that can be used later without exposing the plaintext again.",
@@ -21,7 +34,7 @@ export function registerSecretTools(server: McpServer): void {
       label: z.string().optional().describe("Optional label for auditing"),
     },
     async ({ value, label }) => {
-      const record = await secrets.put(value, label);
+      const record = await putSecret(value, label);
       return createTextResult({
         text: JSON.stringify({
           secretId: record.id,
@@ -40,7 +53,7 @@ export function registerSecretTools(server: McpServer): void {
       secretId: z.string().describe("Secret handle to delete"),
     },
     async ({ secretId }) => {
-      await secrets.delete(secretId);
+      await deleteSecret(secretId);
       return createTextResult({ text: "Secret deleted" });
     }
   );
@@ -148,7 +161,7 @@ export function registerSecretTools(server: McpServer): void {
           .map((key) => String(record[key] ?? "").trim())
           .filter(Boolean)
           .join(" | ");
-        const secret = await secrets.put(value, label || undefined);
+        const secret = await putSecret(value, label || undefined);
         imported.push({
           row: index + 2,
           secretId: secret.id,

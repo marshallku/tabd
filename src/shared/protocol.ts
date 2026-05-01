@@ -42,6 +42,8 @@ export type BridgeAction =
   | "monitor.consoleLogs"
   | "monitor.pageErrors"
   | "monitor.networkLogs"
+  | "secrets.put"
+  | "secrets.delete"
   | "wait.networkIdle"
   | "capture.metrics"
   | "capture.highlight"

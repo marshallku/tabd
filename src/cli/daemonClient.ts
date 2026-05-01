@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
-import { getDaemonPaths } from "../server/daemon.js";
+import { getDaemonPaths } from "../shared/daemonPaths.js";
 import type { BridgeAction, BridgeResponse } from "../shared/protocol.js";
 
 interface RequestMessage {
@@ -17,6 +17,7 @@ interface RequestMessage {
 export interface DaemonClient {
   send(action: string, params?: Record<string, unknown>): Promise<BridgeResponse>;
   close(): void;
+  isClosed(): boolean;
 }
 
 export interface PingResult {
@@ -96,6 +97,7 @@ export async function connectClient(
 
   socket.setEncoding("utf8");
   let buffer = "";
+  let closed = false;
   const pending = new Map<string, (res: BridgeResponse) => void>();
 
   socket.on("data", (chunk: string) => {
@@ -121,14 +123,25 @@ export async function connectClient(
   });
 
   socket.on("close", () => {
+    closed = true;
     for (const handler of pending.values()) {
       handler({ id: "", success: false, error: "daemon connection closed" });
     }
     pending.clear();
   });
+  socket.on("error", () => {
+    closed = true;
+  });
 
   return {
     send(action, params) {
+      if (closed) {
+        return Promise.resolve({
+          id: "",
+          success: false,
+          error: "daemon connection closed",
+        });
+      }
       const id = randomUUID();
       const payload: RequestMessage = {
         id,
@@ -139,6 +152,9 @@ export async function connectClient(
         pending.set(id, resolveOk);
         socket.write(JSON.stringify(payload) + "\n");
       });
+    },
+    isClosed() {
+      return closed;
     },
     close() {
       socket.end();

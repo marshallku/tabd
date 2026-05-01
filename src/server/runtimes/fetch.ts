@@ -153,6 +153,10 @@ export class FetchBrowserDriver implements BrowserDriver {
       case "dialog.setBehavior":
       case "dialog.getLast":
         return this.unsupported("Dialogs require a browser runtime");
+      case "secrets.put":
+      case "secrets.delete":
+        // Handled in bridge layer, never reaches the driver.
+        return this.unsupported("secrets actions are handled by the bridge");
       default:
         return this.unsupported(
           `Unsupported action: ${action satisfies never}`

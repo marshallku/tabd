@@ -248,6 +248,10 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
         return this.getPageErrors(params);
       case "monitor.networkLogs":
         return this.getNetworkLogs(params);
+      case "secrets.put":
+      case "secrets.delete":
+        // Handled in bridge layer, never reaches the driver.
+        throw new Error(`secrets actions are handled by the bridge`);
       default:
         throw new Error(`Unsupported action: ${action satisfies never}`);
     }
