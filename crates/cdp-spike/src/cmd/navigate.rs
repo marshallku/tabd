@@ -1,5 +1,8 @@
 use anyhow::Result;
 
-pub async fn run(_url: &str, _timeout_ms: u64) -> Result<()> {
-    anyhow::bail!("cmd::navigate — not implemented (task #17)")
+use super::page;
+
+pub async fn run(url: &str, timeout_ms: u64) -> Result<()> {
+    let (browser, client) = page::open(url, timeout_ms).await?;
+    page::teardown(browser, client).await
 }
