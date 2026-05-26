@@ -96,6 +96,8 @@ Run `ai-browser help` for the full subcommand list. See [CLI section](#cli) belo
 
 ## Setup
 
+Full step-by-step instructions (system requirements, platform prerequisites, MCP client wiring, verification, upgrade/uninstall, troubleshooting) live in [`INSTALL.md`](INSTALL.md). The summary below covers the common path.
+
 ### Quick install (recommended)
 
 After cloning, one script handles npm install → Playwright Chromium → build → MCP config patch:
