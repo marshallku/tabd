@@ -8,9 +8,11 @@ import {
 import { runDaemon, getDaemonPaths, isProcessAlive } from "../server/daemon.js";
 import { runRepl } from "./repl.js";
 import type { BridgeAction, BridgeResponse } from "../shared/protocol.js";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 
 interface SubcommandSpec {
   action: BridgeAction;
@@ -289,11 +291,13 @@ function printHelp(): void {
   console.log("  ai-browser mcp                 (run MCP server on stdio)");
   console.log("");
   console.log("Subcommands:");
-  const names = [...Object.keys(SUBCOMMANDS), "secret-put"].sort();
+  const names = [...Object.keys(SUBCOMMANDS), "secret-put", "run-once"].sort();
   const maxLen = Math.max(...names.map((n) => n.length));
   const customDescriptions: Record<string, string> = {
     "secret-put":
       "Store a secret from --from-env/--from-file/--stdin (never argv)",
+    "run-once":
+      "Run one subcommand in an ephemeral daemon (isolated from main daemon)",
   };
   for (const name of names) {
     const desc =
@@ -377,6 +381,69 @@ async function handleSecretPut(rest: string[]): Promise<number> {
     client.send("secrets.put", { value, label })
   );
   return renderResult(result, parsed);
+}
+
+// Subcommands that run-once must refuse to wrap. Wrapping daemon/run-once
+// itself would recurse or break the cleanup contract; mcp/repl/help are
+// long-running surfaces that are nonsensical inside an ephemeral daemon.
+const RUN_ONCE_BLOCKED = new Set([
+  "daemon",
+  "run-once",
+  "mcp",
+  "repl",
+  "help",
+  "-h",
+  "--help",
+]);
+
+async function handleRunOnce(rest: string[]): Promise<number> {
+  if (rest.length === 0) {
+    console.error(
+      "run-once: requires a subcommand. Example: ai-browser run-once navigate https://example.com"
+    );
+    return 2;
+  }
+  const subcmd = rest[0];
+  if (RUN_ONCE_BLOCKED.has(subcmd)) {
+    console.error(
+      `run-once: refusing to wrap meta command '${subcmd}' (would recurse or contradict the ephemeral lifecycle)`
+    );
+    return 2;
+  }
+
+  // Isolate this invocation in a fresh socket/pid directory so it never
+  // collides with a long-running user daemon. AI_BROWSER_BASE_DIR is read
+  // by getDaemonPaths for both client connect and daemon spawn.
+  const baseDir = mkdtempSync(pathJoin(tmpdir(), "ai-browser-once-"));
+  const previousBase = process.env.AI_BROWSER_BASE_DIR;
+  process.env.AI_BROWSER_BASE_DIR = baseDir;
+
+  let exitCode: number;
+  try {
+    // Reuse the normal CLI dispatch — ensureDaemon will see no live daemon
+    // at this isolated path and spawn a fresh one for the call.
+    exitCode = await runCli(rest);
+  } finally {
+    // Stop the ephemeral daemon best-effort, then restore env and
+    // tear down the temp directory. The daemon's own cleanup unlinks
+    // the socket/pid files, but rmSync sweeps anything else.
+    try {
+      await runCli(["daemon", "stop"]);
+    } catch {
+      /* best-effort */
+    }
+    if (previousBase === undefined) {
+      delete process.env.AI_BROWSER_BASE_DIR;
+    } else {
+      process.env.AI_BROWSER_BASE_DIR = previousBase;
+    }
+    try {
+      rmSync(baseDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+  return exitCode;
 }
 
 async function handleDaemon(rest: string[]): Promise<number> {
@@ -564,6 +631,7 @@ export async function runCli(argv: string[]): Promise<number> {
     return 0;
   }
   if (cmd === "secret-put") return handleSecretPut(rest);
+  if (cmd === "run-once") return handleRunOnce(rest);
   const spec = SUBCOMMANDS[cmd];
   if (!spec) {
     console.error(`unknown subcommand: ${cmd}`);
