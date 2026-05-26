@@ -155,7 +155,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 9. `Page.enable`, `Runtime.enable`
 10. `Page.navigate {url}` → response의 frameId 기억
 11. `document.readyState` 폴링 (200ms, `interactive` 또는 `complete`까지)
-    - `Page.loadEventFired` 이벤트는 보조 신호로 listen만 함
+    - (`Page.loadEventFired` 이벤트는 spike scope에서 생략 — readyState 폴링만으로 충분)
 12. `Runtime.evaluate { expression, returnByValue: true }` —
     `expression` 은 `format!("(document.querySelector({})?.textContent) ?? ''", serde_json::to_string(&selector)?)`
     로 안전 임베드 (codex C3). 따옴표/백슬래시/유니코드 selector도 깨지지 않음
