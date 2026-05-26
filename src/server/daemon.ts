@@ -204,7 +204,7 @@ export async function runDaemon(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGHUP", () => void shutdown("SIGHUP"));
 
-  await initBridge();
+  await initBridge({ role: { kind: "host" } });
   bridgeReady = true;
   resolveReady();
   console.error("[daemon] browser runtime initialized");

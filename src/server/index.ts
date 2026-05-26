@@ -1,26 +1,19 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createMcpServer } from "./mcpServer.js";
-import { initBridge, shutdownBridge, type BridgeMode } from "./bridge.js";
-
-function resolveMode(): BridgeMode {
-  const raw = (process.env.AI_BROWSER_MCP_MODE ?? "").toLowerCase();
-  if (raw === "daemon") return "daemon";
-  if (raw === "standalone" || raw === "") return "standalone";
-  console.error(
-    `[mcp] unknown AI_BROWSER_MCP_MODE='${raw}', falling back to standalone`
-  );
-  return "standalone";
-}
+import { initBridge, shutdownBridge } from "./bridge.js";
 
 async function main(): Promise<void> {
-  const mode = resolveMode();
-  await initBridge({ mode });
+  // MCP entry is always a thin client of the shared daemon. Standalone mode
+  // (driver in the MCP process) is no longer offered — all MCP/CLI/AI clients
+  // share one Chromium so logins, cookies, and secrets are reusable across
+  // tools without coordination.
+  await initBridge({ role: { kind: "client" } });
 
   const mcpServer = createMcpServer();
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
 
-  console.error(`[mcp] AI Browser MCP server running (mode=${mode})`);
+  console.error(`[mcp] AI Browser MCP server running (attached to daemon)`);
 
   const shutdown = async (): Promise<void> => {
     console.error("[mcp] Shutting down...");

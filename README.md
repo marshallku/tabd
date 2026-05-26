@@ -61,7 +61,7 @@ AI Browser MCP Server
 
 ## Two ways to use it
 
-**As an MCP server (for AI agents)** — default. Claude Code / Codex / etc. invoke `ai-browser` (no args) on stdio and call tools. By default each MCP session owns its own browser instance. Pass `--daemon` (or set `AI_BROWSER_MCP_MODE=daemon`) to attach to the shared daemon instead — AI and CLI then share one Chromium and one set of tabs/cookies/logs.
+**As an MCP server (for AI agents)** — default. Claude Code / Codex / etc. invoke `ai-browser` (no args) on stdio and call tools. The MCP server always attaches to (or auto-spawns) the shared daemon, so AI and CLI sessions share one Chromium and one set of tabs/cookies/secrets. Standalone per-MCP-session browsers are no longer offered.
 
 **As a CLI (for humans + scripts)** — a long-lived daemon owns one Chromium; CLI subcommands talk to it over a Unix socket. Subsequent commands are <100ms (no cold start) and share state across CLI invocations (cookies, tabs, network logs).
 
@@ -78,20 +78,19 @@ ai-browser daemon stop                         # quit the browser
 
 The daemon auto-spawns on the first CLI command. State persists across CLI calls.
 
-To share one Chromium between MCP and CLI, run the MCP server in daemon-attach mode — both will hit the same browser instance:
+The MCP server and the CLI already share one Chromium: both attach to the same daemon socket, which is auto-spawned on first use. No flag is required.
 
 ```jsonc
 {
   "mcpServers": {
     "browser": {
-      "command": "ai-browser",
-      "args": ["mcp", "--daemon"]
+      "command": "ai-browser"
     }
   }
 }
 ```
 
-Equivalent: set `AI_BROWSER_MCP_MODE=daemon` in the env block. Default (`standalone`) preserves the original isolated-browser behavior.
+(The legacy `--daemon` / `--standalone` MCP flags are accepted but ignored for one release.)
 
 Run `ai-browser help` for the full subcommand list. See [CLI section](#cli) below.
 

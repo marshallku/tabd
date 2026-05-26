@@ -1,5 +1,5 @@
 /**
- * E2E MCP daemon-attach test — verifies the bridge in `daemon` mode forwards
+ * E2E MCP daemon-attach test — verifies the bridge in `client` role forwards
  * to a running daemon, so an "MCP-style" client and a CLI command see the
  * same browser state (shared Chromium between AI and human).
  *
@@ -48,9 +48,9 @@ const ensureClean = () => {
 try {
   ensureClean();
 
-  // 1. Initialize bridge in daemon mode — should auto-spawn the daemon and attach.
-  await initBridge({ mode: "daemon" });
-  check(true, "bridge.initBridge(mode='daemon') resolved (daemon attached)");
+  // 1. Initialize bridge as client — should auto-spawn the daemon and attach.
+  await initBridge({ role: { kind: "client" } });
+  check(true, "bridge.initBridge({client}) resolved (daemon attached)");
 
   // 2. send() now forwards to the daemon. Navigate to example.com.
   let res = await send("tabs.navigate", { url: "https://example.com" });
@@ -112,12 +112,12 @@ try {
     `bridge auto-reconnected after daemon restart (success=${res.success}, err=${res.error ?? "-"})`
   );
 
-  // 6. Standalone mode regression: shut down, verify standalone still works.
+  // 6. Detach + reattach as client: shutdown drops the daemon connection,
+  //    re-init must reconnect (auto-spawning if needed) without errors.
   await shutdownBridge();
-  ensureClean();
-  await initBridge({ mode: "standalone" });
+  await initBridge({ role: { kind: "client" } });
   res = await send("tabs.navigate", { url: "https://example.com" });
-  check(res.success, "standalone mode still functional after using daemon mode");
+  check(res.success, "client role reconnects after shutdownBridge");
   await shutdownBridge();
 
   console.log(`\n[test] ${failed ? "SOME TESTS FAILED" : "ALL TESTS PASSED"}`);

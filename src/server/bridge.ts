@@ -17,16 +17,26 @@ export interface BrowserDriver {
   ): Promise<BridgeResponse>;
 }
 
-export type BridgeMode = "standalone" | "daemon";
+// Role separation:
+//   - "host": the daemon process. Owns a BrowserDriver, listens on a socket,
+//     and routes incoming requests to the driver. There must be at most one
+//     host per machine for a given socket path.
+//   - "client": every other entry point (MCP server, CLI, subagent). Holds
+//     only a socket connection to the host. Never owns a driver.
+// The union shape makes the host-attaches-to-itself self-loop unrepresentable
+// at the type level. An explicit socket override is intentionally NOT part of
+// this role yet — that arrives in Phase 7 alongside getDaemonPaths overrides
+// so reconnect, ensureDaemon, and connect all respect the same path.
+export type BridgeRole = { kind: "host" } | { kind: "client" };
 
-let mode: BridgeMode = "standalone";
+let role: BridgeRole = { kind: "client" };
 let driver: BrowserDriver | null = null;
 let daemonClient: DaemonClient | null = null;
 
-export async function initBridge(options?: { mode?: BridgeMode }): Promise<void> {
-  mode = options?.mode ?? "standalone";
+export async function initBridge(options?: { role?: BridgeRole }): Promise<void> {
+  role = options?.role ?? { kind: "client" };
 
-  if (mode === "daemon") {
+  if (role.kind === "client") {
     // Attach to (or auto-spawn) the shared daemon. Both AI clients (MCP) and
     // human CLI usage will hit the same Chromium instance.
     await ensureDaemon();
@@ -41,7 +51,7 @@ export async function initBridge(options?: { mode?: BridgeMode }): Promise<void>
 }
 
 export async function shutdownBridge(): Promise<void> {
-  if (mode === "daemon") {
+  if (role.kind === "client") {
     daemonClient?.close();
     daemonClient = null;
     return;
@@ -95,11 +105,12 @@ export async function send(
   action: BridgeAction,
   params: Record<string, unknown> = {}
 ): Promise<BridgeResponse> {
-  // Secrets live in the same process as type_secret consumers. In daemon mode
-  // that is the daemon process — forward as usual. In standalone mode handle
-  // locally so put/delete share the in-process store with interaction.typeSecret.
+  // Secrets must be served by the same process that holds the in-memory
+  // (or persistent) store and the typeSecret consumer. In the host (daemon)
+  // process that means routing them locally so they share the cached store
+  // with interaction.typeSecret rather than re-entering the socket.
   if (
-    mode === "standalone" &&
+    role.kind === "host" &&
     (action === "secrets.put" ||
       action === "secrets.delete" ||
       action === "secrets.list")
@@ -107,7 +118,7 @@ export async function send(
     return handleLocalSecrets(action, params);
   }
 
-  if (mode === "daemon") {
+  if (role.kind === "client") {
     try {
       const client = await ensureDaemonClient();
       const res = await client.send(action, params);
