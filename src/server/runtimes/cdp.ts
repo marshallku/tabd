@@ -373,10 +373,18 @@ export class CdpBrowserDriver implements BrowserDriver {
         return this.getNetworkLogs(params);
 
       case "secrets.put":
-      case "secrets.delete":
+        return getSecretStore().put(
+          String(params.value ?? ""),
+          typeof params.label === "string" ? params.label : undefined
+        );
+      case "secrets.delete": {
+        const id = String(params.id ?? params.secretId ?? "");
+        if (!id) throw new Error("id is required");
+        await getSecretStore().delete(id);
+        return null;
+      }
       case "secrets.list":
-        // Handled in bridge layer, never reaches the driver.
-        throw new Error(`secrets actions are handled by the bridge`);
+        return getSecretStore().list();
 
       default:
         throw new Error(`Unsupported action: ${action satisfies never}`);

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { BridgeAction, BridgeResponse } from "../../shared/protocol.js";
 import type { BrowserDriver } from "../bridge.js";
+import { getSecretStore } from "../secrets.js";
 import {
   cleanHtml,
   domainMatches,
@@ -156,10 +157,18 @@ export class FetchBrowserDriver implements BrowserDriver {
       case "dialog.getLast":
         return this.unsupported("Dialogs require a browser runtime");
       case "secrets.put":
-      case "secrets.delete":
+        return getSecretStore().put(
+          String(params.value ?? ""),
+          typeof params.label === "string" ? params.label : undefined
+        );
+      case "secrets.delete": {
+        const id = String(params.id ?? params.secretId ?? "");
+        if (!id) throw new Error("id is required");
+        await getSecretStore().delete(id);
+        return null;
+      }
       case "secrets.list":
-        // Handled in bridge layer, never reaches the driver.
-        return this.unsupported("secrets actions are handled by the bridge");
+        return getSecretStore().list();
       default:
         return this.unsupported(
           `Unsupported action: ${action satisfies never}`

@@ -6,7 +6,6 @@ import {
   type DaemonClient,
 } from "../cli/daemonClient.js";
 import { getDaemonPaths } from "../shared/daemonPaths.js";
-import { getSecretStore } from "./secrets.js";
 
 export interface BrowserDriver {
   init(): Promise<void>;
@@ -72,52 +71,14 @@ async function ensureDaemonClient(): Promise<DaemonClient> {
   return daemonClient;
 }
 
-async function handleLocalSecrets(
-  action: "secrets.put" | "secrets.delete" | "secrets.list",
-  params: Record<string, unknown>
-): Promise<BridgeResponse> {
-  const store = getSecretStore();
-  try {
-    if (action === "secrets.put") {
-      const value = String(params.value ?? "");
-      const label = typeof params.label === "string" ? params.label : undefined;
-      const record = await store.put(value, label);
-      return { id: "", success: true, data: record };
-    }
-    if (action === "secrets.list") {
-      const items = await store.list();
-      return { id: "", success: true, data: items };
-    }
-    const id = String(params.id ?? params.secretId ?? "");
-    if (!id) throw new Error("id is required");
-    await store.delete(id);
-    return { id: "", success: true, data: null };
-  } catch (err) {
-    return {
-      id: "",
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
 export async function send(
   action: BridgeAction,
   params: Record<string, unknown> = {}
 ): Promise<BridgeResponse> {
-  // Secrets must be served by the same process that holds the in-memory
-  // (or persistent) store and the typeSecret consumer. In the host (daemon)
-  // process that means routing them locally so they share the cached store
-  // with interaction.typeSecret rather than re-entering the socket.
-  if (
-    role.kind === "host" &&
-    (action === "secrets.put" ||
-      action === "secrets.delete" ||
-      action === "secrets.list")
-  ) {
-    return handleLocalSecrets(action, params);
-  }
-
+  // Every action — including secrets.* — flows through the driver so that
+  // the ActionQueue can serialize secret operations against concurrent
+  // interaction.typeSecret calls in the same process. (Previously secrets
+  // bypassed the driver and could interleave with queued browser work.)
   if (role.kind === "client") {
     try {
       const client = await ensureDaemonClient();

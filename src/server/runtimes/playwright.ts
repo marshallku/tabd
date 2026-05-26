@@ -20,6 +20,7 @@ import type { BridgeAction, BridgeResponse } from "../../shared/protocol.js";
 import type { BrowserDriver } from "../bridge.js";
 import { getSecretStore } from "../secrets.js";
 import { compileUrlMatcher, type UrlPatternType } from "../../shared/urlMatch.js";
+import { ActionQueue, GLOBAL, type Scope } from "../utils/actionQueue.js";
 
 interface PlaywrightOptions {
   browserName: string;
@@ -62,6 +63,12 @@ interface PageState {
   lastDialog: Record<string, unknown> | null;
 }
 
+// Sentinel value for __pageUuid when an explicit tabId could not be
+// resolved at enqueue time. Dispatch detects this and raises a clean
+// "Tab closed before action could execute" error instead of letting the
+// positional tabId silently re-resolve to a different page later on.
+const UNRESOLVED_TAB = "__unresolved__";
+
 const MAX_LOG_ENTRIES = 200;
 const MAX_NETWORK_ENTRIES = 500;
 const MAX_BODY_BYTES = 100_000;
@@ -84,7 +91,12 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   private closingIntentionally = false;
   private activeTabId: number | null = null;
   private readonly pageStates = new Map<Page, PageState>();
+  // Stable, position-independent page identity used for ActionQueue scope.
+  // Client-facing tabId (positional index) can shift when other tabs close,
+  // but queued work must still resolve against the same Page object.
+  private readonly pageUuids = new WeakMap<Page, string>();
   private readonly secrets = getSecretStore();
+  private readonly queue = new ActionQueue();
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: PlaywrightOptions) {
@@ -212,8 +224,15 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
     params: Record<string, unknown>
   ): Promise<BridgeResponse> {
     const id = crypto.randomUUID();
+    // Determine the queue scope AND pin the page identity at enqueue time.
+    // The pinned UUID rides into dispatch via __pageUuid so that even if the
+    // positional tabId shifts during the queue wait (because another action
+    // closed an earlier tab), the action still resolves to the same Page.
+    const { scope, pinnedParams } = this.scopeFor(action, params);
     try {
-      const data = await this.dispatch(action, params);
+      const data = await this.queue.enqueue(scope, () =>
+        this.dispatch(action, pinnedParams)
+      );
       return { id, success: true, data };
     } catch (error) {
       return {
@@ -221,6 +240,86 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
         success: false,
         error: error instanceof Error ? error.message : String(error),
       };
+    }
+  }
+
+  // Classify each action into a serialization scope AND, when the action
+  // targets a specific tab, pin that target by its stable UUID. Three cases:
+  //   - GLOBAL: structural / multi-tab operations and active-tab implicit
+  //     actions — they cannot pin a single page without racing.
+  //   - per-page UUID: explicit tabId resolves to a Page right now; we
+  //     attach its UUID to params so dispatch reaches the same Page even
+  //     after positional shifts.
+  //   - GLOBAL fallback: explicit tabId that no longer resolves. The
+  //     dispatcher surfaces the real error under the global lock.
+  private scopeFor(
+    action: BridgeAction,
+    params: Record<string, unknown>
+  ): { scope: Scope; pinnedParams: Record<string, unknown> } {
+    // Always-global: any structural / cross-tab action serializes against
+    // the world. But if it names a specific tabId, we still pin the target
+    // Page now so positional shifts during the queue wait do not redirect
+    // the close/activate to the wrong tab.
+    switch (action) {
+      case "tabs.open":
+      case "tabs.list":
+      case "secrets.put":
+      case "secrets.delete":
+      case "secrets.list":
+        return { scope: GLOBAL, pinnedParams: params };
+      case "tabs.close":
+      case "tabs.activate":
+        return {
+          scope: GLOBAL,
+          pinnedParams: this.pinByTabId(params),
+        };
+      default:
+        break;
+    }
+    if (typeof params.tabId !== "number") {
+      return { scope: GLOBAL, pinnedParams: params };
+    }
+    try {
+      const page = this.pageFromTabId(params.tabId);
+      const uuid = this.pageUuids.get(page);
+      if (!uuid) {
+        // Page exists but is not tracked — treat as already-gone.
+        return {
+          scope: GLOBAL,
+          pinnedParams: { ...params, __pageUuid: UNRESOLVED_TAB },
+        };
+      }
+      return {
+        scope: uuid,
+        pinnedParams: { ...params, __pageUuid: uuid },
+      };
+    } catch {
+      // Tab does not currently resolve. Mark it so dispatch surfaces a
+      // clean "tab closed" error rather than letting the positional tabId
+      // get re-resolved into a freshly-opened page after a global action.
+      return {
+        scope: GLOBAL,
+        pinnedParams: { ...params, __pageUuid: UNRESOLVED_TAB },
+      };
+    }
+  }
+
+  // Pin a Page identity onto params without changing the queue scope.
+  // Used by structural actions (tabs.close/activate) that must serialize
+  // globally but still need to target the original tab even after the
+  // positional index shifts.
+  private pinByTabId(
+    params: Record<string, unknown>
+  ): Record<string, unknown> {
+    if (typeof params.tabId !== "number") return params;
+    try {
+      const page = this.pageFromTabId(params.tabId);
+      const uuid = this.pageUuids.get(page);
+      return uuid
+        ? { ...params, __pageUuid: uuid }
+        : { ...params, __pageUuid: UNRESOLVED_TAB };
+    } catch {
+      return { ...params, __pageUuid: UNRESOLVED_TAB };
     }
   }
 
@@ -326,10 +425,18 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
       case "monitor.networkLogs":
         return this.getNetworkLogs(params);
       case "secrets.put":
-      case "secrets.delete":
+        return this.secrets.put(
+          String(params.value ?? ""),
+          typeof params.label === "string" ? params.label : undefined
+        );
+      case "secrets.delete": {
+        const id = String(params.id ?? params.secretId ?? "");
+        if (!id) throw new Error("id is required");
+        await this.secrets.delete(id);
+        return null;
+      }
       case "secrets.list":
-        // Handled in bridge layer, never reaches the driver.
-        throw new Error(`secrets actions are handled by the bridge`);
+        return this.secrets.list();
       default:
         throw new Error(`Unsupported action: ${action satisfies never}`);
     }
@@ -373,6 +480,13 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   private attachPage(page: Page): void {
     if (this.pageStates.has(page)) {
       return;
+    }
+
+    // Assign a stable UUID per Page object the first time we see it. This is
+    // what the ActionQueue uses to keep concurrent requests against the same
+    // physical tab in order even as positional tabIds shift around close/popup.
+    if (!this.pageUuids.has(page)) {
+      this.pageUuids.set(page, randomBytes(8).toString("hex"));
     }
 
     const state: PageState = {
@@ -1397,6 +1511,13 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   }
 
   private getPage(params: Record<string, unknown>): Page {
+    // __pageUuid wins over tabId so a queued action lands on the same Page
+    // even if the positional index shifted while it was waiting.
+    if (typeof params.__pageUuid === "string") {
+      const page = this.pageFromUuid(params.__pageUuid);
+      this.activeTabId = this.tabIdForPage(page);
+      return page;
+    }
     const page = this.pageFromTabId(
       typeof params.tabId === "number"
         ? params.tabId
@@ -1407,6 +1528,9 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   }
 
   private requirePage(params: Record<string, unknown>): Page {
+    if (typeof params.__pageUuid === "string") {
+      return this.pageFromUuid(params.__pageUuid);
+    }
     if (typeof params.tabId !== "number") {
       throw new Error("tabId is required");
     }
@@ -1419,6 +1543,21 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
       throw new Error(`Tab not found: ${tabId}`);
     }
     return page;
+  }
+
+  private pageFromUuid(uuid: string): Page {
+    if (uuid === UNRESOLVED_TAB) {
+      // Pinning explicitly failed at enqueue time. Refuse to fall back to
+      // any positional re-resolution — that would silently retarget the
+      // action to a tab that did not exist when the caller submitted it.
+      throw new Error("Tab closed before action could execute");
+    }
+    for (const page of this.pages()) {
+      if (this.pageUuids.get(page) === uuid) {
+        return page;
+      }
+    }
+    throw new Error("Tab closed before action could execute");
   }
 
   private pages(): Page[] {
