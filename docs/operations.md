@@ -145,6 +145,36 @@ Shutdown order:
 
 The bridge never auto-replays a request that disconnected mid-send because the daemon may have already partially executed it. Long-lived MCP sessions transparently reconnect on the *next* request via `ensureDaemon` (which auto-spawns if needed).
 
+## Pre-release soak test
+
+Before tagging a release (or after any meaningful supervisor change), run a long soak against the daemon to surface slow leaks, restart-storm regressions, and cross-client races that short E2E tests miss.
+
+```bash
+# Recommended pre-release gate — 6h with 2 concurrent clients
+scripts/soak.sh --duration 6h --workers 2 --out /tmp/soak.csv
+
+# Quick smoke (~1 min) before a longer run
+scripts/soak.sh --duration 1m --workers 2 --out /tmp/soak-smoke.csv --poll 5
+```
+
+The script spawns N workers that drive a mix of `navigate`, `get-text`, `eval`, and `screenshot` against the local daemon while polling `daemon.health` every 15s (`--poll` overrides). Output CSV columns:
+
+```
+ts, uptimeMs, inflight, totalRequests, chromiumRssMB, restartAttempt, restarting, lastErrorMsg
+```
+
+Three independent gates must all pass for `exit 0`:
+
+1. No row with `restartAttempt > 2` (no persistent restart loop).
+2. ≤25% empty `uptimeMs` samples (daemon stayed responsive to `daemon.health`).
+3. ≤25% worker error rate (the daemon stayed *useful*, not just alive).
+
+Zero health samples = FAIL (the poller crashed; verdict cannot be evaluated).
+
+Requires `jq` in `$PATH` (used to parse `daemon.health` JSON).
+
+Look at the CSV afterwards: a stable RSS line with occasional small bumps means the daemon is healthy; a steady upward slope is a slow leak and warrants tightening `BROWSER_MAX_RSS_MB`.
+
 ## One-shot CI usage
 
 When a job just needs a clean browser for a single command:
