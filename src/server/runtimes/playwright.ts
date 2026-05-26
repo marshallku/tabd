@@ -437,6 +437,12 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
       }
       case "secrets.list":
         return this.secrets.list();
+      case "daemon.ping":
+      case "daemon.shutdown":
+      case "daemon.health":
+        // Daemon control actions are intercepted in the socket server, not
+        // routed through the driver. Hitting here means a misrouted request.
+        throw new Error(`${action} is handled by the daemon, not the driver`);
       default:
         throw new Error(`Unsupported action: ${action satisfies never}`);
     }

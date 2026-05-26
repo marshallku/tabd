@@ -34,7 +34,8 @@
         "e2e:wait-url": "npm run build && node tests/e2e-wait-url.mjs",
         "e2e:secrets-cli": "npm run build && node tests/e2e-secrets-cli.mjs",
         "e2e:secrets-persistent": "npm run build && node tests/e2e-secrets-persistent.mjs",
-        "e2e:action-queue": "npm run build && node tests/e2e-action-queue.mjs"
+        "e2e:action-queue": "npm run build && node tests/e2e-action-queue.mjs",
+        "e2e:drain": "npm run build && node tests/e2e-daemon-drain.mjs"
     },
     "publishConfig": {
         "access": "public"

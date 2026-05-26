@@ -31,6 +31,65 @@ const readyPromise: Promise<void> = new Promise((resolve) => {
 // during the brief window between server.close() and process exit.
 const liveSockets = new Set<Socket>();
 
+// In-flight accounting for graceful drain on shutdown.
+//  - activeRequests: number of non-daemon-control actions currently executing
+//    in the driver. Daemon control actions (ping/health/status) are NOT
+//    counted so they remain answerable during shutdown.
+//  - acceptingRequests: when false, new non-control actions are rejected
+//    with a clear error; control actions still work. This lets observers
+//    see drain progress through daemon.health while it happens.
+//  - startedAt: process start time used by daemon.health for uptime.
+//  - lastError: most recent driver error surfaced through processLine,
+//    exposed via daemon.health for diagnostics.
+let activeRequests = 0;
+let acceptingRequests = true;
+let resolveDrain: () => void = () => {};
+let drainSignal: Promise<void> = Promise.resolve();
+let totalRequests = 0;
+const startedAt = Date.now();
+let lastError: { action: string; message: string; at: number } | null = null;
+
+function rearmDrainSignal(): void {
+  drainSignal = new Promise<void>((resolve) => {
+    resolveDrain = resolve;
+  });
+}
+rearmDrainSignal();
+
+function isDaemonControl(action: BridgeAction): boolean {
+  return (
+    action === "daemon.ping" ||
+    action === "daemon.shutdown" ||
+    action === "daemon.health"
+  );
+}
+
+async function waitForDrain(timeoutMs: number): Promise<boolean> {
+  if (activeRequests === 0) return true;
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    const tryResolve = (): void => {
+      if (activeRequests === 0) {
+        clearTimeout(timer);
+        resolve(true);
+      }
+    };
+    // Resolve as soon as the in-flight count reaches zero. Each completing
+    // request fires drainSignal, so chain on it until we see zero.
+    const loop = async (): Promise<void> => {
+      while (activeRequests > 0) {
+        await drainSignal;
+        if (activeRequests === 0) {
+          tryResolve();
+          return;
+        }
+      }
+      tryResolve();
+    };
+    void loop();
+  });
+}
+
 export function isProcessAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
@@ -177,10 +236,46 @@ export async function runDaemon(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     console.error(`[daemon] shutting down (${signal})`);
+
+    // Stop accepting new non-control work. Note: we deliberately keep the
+    // socket listener OPEN during drain so new observers (CLI `daemon
+    // health`, attached MCP clients) can still connect and see drain
+    // progress + receive the explicit "daemon is shutting down" error for
+    // non-control requests. The listener is closed only after drain.
+    acceptingRequests = false;
+
+    // Wait up to DRAIN_TIMEOUT_MS for in-flight driver work to settle.
+    // If the timeout elapses we forcibly tear the driver down — Playwright
+    // will reject any pending Promises that depend on the context, which
+    // gives a real cancel (not a fake one) for actions like wait_for_url.
+    const DRAIN_TIMEOUT_MS = Number(
+      process.env.AI_BROWSER_DRAIN_TIMEOUT_MS ?? 10_000
+    );
+    const drained = await waitForDrain(DRAIN_TIMEOUT_MS);
+    if (!drained) {
+      console.error(
+        `[daemon] drain timeout (${DRAIN_TIMEOUT_MS}ms) with ${activeRequests} request(s) in flight; forcing cancel`
+      );
+    }
+
+    // Tear down the browser BEFORE closing the socket listener. Otherwise
+    // ensureDaemon() in another process could observe "no daemon" (socket
+    // closed) and auto-spawn a replacement while this daemon is still
+    // mid-teardown — two daemons would briefly contend for the same
+    // Chromium user-data-dir / port. Order matters here.
+    try {
+      // shutdownBridge closes the context/browser/server. When drain timed
+      // out, this is what actually cancels the stuck Playwright work and
+      // unblocks any pending Playwright Promises.
+      await shutdownBridge();
+    } catch (err) {
+      console.error("[daemon] bridge shutdown error:", err);
+    }
+
+    // Browser is gone — now close the listener and sever existing sockets
+    // so attached bridges (e.g. MCP) observe a clean disconnect instead of
+    // writing into a stale FD.
     server.close();
-    // End every accepted client socket so attached bridges (e.g. MCP daemon
-    // mode) immediately observe a clean close instead of writing into a
-    // stale FD during process teardown.
     for (const sock of liveSockets) {
       try {
         sock.end();
@@ -190,11 +285,6 @@ export async function runDaemon(): Promise<void> {
       }
     }
     liveSockets.clear();
-    try {
-      await shutdownBridge();
-    } catch (err) {
-      console.error("[daemon] bridge shutdown error:", err);
-    }
     if (existsSync(socketPath)) unlinkSync(socketPath);
     if (existsSync(pidPath)) unlinkSync(pidPath);
     resolveDone();
@@ -252,22 +342,51 @@ async function processLine(socket: Socket, line: string): Promise<void> {
     return;
   }
 
-  // daemon.shutdown is allowed even before bridge is ready. Calls the
-  // in-process shutdown directly rather than SIGTERM so cleanup runs even if
-  // signal handlers are not yet installed.
-  if (req.action === ("daemon.shutdown" as BridgeAction)) {
+  // Daemon control actions are answered locally and bypass the queue/drain
+  // gate so observers can drive lifecycle and inspect health at any time.
+  if (req.action === "daemon.shutdown") {
+    // Close the accepting gate IMMEDIATELY — before the 50ms grace period
+    // for the response to flush — so any non-control requests racing in
+    // after this point hit the drain path, not the in-flight path.
+    acceptingRequests = false;
     writeJson(socket, { id: req.id, success: true, data: { stopping: true } });
     setTimeout(() => void triggerShutdown("daemon.shutdown"), 50);
     return;
   }
 
-  // daemon.ping returns immediately with a `ready` flag so callers can
-  // distinguish "socket bound" from "browser ready".
-  if (req.action === ("daemon.ping" as BridgeAction)) {
+  if (req.action === "daemon.ping") {
     writeJson(socket, {
       id: req.id,
       success: true,
       data: { pid: process.pid, ready: bridgeReady },
+    });
+    return;
+  }
+
+  if (req.action === "daemon.health") {
+    writeJson(socket, {
+      id: req.id,
+      success: true,
+      data: {
+        pid: process.pid,
+        uptimeMs: Date.now() - startedAt,
+        ready: bridgeReady,
+        accepting: acceptingRequests,
+        inflight: activeRequests,
+        totalRequests,
+        lastError,
+      },
+    });
+    return;
+  }
+
+  // Refuse new non-control work after shutdown begins. This is the
+  // user-visible signal that the daemon is draining.
+  if (!acceptingRequests) {
+    writeJson(socket, {
+      id: req.id,
+      success: false,
+      error: "daemon is shutting down (drain in progress)",
     });
     return;
   }
@@ -277,15 +396,35 @@ async function processLine(socket: Socket, line: string): Promise<void> {
     await readyPromise;
   }
 
+  activeRequests++;
+  totalRequests++;
   try {
     const result = await send(req.action, req.params ?? {});
     writeJson(socket, { ...result, id: req.id });
+    if (!result.success && result.error) {
+      lastError = {
+        action: req.action,
+        message: result.error,
+        at: Date.now(),
+      };
+    }
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    lastError = { action: req.action, message, at: Date.now() };
     writeJson(socket, {
       id: req.id,
       success: false,
-      error: err instanceof Error ? err.message : String(err),
+      error: message,
     });
+  } finally {
+    activeRequests--;
+    if (activeRequests === 0) {
+      // Wake every waitForDrain() observer, then arm a fresh signal so the
+      // next batch of in-flight work has a new Promise to chain on.
+      const prevResolve = resolveDrain;
+      rearmDrainSignal();
+      prevResolve();
+    }
   }
 }
 

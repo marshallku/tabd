@@ -50,8 +50,15 @@ export async function pingDaemon(): Promise<boolean> {
   return (await pingDaemonStatus()).ready;
 }
 
-export async function ensureDaemon(timeoutMs = 30_000): Promise<void> {
-  if (await pingDaemon()) return;
+export interface EnsureDaemonResult {
+  /** true if this call spawned a new daemon process (previously not running). */
+  spawned: boolean;
+}
+
+export async function ensureDaemon(
+  timeoutMs = 30_000
+): Promise<EnsureDaemonResult> {
+  if (await pingDaemon()) return { spawned: false };
 
   const { socketPath, pidPath } = getDaemonPaths();
   mkdirSync(dirname(socketPath), { recursive: true });
@@ -69,7 +76,7 @@ export async function ensureDaemon(timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await sleep(150);
-    if (await pingDaemon()) return;
+    if (await pingDaemon()) return { spawned: true };
   }
   void pidPath;
   throw new Error(`daemon did not become ready within ${timeoutMs}ms`);

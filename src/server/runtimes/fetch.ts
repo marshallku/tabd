@@ -169,6 +169,12 @@ export class FetchBrowserDriver implements BrowserDriver {
       }
       case "secrets.list":
         return getSecretStore().list();
+      case "daemon.ping":
+      case "daemon.shutdown":
+      case "daemon.health":
+        return this.unsupported(
+          `${action} is handled by the daemon, not the driver`
+        );
       default:
         return this.unsupported(
           `Unsupported action: ${action satisfies never}`

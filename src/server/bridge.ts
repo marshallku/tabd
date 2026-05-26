@@ -59,16 +59,19 @@ export async function shutdownBridge(): Promise<void> {
   driver = null;
 }
 
-async function ensureDaemonClient(): Promise<DaemonClient> {
+async function ensureDaemonClient(): Promise<{
+  client: DaemonClient;
+  spawned: boolean;
+}> {
   if (daemonClient && !daemonClient.isClosed()) {
-    return daemonClient;
+    return { client: daemonClient, spawned: false };
   }
   // Reconnect transparently if the daemon was stopped/restarted from the CLI.
   // This keeps long-lived MCP sessions alive across daemon lifecycle events.
-  await ensureDaemon();
+  const { spawned } = await ensureDaemon();
   const { socketPath } = getDaemonPaths();
   daemonClient = await connectClient(socketPath);
-  return daemonClient;
+  return { client: daemonClient, spawned };
 }
 
 export async function send(
@@ -81,14 +84,26 @@ export async function send(
   // bypassed the driver and could interleave with queued browser work.)
   if (role.kind === "client") {
     try {
-      const client = await ensureDaemonClient();
+      const { client } = await ensureDaemonClient();
       const res = await client.send(action, params);
-      // If the connection died mid-send, retry once with a fresh client so a
-      // single restart does not surface as a tool-call failure.
+      // A mid-send disconnect can never be safely auto-replayed. The action
+      // may have been partially executed on the daemon before the socket
+      // dropped — by the time the client observes the disconnect, the
+      // browser state has already been mutated (navigation kicked off,
+      // click dispatched, cookie set, etc.). Replaying duplicates that
+      // work. Surface the disconnect as a cancellation; the caller can
+      // decide whether to retry after inspecting state. The NEXT send()
+      // in this process triggers ensureDaemonClient → ensureDaemon, which
+      // auto-spawns a fresh daemon if needed, so legitimate restart
+      // recovery still works for subsequent requests.
       if (!res.success && /daemon connection closed/.test(res.error ?? "")) {
         daemonClient = null;
-        const retryClient = await ensureDaemonClient();
-        return await retryClient.send(action, params);
+        return {
+          id: "",
+          success: false,
+          error:
+            "request cancelled: daemon connection lost mid-request (may have partially executed)",
+        };
       }
       return res;
     } catch (err) {

@@ -49,7 +49,10 @@ export type BridgeAction =
   | "wait.networkIdle"
   | "capture.metrics"
   | "capture.highlight"
-  | "capture.elementRect";
+  | "capture.elementRect"
+  | "daemon.ping"
+  | "daemon.shutdown"
+  | "daemon.health";
 
 export interface BridgeRequest {
   id: string;

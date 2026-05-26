@@ -385,6 +385,10 @@ export class CdpBrowserDriver implements BrowserDriver {
       }
       case "secrets.list":
         return getSecretStore().list();
+      case "daemon.ping":
+      case "daemon.shutdown":
+      case "daemon.health":
+        throw new Error(`${action} is handled by the daemon, not the driver`);
 
       default:
         throw new Error(`Unsupported action: ${action satisfies never}`);

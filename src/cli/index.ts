@@ -463,6 +463,26 @@ async function handleDaemon(rest: string[]): Promise<number> {
       if (!status.alive) return 1;
       return 2;
     }
+    case "health": {
+      // Reports daemon uptime, accepting flag, in-flight count, and the
+      // most recent error surfaced through a request. Works during drain.
+      const status = await pingDaemonStatus();
+      if (!status.alive) {
+        console.error("[daemon] not running");
+        return 1;
+      }
+      const res = await withExistingDaemon(async (client) =>
+        client.send("daemon.health", {})
+      ).catch(() => null);
+      if (!res || !res.success) {
+        console.error(
+          `[daemon] health failed: ${res?.error ?? "no response"}`
+        );
+        return 1;
+      }
+      console.log(JSON.stringify(res.data, null, 2));
+      return 0;
+    }
     default:
       console.error(`unknown daemon subcommand: ${sub}`);
       return 2;

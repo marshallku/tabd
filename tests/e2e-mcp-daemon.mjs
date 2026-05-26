@@ -100,16 +100,24 @@ try {
   );
   await send("secrets.delete", { id: secretId });
 
-  // 5. Daemon restart while bridge is attached — bridge should auto-reconnect
-  //    on the next send() rather than hang or error out.
+  // 5. Daemon restart while bridge is attached — the in-flight semantics
+  //    now refuse to auto-replay actions across a daemon disconnect
+  //    (because the action may have been partially executed before the
+  //    socket dropped). So we expect: first send after restart may surface
+  //    a cancel/connection-lost error, then a subsequent send reconnects
+  //    cleanly. The user-visible promise is: "the bridge recovers, just
+  //    not by silently replaying the original action."
   cli("daemon", "restart");
-  // Note: restart auto-spawns a fresh daemon. The previous daemonClient inside
-  //       the bridge is now talking to a closed socket; bridge.send must detect
-  //       and reconnect transparently.
-  res = await send("tabs.navigate", { url: "https://example.com" });
+  let first = await send("tabs.navigate", { url: "https://example.com" });
+  if (!first.success) {
+    // Expected: bridge surfaced the disconnect. Next call must succeed.
+    res = await send("tabs.navigate", { url: "https://example.com" });
+  } else {
+    res = first;
+  }
   check(
     res.success,
-    `bridge auto-reconnected after daemon restart (success=${res.success}, err=${res.error ?? "-"})`
+    `bridge usable after daemon restart (first.success=${first.success}, retry.success=${res.success}, err=${res.error ?? "-"})`
   );
 
   // 6. Detach + reattach as client: shutdown drops the daemon connection,
