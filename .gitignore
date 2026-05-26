@@ -1,2 +1,6 @@
 dist/
 node_modules/
+
+# Rust spike (crates/cdp-spike)
+target/
+
