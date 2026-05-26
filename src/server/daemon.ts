@@ -7,7 +7,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { initBridge, send, shutdownBridge } from "./bridge.js";
+import {
+  initBridge,
+  send,
+  shutdownBridge,
+  getHostDriverHealth,
+} from "./bridge.js";
 import type { BridgeAction } from "../shared/protocol.js";
 
 export { getDaemonPaths } from "../shared/daemonPaths.js";
@@ -375,6 +380,10 @@ async function processLine(socket: Socket, line: string): Promise<void> {
         inflight: activeRequests,
         totalRequests,
         lastError,
+        // Driver-level fields are merged in when the bridge is in host
+        // mode and the driver implements getDriverHealth. Includes
+        // Chromium PID, tree RSS, supervisor state.
+        driver: getHostDriverHealth(),
       },
     });
     return;

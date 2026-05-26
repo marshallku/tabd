@@ -24,6 +24,7 @@ import { getSecretStore } from "../secrets.js";
 import { compileUrlMatcher, type UrlPatternType } from "../../shared/urlMatch.js";
 import { ActionQueue, GLOBAL, type Scope } from "../utils/actionQueue.js";
 import { SnapshotKeeper, type ContextSnapshot } from "../utils/snapshotKeeper.js";
+import { getProcessTreeRssBytes } from "../utils/processMonitor.js";
 
 interface PlaywrightOptions {
   browserName: string;
@@ -77,6 +78,10 @@ const UNRESOLVED_TAB = "__unresolved__";
 // fresh boot. Backoff grows exponentially: 1s, 2s, 4s, capped at 30s.
 const MAX_RESTART_ATTEMPTS = 3;
 const RESTART_BACKOFF_CAP_MS = 30_000;
+
+// How often to poll the Chromium process tree for RSS. 15s is a balance
+// between responsiveness to leaks and overhead of fork(`ps`/`pgrep`).
+const RSS_POLL_INTERVAL_MS = 15_000;
 
 // Chromium leaves these single-instance lock files in the user-data-dir
 // after an unclean exit. The next launchPersistentContext will fail with
@@ -151,6 +156,12 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   // can do a fresh boot.
   private restartAttempt = 0;
   private restarting: Promise<void> | null = null;
+  // Resource monitor state. lastRssBytes is reported via daemon.health.
+  // When non-zero, BROWSER_MAX_RSS_MB env triggers a graceful restart on
+  // threshold crossing.
+  private rssTimer: ReturnType<typeof setInterval> | null = null;
+  private lastRssBytes = 0;
+  private lastRssAt = 0;
 
   constructor(options: PlaywrightOptions) {
     this.options = options;
@@ -267,6 +278,79 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
     }
 
     this.startKeepalive();
+    this.startRssMonitor();
+  }
+
+  /** Snapshot of supervisor + resource state for daemon.health. */
+  getDriverHealth(): {
+    chromiumPid: number | null;
+    chromiumRssBytes: number;
+    rssCheckedAt: number;
+    rssMaxMb: number | null;
+    restartAttempt: number;
+    restarting: boolean;
+  } {
+    const rssMaxMbEnv = process.env.BROWSER_MAX_RSS_MB;
+    const rssMaxMb = rssMaxMbEnv ? Number(rssMaxMbEnv) : null;
+    return {
+      chromiumPid: this.chromiumProc?.pid ?? null,
+      chromiumRssBytes: this.lastRssBytes,
+      rssCheckedAt: this.lastRssAt,
+      rssMaxMb: rssMaxMb && Number.isFinite(rssMaxMb) ? rssMaxMb : null,
+      restartAttempt: this.restartAttempt,
+      restarting: this.restarting !== null,
+    };
+  }
+
+  private startRssMonitor(): void {
+    this.stopRssMonitor();
+    // Persistent path has no Chromium PID available (launchPersistentContext
+    // does not expose it), so tree RSS cannot be computed. Skip monitor —
+    // operator must rely on OS-level tools in that case.
+    if (!this.chromiumProc?.pid) return;
+    const intervalEnv = process.env.BROWSER_RSS_POLL_MS;
+    const intervalMs =
+      intervalEnv && Number.isFinite(Number(intervalEnv))
+        ? Math.max(500, Number(intervalEnv))
+        : RSS_POLL_INTERVAL_MS;
+    const tick = async (): Promise<void> => {
+      const rootPid = this.chromiumProc?.pid;
+      if (!rootPid) return;
+      try {
+        const bytes = await getProcessTreeRssBytes(rootPid);
+        this.lastRssBytes = bytes;
+        this.lastRssAt = Date.now();
+        const cap = Number(process.env.BROWSER_MAX_RSS_MB ?? 0);
+        if (
+          Number.isFinite(cap) &&
+          cap > 0 &&
+          bytes / (1024 * 1024) > cap &&
+          !this.restarting &&
+          !this.closingIntentionally
+        ) {
+          console.error(
+            `[playwright] RSS ${Math.round(bytes / 1024 / 1024)}MB exceeds BROWSER_MAX_RSS_MB=${cap}; scheduling graceful restart`
+          );
+          // Restart via the same supervisor as crash recovery. The pre-
+          // restart snapshot keeps URLs + storageState, so the new process
+          // resumes the prior session at lower RSS.
+          void this.scheduleRestart("rss-threshold");
+        }
+      } catch {
+        // Best-effort; transient ps failures are not actionable here.
+      }
+    };
+    // Run one immediately so health reflects a real value quickly.
+    void tick();
+    this.rssTimer = setInterval(() => void tick(), intervalMs);
+    (this.rssTimer as { unref?: () => void }).unref?.();
+  }
+
+  private stopRssMonitor(): void {
+    if (this.rssTimer) {
+      clearInterval(this.rssTimer);
+      this.rssTimer = null;
+    }
   }
 
   private async restoreUrls(urls: string[]): Promise<void> {
@@ -300,6 +384,7 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   async close(): Promise<void> {
     this.closingIntentionally = true;
     this.stopKeepalive();
+    this.stopRssMonitor();
     // Stop the snapshot refresh tick BEFORE context.close so the timer
     // doesn't fire one last storageState query against a closing context.
     this.snapshot.detach();
@@ -389,12 +474,35 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
         // storageState in memory).
         const snap: ContextSnapshot = this.snapshot.current();
 
-        // Drop refs to dead Playwright objects so init() builds new ones.
-        // stopKeepalive() before init() — otherwise a new interval is
-        // installed on top of the old one and they accumulate per restart.
+        // Stop background timers before tearing the runtime down. Otherwise
+        // a new interval is installed on top of the old one and they
+        // accumulate per restart.
         this.stopKeepalive();
+        this.stopRssMonitor();
         this.snapshot.detach();
         this.pageStates.clear();
+
+        // Gracefully close the existing browser tree BEFORE the relaunch.
+        // For crash recovery (server already exited) these are essentially
+        // no-ops. For RSS-threshold restart they are the actual memory
+        // reclaim — without them we would leave the old high-RSS Chromium
+        // alive and spawn a second one. Each step is best-effort so a dead
+        // pointer does not prevent the next layer from being cleaned up.
+        try {
+          await this.context?.close();
+        } catch {
+          /* may already be dead from crash */
+        }
+        try {
+          await this.browser?.close();
+        } catch {
+          /* may already be dead */
+        }
+        try {
+          await this.server?.close();
+        } catch {
+          /* may already be dead */
+        }
         this.context = null;
         this.browser = null;
         this.server = null;

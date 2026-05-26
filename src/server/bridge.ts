@@ -14,6 +14,21 @@ export interface BrowserDriver {
     action: BridgeAction,
     params: Record<string, unknown>
   ): Promise<BridgeResponse>;
+  /**
+   * Optional driver-level health snapshot reported via daemon.health.
+   * Drivers that do not maintain supervisor/resource state can omit it.
+   */
+  getDriverHealth?(): Record<string, unknown>;
+}
+
+/**
+ * Read the current driver's health snapshot. Only meaningful in host
+ * (daemon) mode; returns null in client mode where there is no local
+ * driver to inspect.
+ */
+export function getHostDriverHealth(): Record<string, unknown> | null {
+  if (role.kind !== "host" || !driver) return null;
+  return driver.getDriverHealth?.() ?? null;
 }
 
 // Role separation:
