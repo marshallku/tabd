@@ -29,10 +29,16 @@ pub async fn run(url: &str, expr: &str, as_json: bool, timeout_ms: u64) -> Resul
 /// and return the inner `result.value` (or `None` when the expression evaluates
 /// to `undefined`). Propagates `exceptionDetails` as a Rust error.
 pub async fn evaluate_value(client: &CdpClient, expr: &str) -> Result<Option<Value>> {
+    // `awaitPromise: true` matches TS chromium-cdp (src/server/runtimes/cdp.ts:1893):
+    // resolves `Promise.resolve(x)` to `x` instead of returning the raw promise object.
     let raw = client
         .send(
             "Runtime.evaluate",
-            json!({ "expression": expr, "returnByValue": true }),
+            json!({
+                "expression": expr,
+                "returnByValue": true,
+                "awaitPromise": true,
+            }),
         )
         .await?;
 

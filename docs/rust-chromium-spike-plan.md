@@ -30,7 +30,7 @@ spike crate를 만든다. 목적은 두 가지:
 |---|---|---|---|
 | 런치 플래그 | `--no-first-run --disable-dev-shm-usage --disable-background-networking --disable-sync --disable-extensions --no-sandbox` | 동일하게 다 붙임 | — |
 | endpoint 결정 | stderr `DevTools listening on ws://...` 파싱 + `/json/version` readiness 확인 | 동일 | — |
-| navigate 완료 신호 | `Page.navigate` + `document.readyState` 폴링 | 동일 (`loadEventFired`는 보조 신호로만) | — |
+| navigate 완료 신호 | `Page.navigate` + `document.readyState` 폴링 | 동일 (loadEventFired는 spike scope에서 생략) | — |
 | 텍스트 추출 selector | default `"main, article, body"` → fallback `body` | 명시 selector만 (default 없음) | default + fallback |
 | 텍스트 추출 방식 | `innerText`, 공백라인 압축, trim, `raw` 옵션 시 `textContent` | `textContent` 단독 | `innerText` + 압축 + trim |
 | evaluate | `Runtime.evaluate(code, returnByValue: true)` | 동일 | — |
@@ -159,7 +159,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 12. `Runtime.evaluate { expression, returnByValue: true }` —
     `expression` 은 `format!("(document.querySelector({})?.textContent) ?? ''", serde_json::to_string(&selector)?)`
     로 안전 임베드 (codex C3). 따옴표/백슬래시/유니코드 selector도 깨지지 않음
-13. `Browser.close` → child wait → TempDir drop으로 정리
+13. shutdown: WebSocket close → child SIGTERM (graceful 2s) → SIGKILL 폴백 → TempDir drop으로 정리.
+    CDP `Browser.close` 는 phase-1 follow-up (spike scope에서는 SIGTERM이 충분히 graceful)
 
 ## 성공 기준 (codex C1 — 실재 TS CLI 표면과 정합)
 

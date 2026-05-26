@@ -33,7 +33,11 @@ pub async fn open(url: &str, timeout_ms: u64) -> Result<(Browser, CdpClient)> {
         if let Ok(resp) = client
             .send(
                 "Runtime.evaluate",
-                json!({ "expression": "document.readyState", "returnByValue": true }),
+                json!({
+                    "expression": "document.readyState",
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
             )
             .await
             && let Some(state) = resp
