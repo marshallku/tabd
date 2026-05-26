@@ -1,10 +1,13 @@
 import { existsSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import type { ChildProcess } from "node:child_process";
 import {
   chromium,
   firefox,
   webkit,
   type Browser,
   type BrowserContext,
+  type BrowserServer,
   type BrowserType,
   type ConsoleMessage,
   type Dialog,
@@ -67,8 +70,18 @@ const TEXT_CONTENT_TYPES =
 
 export class PlaywrightBrowserDriver implements BrowserDriver {
   private readonly options: PlaywrightOptions;
+  // Non-persistent path: server owns the Chromium child process and exposes
+  // a ws endpoint; we connect a Browser to it. Persistent path skips the
+  // server because launchPersistentContext does not expose one.
+  private server: BrowserServer | null = null;
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
+  private chromiumProc: ChildProcess | null = null;
+  // True while close()/restart is intentionally tearing the runtime down.
+  // Crash listeners read this to distinguish planned shutdown from an
+  // unexpected exit so the future supervisor (Phase 5) does not relaunch
+  // during normal teardown.
+  private closingIntentionally = false;
   private activeTabId: number | null = null;
   private readonly pageStates = new Map<Page, PageState>();
   private readonly secrets = getSecretStore();
@@ -80,8 +93,11 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
 
   async init(): Promise<void> {
     const browserType = this.resolveBrowserType();
+    this.closingIntentionally = false;
 
     if (this.options.userDataDir) {
+      // Persistent path: profile-backed context. BrowserServer is not
+      // available here; crash signal is context.on("close").
       this.context = await browserType.launchPersistentContext(
         this.options.userDataDir,
         {
@@ -95,14 +111,34 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
         }
       );
       this.browser = null;
+      this.server = null;
+      this.chromiumProc = null;
+      this.context.on("close", () => this.onContextClosed());
     } else {
-      const launchOptions: LaunchOptions = {
+      // Non-persistent path: launchServer + connect. This is the only public
+      // launch shape that exposes Chromium PID + exit events to the daemon,
+      // which the Phase 5 supervisor needs for tree-RSS monitoring and
+      // crash-vs-planned-close discrimination.
+      //
+      // Security: launchServer's default host is "::" / "0.0.0.0", which makes
+      // the Chromium control WebSocket reachable from LAN. Pin to loopback and
+      // randomize the wsPath so that another local user cannot discover and
+      // hijack the endpoint by scanning ports.
+      const launchServerOptions = {
         headless: this.options.headless,
         executablePath: this.resolveExecutablePath(),
         timeout: this.options.startupTimeoutMs,
-      };
+        host: "127.0.0.1",
+        wsPath: `/ai-browser/${randomBytes(16).toString("hex")}`,
+      } satisfies Parameters<BrowserType["launchServer"]>[0];
+      this.server = await browserType.launchServer(launchServerOptions);
+      this.chromiumProc = this.server.process();
+      this.server.on("close", () => this.onServerClosed());
+      this.chromiumProc.on("exit", (code, signal) =>
+        this.onChromiumExit(code, signal)
+      );
 
-      this.browser = await browserType.launch(launchOptions);
+      this.browser = await browserType.connect(this.server.wsEndpoint());
       this.context = await this.browser.newContext({
         viewport: {
           width: this.options.viewportWidth,
@@ -122,15 +158,53 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   }
 
   async close(): Promise<void> {
+    this.closingIntentionally = true;
     this.stopKeepalive();
     this.pageStates.clear();
-    await this.context?.close();
-    if (this.browser) {
-      await this.browser.close();
+    // Tear down in dependency order. Each step is best-effort so a partial
+    // failure does not prevent cleanup of the next layer.
+    try {
+      await this.context?.close();
+    } catch (err) {
+      console.error("[playwright] context.close error:", err);
+    }
+    try {
+      await this.browser?.close();
+    } catch (err) {
+      console.error("[playwright] browser.close error:", err);
+    }
+    try {
+      await this.server?.close();
+    } catch (err) {
+      console.error("[playwright] server.close error:", err);
     }
     this.context = null;
     this.browser = null;
+    this.server = null;
+    this.chromiumProc = null;
     this.activeTabId = null;
+  }
+
+  // --- Crash / lifecycle observers ----------------------------------------
+  // Phase 2 only logs. The Phase 5 supervisor will hook into these to drive
+  // restart with snapshot/restore.
+  private onServerClosed(): void {
+    if (this.closingIntentionally) return;
+    console.error("[playwright] BrowserServer closed unexpectedly");
+  }
+
+  private onChromiumExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.closingIntentionally) return;
+    console.error(
+      `[playwright] Chromium process exited unexpectedly (code=${code}, signal=${signal ?? "-"})`
+    );
+  }
+
+  private onContextClosed(): void {
+    if (this.closingIntentionally) return;
+    console.error(
+      "[playwright] Persistent context closed unexpectedly (likely Chromium crash)"
+    );
   }
 
   async execute(
