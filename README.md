@@ -17,7 +17,7 @@ The MCP surface keeps the `browser-control` shape and adds secret-safe input hel
 | **Interaction** | click, type, scroll, pressKey (chords), hover, mouseMove, selectOption, check, annotations | - | full |
 | **Capture** | screenshot, computedStyles, elementRect, metrics, annotate, highlight | metrics only | full |
 | **Execution** | executeJs | - | full |
-| **Wait** | selector, navigation, networkIdle | - | full |
+| **Wait** | selector, navigation, networkIdle, url (pattern-based) | - | full |
 | **Cookies** | get, set, delete | full | full |
 | **Storage** | get, set, clear + session save/restore | full | full |
 | **Dialog** | setBehavior, getLast | - | full |
@@ -218,6 +218,9 @@ npm run smoke:fill-and-submit
 | `BROWSER_HEADLESS` | `1` | Set `0` to show the browser window |
 | `BROWSER_USER_DATA_DIR` | (temp) | Persistent profile directory |
 | `BROWSER_STARTUP_TIMEOUT_MS` | `30000` | Browser launch timeout |
+| `AI_BROWSER_SECRET_STORE` | `memory` | `persistent` to keep secrets across daemon restarts |
+| `AI_BROWSER_VAULT_KEY` | (unset) | Passphrase for the persistent vault (PBKDF2 → AES-256-GCM). Unset → OS keychain fallback |
+| `AI_BROWSER_SECRETS_FILE` | `$XDG_CONFIG_HOME/ai-browser/secrets.enc` | Override the persistent secrets file path |
 
 ## CLI
 
@@ -280,6 +283,15 @@ ai-browser metrics --json
 # Waits
 ai-browser wait-selector "#app-ready"
 ai-browser wait-network-idle
+ai-browser wait-url "https://example.com/dashboard*" --pattern-type glob --timeout 120000
+
+# Secrets (credentials stay inside the daemon; plaintext never crosses argv)
+ai-browser secret-put --from-env LOGIN_PW --label gmail --json
+ai-browser secret-put --from-file /tmp/pw.txt --label github --json
+echo -n "$PW" | ai-browser secret-put --stdin --label paypal --json
+ai-browser secret-list --json
+ai-browser type-secret "#password" --secret-id <id>
+ai-browser secret-delete <id>
 
 # Monitoring
 ai-browser console-logs --json
@@ -362,6 +374,64 @@ Typical recipes for an AI agent:
 - In this Codex sandbox, Chromium launch required escalated permissions to pass the runtime smoke test.
 - The checked smoke path used the cached Playwright Chromium binary at `~/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome`.
 - A runnable MCP entrypoint is provided at [scripts/run-mcp.sh](/home/marshall/dev/browser/scripts/run-mcp.sh).
+
+## Persistent secret store
+
+By default, secrets live in an in-memory AES-GCM vault that evaporates when the daemon stops. Set `AI_BROWSER_SECRET_STORE=persistent` to keep them across restarts in an encrypted file (default `$XDG_CONFIG_HOME/ai-browser/secrets.enc`, mode `0600`).
+
+The master key resolves in this order:
+
+1. **`AI_BROWSER_VAULT_KEY` env** (passphrase) — derived to a 32-byte key via PBKDF2-SHA256 (200k iters, per-vault random salt stored in the file header). Best for CI, scripts, and shared shells where keychain access is awkward.
+2. **OS keychain auto-fallback** — only if `AI_BROWSER_VAULT_KEY` is unset:
+   - macOS: `security add-generic-password` (key fed through `security -i` so it never appears in process argv)
+   - Linux: `secret-tool` (libsecret)
+3. **Neither available** → store init fails with an actionable error.
+
+Once unlocked, every record is sealed with its own IV + auth tag. `secret-list` (CLI) and `secret_list` (MCP) return metadata only — id, label, createdAt, opaque preview — and never decrypt.
+
+```bash
+# One-time setup (passphrase mode)
+export AI_BROWSER_SECRET_STORE=persistent
+export AI_BROWSER_VAULT_KEY='your-strong-passphrase'
+
+ai-browser secret-put --from-env GMAIL_PW --label gmail --json
+# { "id": "ab12...", "label": "gmail", ... } — id is the only handle you reuse
+```
+
+Restart the daemon, restart the host — the handle still resolves. Switching modes (passphrase ↔ keychain) requires a new vault file because the master keys are independent by design.
+
+## Login + 2FA recipe
+
+The three new pieces (`wait-url`, persistent secrets, CLI `type-secret`) compose into a single shell script that handles credential-protected logins with manual 2FA:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Daemon shares cookies/storage across calls — log in once, reuse forever.
+ai-browser navigate https://accounts.example.com/signin
+ai-browser type "#email" "me@example.com"
+ai-browser type-secret "#password" --secret-id "$EXAMPLE_SECRET_ID"
+ai-browser click "button[type=submit]"
+
+# User taps the 2FA prompt on their phone. The script just waits.
+ai-browser wait-url "https://app.example.com/home*" \
+    --pattern-type glob \
+    --timeout 120000
+
+# Now logged in. Persist cookies to disk so the next run skips 2FA.
+ai-browser cookies-get https://app.example.com --json > ~/.cache/example-cookies.json
+```
+
+`wait-url` supports three `--pattern-type` modes:
+
+| Mode | Use when | Example |
+|------|----------|---------|
+| `exact` (default) | the target URL is fully predictable | `https://app.example.com/home` |
+| `glob` | path varies but host/prefix is stable | `https://app.example.com/u/*/home` |
+| `regex` | you need alternation or anchored matching | `^https://(app\|m)\\.example\\.com/home$` |
+
+The same primitives are available as MCP tools (`wait_for_url`, `secret_store_put`, `secret_list`, `type_secret`, `secret_store_delete`) so an AI agent can drive the same flow without ever seeing plaintext credentials.
 
 ## Secret Import
 
