@@ -220,14 +220,19 @@ npm run smoke:fill-and-submit
 | `AI_BROWSER_SECRET_STORE` | `memory` | `persistent` to keep secrets across daemon restarts |
 | `AI_BROWSER_VAULT_KEY` | (unset) | Passphrase for the persistent vault (PBKDF2 → AES-256-GCM). Unset → OS keychain fallback |
 | `AI_BROWSER_SECRETS_FILE` | `$XDG_CONFIG_HOME/ai-browser/secrets.enc` | Override the persistent secrets file path |
+| `AI_BROWSER_BASE_DIR` | `$XDG_RUNTIME_DIR/ai-browser` | Override the socket/pid directory. Used by `run-once` to isolate the ephemeral daemon. |
+| `AI_BROWSER_DRAIN_TIMEOUT_MS` | `10000` | How long `daemon.shutdown` waits for in-flight actions to finish before force-closing the context (real cancel, not a fake one). |
+| `BROWSER_MAX_RSS_MB` | (unset) | Chromium-tree RSS cap. When exceeded, the daemon gracefully restarts with the URL list + storageState replayed. Persistent-context mode skips the check (PID unavailable). |
+| `BROWSER_RSS_POLL_MS` | `15000` | RSS poll interval. Lower for tighter reaction; min 500ms. |
 
 ## CLI
 
 ```
 ai-browser <subcommand> [args] [--option value] [--json] [--tab N]
-ai-browser daemon [start|stop|status|restart|--foreground]
+ai-browser daemon [start|stop|status|health|restart|--foreground]
+ai-browser run-once <subcommand> [args]    # isolated ephemeral daemon
 ai-browser repl
-ai-browser mcp                  # explicit MCP server mode
+ai-browser mcp                             # explicit MCP server mode
 ai-browser help
 ```
 
@@ -238,12 +243,36 @@ The daemon listens on `$XDG_RUNTIME_DIR/ai-browser/daemon.sock` (fallback `~/.ca
 | Command | Effect |
 |---------|--------|
 | `ai-browser daemon start` | Start a detached daemon (no-op if already running) |
-| `ai-browser daemon stop` | Send shutdown to the daemon |
+| `ai-browser daemon stop` | Send shutdown to the daemon (graceful drain — waits for in-flight actions up to `AI_BROWSER_DRAIN_TIMEOUT_MS`, then force-closes the context to release stuck Playwright work) |
 | `ai-browser daemon status` | Print socket path, PID, and running state. Exit codes: `0` = running (ready), `1` = stopped, `2` = starting/mid-init |
+| `ai-browser daemon health` | JSON snapshot: uptime, accepting flag, in-flight count, last error, Chromium PID, tree RSS, supervisor state. Works during drain. |
 | `ai-browser daemon restart` | Stop + start |
 | `ai-browser daemon --foreground` | Run the daemon in the foreground (used internally and for debugging) |
 
 Any subcommand auto-spawns the daemon if it is not running.
+
+### Reliability
+
+The daemon supervises Chromium with three layered mechanisms so it stays up across crashes, leaks, and disconnects:
+
+- **Crash restore.** Every action's URL is tracked in real time (via `framenavigated`) and `storageState` (cookies + localStorage) is refreshed in memory every 5s. When the Chromium process exits unexpectedly (signal, OOM, hard kill), the supervisor relaunches with exponential backoff (1s → 2s → 4s, capped at 30s) and replays URLs + storageState into the new context. Persistent-profile mode relies on the user-data-dir for state and only restores URLs (plus cleans up `SingletonLock`/`SingletonCookie`/`SingletonSocket` so the relaunch can take ownership).
+- **Memory reclaim.** With `BROWSER_MAX_RSS_MB` set, the daemon polls the Chromium process tree every `BROWSER_RSS_POLL_MS` (default 15s) and triggers a graceful restart through the same supervisor path when the threshold is exceeded. The old browser is closed before the new one is launched — the restart is actual reclaim, not a duplicate process.
+- **Drain on shutdown.** `daemon.shutdown` / `SIGTERM` stops accepting new non-control requests, lets in-flight actions finish for up to `AI_BROWSER_DRAIN_TIMEOUT_MS`, and then force-closes the context. Clients with mid-send disconnects receive an explicit `request cancelled` error — the bridge never silently replays an action that may have been partially executed.
+
+Three consecutive failed restarts cause the daemon to exit with code 1 so a process supervisor (systemd, launchd) can do a fresh boot.
+
+For long-running deployments (systemd unit, launchd plist, health observation, drain semantics, migration notes), see [`docs/operations.md`](docs/operations.md).
+
+### Ephemeral daemon for one-off commands (`run-once`)
+
+For CI scripts that want a clean browser per invocation without affecting the user's long-running daemon:
+
+```bash
+ai-browser run-once navigate https://example.com
+ai-browser run-once screenshot --out /tmp/page.png
+```
+
+`run-once` spawns an isolated daemon in a temporary directory (via `AI_BROWSER_BASE_DIR`), runs the single subcommand, then tears the daemon down. Meta subcommands (`daemon`, `run-once`, `mcp`, `repl`, `help`) are refused. The main daemon, if any, is untouched.
 
 ### Output format
 
