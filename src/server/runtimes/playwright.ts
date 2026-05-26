@@ -16,11 +16,14 @@ import {
   type Request,
   type Response,
 } from "playwright-core";
+import { unlink as fsUnlink } from "node:fs/promises";
+import { join as pathJoin } from "node:path";
 import type { BridgeAction, BridgeResponse } from "../../shared/protocol.js";
 import type { BrowserDriver } from "../bridge.js";
 import { getSecretStore } from "../secrets.js";
 import { compileUrlMatcher, type UrlPatternType } from "../../shared/urlMatch.js";
 import { ActionQueue, GLOBAL, type Scope } from "../utils/actionQueue.js";
+import { SnapshotKeeper, type ContextSnapshot } from "../utils/snapshotKeeper.js";
 
 interface PlaywrightOptions {
   browserName: string;
@@ -69,6 +72,44 @@ interface PageState {
 // positional tabId silently re-resolve to a different page later on.
 const UNRESOLVED_TAB = "__unresolved__";
 
+// Maximum consecutive restart attempts before giving up and exiting the
+// daemon process. Process supervisors (systemd, launchd) can then do a
+// fresh boot. Backoff grows exponentially: 1s, 2s, 4s, capped at 30s.
+const MAX_RESTART_ATTEMPTS = 3;
+const RESTART_BACKOFF_CAP_MS = 30_000;
+
+// Chromium leaves these single-instance lock files in the user-data-dir
+// after an unclean exit. The next launchPersistentContext will fail with
+// "ProcessSingleton" or similar until they are removed.
+const CHROMIUM_LOCK_FILES = [
+  "SingletonLock",
+  "SingletonCookie",
+  "SingletonSocket",
+];
+
+async function clearChromiumLocks(userDir: string): Promise<void> {
+  await Promise.all(
+    CHROMIUM_LOCK_FILES.map(async (name) => {
+      try {
+        await fsUnlink(pathJoin(userDir, name));
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+          // Missing is fine — clean shutdown leaves no locks.
+          return;
+        }
+        // Anything else (permission, IO error) deserves attention because
+        // launchPersistentContext will otherwise fail with a confusing
+        // ProcessSingleton error and we'd lose the original cause.
+        console.error(
+          `[playwright] failed to clear lock ${name} in ${userDir}:`,
+          err
+        );
+      }
+    })
+  );
+}
+
 const MAX_LOG_ENTRIES = 200;
 const MAX_NETWORK_ENTRIES = 500;
 const MAX_BODY_BYTES = 100_000;
@@ -98,9 +139,28 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   private readonly secrets = getSecretStore();
   private readonly queue = new ActionQueue();
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  // Crash supervisor state
+  private readonly snapshot: SnapshotKeeper;
+  // Carried into init() so a restart can apply the last storageState to the
+  // new context. Non-persistent path only.
+  private pendingStorageState: unknown | null = null;
+  // Carried into init() so a restart restores the URL list afterwards.
+  private pendingUrls: string[] | null = null;
+  // Number of consecutive failed restarts. Reset on a successful restart.
+  // Hits MAX_RESTART_ATTEMPTS → die loudly so a process supervisor (systemd)
+  // can do a fresh boot.
+  private restartAttempt = 0;
+  private restarting: Promise<void> | null = null;
 
   constructor(options: PlaywrightOptions) {
     this.options = options;
+    // Persistent contexts have their cookies/localStorage backed by the
+    // userDataDir on disk; storageState injection is not their normal
+    // restore path. Non-persistent contexts must capture storageState in
+    // memory so a crash restart can re-apply it to the new context.
+    this.snapshot = new SnapshotKeeper({
+      captureStorageState: !options.userDataDir,
+    });
   }
 
   async init(): Promise<void> {
@@ -109,7 +169,10 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
 
     if (this.options.userDataDir) {
       // Persistent path: profile-backed context. BrowserServer is not
-      // available here; crash signal is context.on("close").
+      // available here; crash signal is context.on("close"). On restart
+      // after an unclean Chromium exit, leftover Singleton* lock files
+      // would block relaunch — clear them first.
+      await clearChromiumLocks(this.options.userDataDir);
       this.context = await browserType.launchPersistentContext(
         this.options.userDataDir,
         {
@@ -151,12 +214,23 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
       );
 
       this.browser = await browserType.connect(this.server.wsEndpoint());
-      this.context = await this.browser.newContext({
+      // Apply storageState if a restart is replaying the prior session's
+      // cookies/localStorage. pendingStorageState is set by the supervisor
+      // right before it calls init() again.
+      const contextOptions: Parameters<Browser["newContext"]>[0] = {
         viewport: {
           width: this.options.viewportWidth,
           height: this.options.viewportHeight,
         },
-      });
+      };
+      if (this.pendingStorageState) {
+        (contextOptions as Record<string, unknown>).storageState =
+          this.pendingStorageState;
+      }
+      this.context = await this.browser.newContext(contextOptions);
+      // pendingStorageState is read once more below in snapshot.attach()
+      // for the keeper seed. It is cleared AFTER that read so a second
+      // crash before the next 5s refresh still has the cookies/storage.
     }
 
     this.context.on("page", (page) => this.attachPage(page));
@@ -166,12 +240,69 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
     this.attachPage(page);
     this.activeTabId = this.tabIdForPage(page);
 
+    // Begin continuous snapshot tracking. The keeper records URLs in real
+    // time via framenavigated events and periodically refreshes
+    // storageState (non-persistent mode). The pre-crash snapshot is what
+    // the supervisor restores after a Chromium kill. On a restart we MUST
+    // seed the keeper with the storageState we just applied to the new
+    // context, otherwise a back-to-back crash before the next refresh
+    // cycle would lose cookies/localStorage.
+    this.snapshot.attach(this.context, {
+      initialStorageState: this.pendingStorageState ?? undefined,
+    });
+    // Now safe to clear — both the new context AND the keeper hold copies.
+    this.pendingStorageState = null;
+    for (const p of this.context.pages()) {
+      const uuid = this.pageUuids.get(p);
+      if (uuid) this.snapshot.trackPage(p, uuid);
+    }
+
+    // Restore URL list on the new context after a restart (the supervisor
+    // sets pendingUrls before calling init() again). Done after snapshot
+    // attach so the new URLs feed back into snapshot tracking immediately.
+    if (this.pendingUrls && this.pendingUrls.length > 0) {
+      const urlsToRestore = this.pendingUrls;
+      this.pendingUrls = null;
+      await this.restoreUrls(urlsToRestore);
+    }
+
     this.startKeepalive();
+  }
+
+  private async restoreUrls(urls: string[]): Promise<void> {
+    if (!this.context) return;
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i];
+      if (!url || url.startsWith("about:") || url.startsWith("chrome-error:")) {
+        continue;
+      }
+      let page: Page;
+      const existing = this.context.pages();
+      if (i < existing.length) {
+        page = existing[i];
+      } else {
+        page = await this.context.newPage();
+        this.attachPage(page);
+        const uuid = this.pageUuids.get(page);
+        if (uuid) this.snapshot.trackPage(page, uuid);
+      }
+      try {
+        await page.goto(url, { waitUntil: "load", timeout: 30_000 });
+      } catch (err) {
+        console.error(
+          `[playwright] restore: navigation to ${url} failed:`,
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
   }
 
   async close(): Promise<void> {
     this.closingIntentionally = true;
     this.stopKeepalive();
+    // Stop the snapshot refresh tick BEFORE context.close so the timer
+    // doesn't fire one last storageState query against a closing context.
+    this.snapshot.detach();
     this.pageStates.clear();
     // Tear down in dependency order. Each step is best-effort so a partial
     // failure does not prevent cleanup of the next layer.
@@ -197,12 +328,13 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
     this.activeTabId = null;
   }
 
-  // --- Crash / lifecycle observers ----------------------------------------
-  // Phase 2 only logs. The Phase 5 supervisor will hook into these to drive
-  // restart with snapshot/restore.
+  // --- Crash / lifecycle observers + supervisor ---------------------------
+  // Both unexpected close events route into scheduleRestart, which captures
+  // the last known snapshot, tears the dead runtime down, and re-inits.
   private onServerClosed(): void {
     if (this.closingIntentionally) return;
     console.error("[playwright] BrowserServer closed unexpectedly");
+    void this.scheduleRestart("server-closed");
   }
 
   private onChromiumExit(code: number | null, signal: NodeJS.Signals | null): void {
@@ -210,6 +342,7 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
     console.error(
       `[playwright] Chromium process exited unexpectedly (code=${code}, signal=${signal ?? "-"})`
     );
+    void this.scheduleRestart(`chromium-exit (code=${code})`);
   }
 
   private onContextClosed(): void {
@@ -217,6 +350,91 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
     console.error(
       "[playwright] Persistent context closed unexpectedly (likely Chromium crash)"
     );
+    void this.scheduleRestart("persistent-context-close");
+  }
+
+  private async scheduleRestart(reason: string): Promise<void> {
+    if (this.closingIntentionally) return;
+    // Coalesce concurrent crash signals (server-close + process-exit often
+    // fire together) onto a single restart in-flight.
+    if (this.restarting) return await this.restarting;
+
+    if (this.restartAttempt >= MAX_RESTART_ATTEMPTS) {
+      console.error(
+        `[playwright] giving up after ${this.restartAttempt} consecutive restart attempts (reason: ${reason})`
+      );
+      // Let the process supervisor (systemd / launchd) start a fresh
+      // daemon. exit(1) marks this as a failure for restart-on-failure.
+      process.exit(1);
+    }
+
+    this.restartAttempt++;
+    const backoffMs = Math.min(
+      RESTART_BACKOFF_CAP_MS,
+      1_000 * 2 ** (this.restartAttempt - 1)
+    );
+    console.error(
+      `[playwright] restart attempt ${this.restartAttempt}/${MAX_RESTART_ATTEMPTS} in ${backoffMs}ms (reason: ${reason})`
+    );
+
+    this.restarting = (async (): Promise<void> => {
+      try {
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        // Shutdown can be requested while we were sleeping. If so, bail
+        // before we relaunch Chromium — otherwise the daemon would tear
+        // down its socket but the new Chromium would still be alive.
+        if (this.closingIntentionally) return;
+
+        // Snapshot is captured pre-restart (it has the last good URLs +
+        // storageState in memory).
+        const snap: ContextSnapshot = this.snapshot.current();
+
+        // Drop refs to dead Playwright objects so init() builds new ones.
+        // stopKeepalive() before init() — otherwise a new interval is
+        // installed on top of the old one and they accumulate per restart.
+        this.stopKeepalive();
+        this.snapshot.detach();
+        this.pageStates.clear();
+        this.context = null;
+        this.browser = null;
+        this.server = null;
+        this.chromiumProc = null;
+        this.activeTabId = null;
+
+        // Carry forward state for the new context.
+        this.pendingStorageState = snap.storageState ?? null;
+        this.pendingUrls = snap.urls.length > 0 ? snap.urls : null;
+
+        // Re-check the gate one more time: between the snapshot capture
+        // and starting init() the daemon could have observed shutdown.
+        if (this.closingIntentionally) return;
+        await this.init();
+        // If shutdown arrived during init() itself, tear the new context
+        // back down so we don't leave Chromium running with no daemon.
+        if (this.closingIntentionally) {
+          await this.close().catch(() => undefined);
+          return;
+        }
+        console.error(
+          `[playwright] restart attempt ${this.restartAttempt} succeeded`
+        );
+        this.restartAttempt = 0;
+      } catch (err) {
+        console.error(
+          `[playwright] restart attempt ${this.restartAttempt} failed:`,
+          err instanceof Error ? err.message : err
+        );
+        // If shutdown happened during the failed attempt, stop chaining.
+        if (this.closingIntentionally) return;
+        // Chain into the next attempt — the loop continues until success
+        // or MAX_RESTART_ATTEMPTS.
+        this.restarting = null;
+        await this.scheduleRestart(`retry-after-failure (${reason})`);
+      } finally {
+        this.restarting = null;
+      }
+    })();
+    return await this.restarting;
   }
 
   async execute(
@@ -224,6 +442,20 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
     params: Record<string, unknown>
   ): Promise<BridgeResponse> {
     const id = crypto.randomUUID();
+    // If the supervisor is mid-restart (context is null/closing during
+    // backoff + relaunch), wait for it to finish before dispatching.
+    // Otherwise the request would fail immediately against a dead context
+    // instead of seeing the daemon as briefly slow. We never throw out of
+    // this wait — if the restart itself failed, dispatch will surface a
+    // more specific error.
+    if (this.restarting) {
+      try {
+        await this.restarting;
+      } catch {
+        // swallow — supervisor logged it; dispatch will report a concrete
+        // error if the context still is not usable.
+      }
+    }
     // Determine the queue scope AND pin the page identity at enqueue time.
     // The pinned UUID rides into dispatch via __pageUuid so that even if the
     // positional tabId shifts during the queue wait (because another action
@@ -233,6 +465,11 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
       const data = await this.queue.enqueue(scope, () =>
         this.dispatch(action, pinnedParams)
       );
+      // Any successful action may have mutated cookies / localStorage /
+      // navigation history. Mark the snapshot dirty so the next refresh
+      // tick re-reads storageState. False positives are cheap; misses
+      // would lose state on a crash restart.
+      this.snapshot.markDirty();
       return { id, success: true, data };
     } catch (error) {
       return {
@@ -494,6 +731,11 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
     if (!this.pageUuids.has(page)) {
       this.pageUuids.set(page, randomBytes(8).toString("hex"));
     }
+    // Snapshot tracking — URL is updated continuously via framenavigated
+    // so the supervisor always has the latest known URL even if the
+    // context dies before we can query it.
+    const uuid = this.pageUuids.get(page);
+    if (uuid) this.snapshot.trackPage(page, uuid);
 
     const state: PageState = {
       consoleLogs: [],
@@ -654,6 +896,11 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   }
 
   private async closeTab(page: Page): Promise<null> {
+    // Drop from snapshot BEFORE the close — otherwise the keeper would
+    // see the page emit "close" and keep its last URL for a phantom
+    // restore on a future crash.
+    const uuid = this.pageUuids.get(page);
+    if (uuid) this.snapshot.dropPage(uuid);
     await page.close();
     this.activeTabId = this.pages()[0] ? 1 : null;
     return null;
@@ -1360,24 +1607,39 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
   }
 
   private async setCookie(params: Record<string, unknown>): Promise<null> {
-    const url = this.normalizeUrl(String(params.url ?? ""));
+    // Playwright's addCookies rejects entries with BOTH url and domain set.
+    // If the caller provided a domain explicitly, honor that. Otherwise
+    // derive everything from the url (which is the common case).
+    const hasDomain = typeof params.domain === "string" && params.domain;
+    const rawUrl = String(params.url ?? "");
+    if (!hasDomain && !rawUrl) {
+      throw new Error("cookies.set requires either url or domain");
+    }
+    const baseCookie: Record<string, unknown> = {
+      name: String(params.name ?? ""),
+      value: String(params.value ?? ""),
+      secure: params.secure === true,
+      httpOnly: params.httpOnly === true,
+    };
+    if (typeof params.expirationDate === "number") {
+      baseCookie.expires = params.expirationDate;
+    }
+    if (hasDomain) {
+      // domain mode: domain + path required, url disallowed
+      baseCookie.domain = params.domain as string;
+      baseCookie.path = typeof params.path === "string" ? params.path : "/";
+    } else {
+      // url mode: domain/path derived from url, must not be set explicitly
+      baseCookie.url = this.normalizeUrl(rawUrl);
+      if (typeof params.path === "string") {
+        // Caller gave an explicit path — drop the url and use domain+path
+        baseCookie.domain = new URL(this.normalizeUrl(rawUrl)).hostname;
+        baseCookie.path = params.path;
+        delete (baseCookie as { url?: unknown }).url;
+      }
+    }
     await this.requireContext().addCookies([
-      {
-        url,
-        name: String(params.name ?? ""),
-        value: String(params.value ?? ""),
-        domain:
-          typeof params.domain === "string"
-            ? params.domain
-            : new URL(url).hostname,
-        path: typeof params.path === "string" ? params.path : "/",
-        secure: params.secure === true,
-        httpOnly: params.httpOnly === true,
-        expires:
-          typeof params.expirationDate === "number"
-            ? params.expirationDate
-            : undefined,
-      },
+      baseCookie as Parameters<BrowserContext["addCookies"]>[0][number],
     ]);
     return null;
   }

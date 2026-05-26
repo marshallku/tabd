@@ -35,7 +35,8 @@
         "e2e:secrets-cli": "npm run build && node tests/e2e-secrets-cli.mjs",
         "e2e:secrets-persistent": "npm run build && node tests/e2e-secrets-persistent.mjs",
         "e2e:action-queue": "npm run build && node tests/e2e-action-queue.mjs",
-        "e2e:drain": "npm run build && node tests/e2e-daemon-drain.mjs"
+        "e2e:drain": "npm run build && node tests/e2e-daemon-drain.mjs",
+        "e2e:crash-restore": "npm run build && node tests/e2e-crash-restore.mjs"
     },
     "publishConfig": {
         "access": "public"
