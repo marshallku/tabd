@@ -199,26 +199,116 @@ rm -rf \"$TMP\"
 마지막 stdout이 spike fetch-text 출력과 byte-exact match면 1차 parity 통과.
 **`example.com` 같은 외부 URL은 smoke에서 빼고** `data:` URL로 결정적으로 (codex I4).
 
-## 측정 항목 (codex C5 — clean breakdown)
+## 측정 결과 (codex C5 — clean breakdown)
 
-footprint 비교 표. 단위 MB.
+본 머신 (Arch Linux x86_64, Node 24.14, Rust 1.95) 실측 footprint. 단위 MB (1 MB = 1024 KB).
 
-| 컴포넌트 | 측정 방법 | 현재 (Playwright 기본) | 현재 (chromium-cdp + 시스템) | spike (Rust + 시스템) |
-|---|---|---|---|---|
-| Node 런타임 | `du -sh $(which node)` 의존 트리 | ~50 | ~50 | 0 |
-| `playwright-core` + deps | `du -sh node_modules/` | TBD | TBD | 0 |
-| 번들 Chromium | `du -sh ~/.cache/ms-playwright/chromium-*/` | ~280 | 0 (시스템 사용 시) | 0 |
-| 시스템 Chromium | `du -sh $(which google-chrome 또는 chromium)` | n/a | 측정 | 측정 |
-| Rust 바이너리 | `ls -lh target/release/cdp-spike` | n/a | n/a | TBD |
-| **총 추가 disk** | 합산 | TBD | TBD | **TBD** |
-| Chrome 프로세스 RSS | `/proc/<pid>/status VmRSS` | 측정 | 측정 | 측정 |
-| spawn → 첫 응답 latency | `time` | 측정 | 측정 | 측정 |
-| 코드 LOC (spike 단독) | `tokei crates/cdp-spike/` | n/a | n/a | TBD |
-| 의존성 트리 항목 수 | `cargo tree | wc -l` | n/a | n/a | TBD |
+### 디스크 footprint
 
-이 표가 채워지면 "Playwright 제거가 실제로 얼마나 줄여주는가"가 숫자로 보인다.
-중간 열(`chromium-cdp + 시스템`)이 핵심 — 이미 TS만으로도 시스템 Chrome 쓰면 번들
-Chromium은 제거 가능하기 때문. spike의 진짜 추가 가치는 Node + node_modules 라인.
+| 컴포넌트 | 현재 (Playwright 기본) | chromium-cdp + 시스템 | spike (Rust + 시스템) |
+|---|---:|---:|---:|
+| Node 런타임 (`$(which node)`) | 117 | 117 | 0 |
+| `node_modules/` (전체) | 96 | 96 | 0 |
+| └ playwright-core | 12 | 12 (의존성 그래프상 여전히 로드됨) | 0 |
+| └ ws | 0.2 | 0.2 | 0 |
+| └ zod | 5.2 | 5.2 | 0 |
+| `dist/` (TS 컴파일 결과) | 0.6 | 0.6 | 0 |
+| 번들 Chromium (`~/.cache/ms-playwright/chromium-*`) | 369 | 0 (사용 안 함) | 0 |
+| 시스템 Chromium | n/a | 사용자 환경 | 사용자 환경 |
+| Rust 바이너리 (`target/release/cdp-spike`) | n/a | n/a | **6.2** |
+| **추가 disk (사용자 시스템 외)** | **583** | **214** | **6.2** |
+
+> Node 런타임 위치는 환경에 따라 다름. 본 머신에서는 mise 경유라
+> `$(which node)`가 `~/.local/share/mise/installs/node/24.14.0/bin/node`로 풀린다.
+> 다른 환경에서는 `/usr/bin/node` 등 다른 경로일 수 있으나 바이너리 크기는 유사
+> (Node 24.x 정적 빌드 ≈ 110~120 MB).
+
+> **핵심 관찰**: 이미 TS만으로도 `BROWSER_RUNTIME=chromium-cdp` + 시스템 Chrome 사용 시
+> 번들 Chromium(369 MB)은 제거 가능. 그러나 Node + node_modules 라인(214 MB)이 남는다.
+> spike는 그것까지 제거해서 **583 MB → 6.2 MB (≈94× 감소)** 달성.
+
+### 런타임 비교
+
+> **측정 조건**: 양쪽 모두 동일한 Chromium 바이너리 사용
+> (이 머신엔 시스템 Chrome 부재 → 양쪽 모두 Playwright cache의
+> `chromium-1217/chrome-linux64/chrome`로 통일). 시스템 Chrome이 있는
+> 환경에서도 chromium 자체 spawn/실행은 동일하므로 결과는 운영자 환경의
+> Chrome 바이너리 선택과 무관. 측정 값은 **호스트 측 (Rust vs Node+TS)
+> 오버헤드 차이**.
+
+| 항목 | 현재 (TS chromium-cdp) | spike (Rust) |
+|---|---:|---:|
+| navigate latency (data: URL, n=3 avg) | 517 ms | 210 ms |
+| 코드 LOC (spike crate 단독) | n/a | 864 |
+| 의존성 트리 항목 수 (unique crates) | n/a | 168 |
+
+> **latency**: spike가 chromium-cdp 대비 **약 2.5× 빠름**. 주로 Node startup +
+> TS 모듈 로딩 오버헤드 제거가 기여. Chrome 자체 spawn 시간은 양쪽 동일.
+
+> **LOC 864**: stub + 단위 테스트 + 5개 명령 + CDP 클라이언트 합산. 비교용으로
+> `src/server/runtimes/cdp.ts` 단독은 1900+ 줄 (풀 기능 — DOM/cookies/screenshot/등).
+> spike는 navigate/eval/fetch-text 부분만 한정.
+
+### 측정 명령 (재현용 — 표의 모든 값을 1:1로 다시 만들 수 있음)
+
+> 디스크 사이즈는 `du -sh`(allocated, 사용자가 체감하는 on-disk 크기) 기준.
+> 매우 작은 값(< 1 MB)은 `du -b`(apparent) 와 차이가 보일 수 있음.
+
+```bash
+# Rust 바이너리 (6.2 MB apparent / ≈6.3 MB allocated)
+du -b crates/cdp-spike/target/release/cdp-spike  # 6446080 bytes
+du -sh crates/cdp-spike/target/release/cdp-spike
+
+# node_modules 전체 (96 MB) + per-dep 서브로우 (12 MB / 0.2 MB / 5.2 MB)
+du -sh node_modules
+du -sh node_modules/playwright-core node_modules/ws node_modules/zod
+
+# dist/ (0.6 MB apparent — du -b 591476 bytes; du -sh 보고 0.9 MB allocated)
+du -b dist | tail -1
+du -sh dist
+
+# 번들 Chromium (369 MB)
+du -sh ~/.cache/ms-playwright/chromium-1217
+
+# Node 런타임 (117 MB) — 환경에 따라 경로 다름
+ls -l "$(which node)"
+
+# LOC (864)
+find crates/cdp-spike/src -name '*.rs' -exec wc -l {} +
+
+# 의존성 트리 unique crate 수 (168)
+cargo tree --manifest-path crates/cdp-spike/Cargo.toml --prefix none | sort -u | wc -l
+
+# 양쪽 latency 측정에 반드시 같은 chromium binary를 사용해야 비교가 의미 있음.
+# 이 머신은 시스템 Chrome이 없으므로 Playwright cache의 chromium-1217을 양쪽에 강제.
+# 시스템 Chrome이 있는 환경에서는 그 경로로 바꾸기만 하면 됨.
+CHROMIUM="$HOME/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome"
+
+# spike latency (210 ms avg, n=3, ns 정밀도)
+for i in 1 2 3; do t1=$(date +%s%N);
+  BROWSER_EXECUTABLE="$CHROMIUM" \
+    ./crates/cdp-spike/target/release/cdp-spike navigate "data:text/html,<h1>hi</h1>" >/dev/null
+  t2=$(date +%s%N); echo $(( (t2-t1)/1000000 ))ms; done
+
+# TS chromium-cdp latency (517 ms avg, n=3) — 같은 chromium binary 강제 + navigate
+# 성공 여부 확인 (실패 시 process.exit(1) → latency 측정 자체가 무효화되도록).
+for i in 1 2 3; do tmp=$(mktemp -d); t1=$(date +%s%N);
+  BROWSER_RUNTIME=chromium-cdp \
+  BROWSER_EXECUTABLE="$CHROMIUM" \
+  BROWSER_USER_DATA_DIR="$tmp" BROWSER_DEBUG_PORT=$((19222+i)) \
+  node --input-type=module -e '
+    const{createRuntime}=await import("./dist/server/runtime.js");
+    const r=createRuntime(); await r.init();
+    const nav = await r.execute("tabs.navigate",{url:"data:text/html,<h1>hi</h1>"});
+    if (!nav.success) { console.error("navigate failed", nav); process.exit(1); }
+    await r.close();
+  ' >/dev/null
+  rc=$?
+  t2=$(date +%s%N)
+  if [[ $rc -eq 0 ]]; then echo $(( (t2-t1)/1000000 ))ms; else echo "FAILED"; fi
+  rm -rf "$tmp"
+done
+```
 
 ## 중단 기준
 
