@@ -132,6 +132,8 @@ export class FetchBrowserDriver implements BrowserDriver {
         return null;
       case "wait.networkIdle":
         return null;
+      case "wait.url":
+        return this.unsupported("URL waits require a browser runtime");
       case "cookies.get":
         return this.getCookies(String(params.url ?? ""));
       case "cookies.set":
@@ -155,6 +157,7 @@ export class FetchBrowserDriver implements BrowserDriver {
         return this.unsupported("Dialogs require a browser runtime");
       case "secrets.put":
       case "secrets.delete":
+      case "secrets.list":
         // Handled in bridge layer, never reaches the driver.
         return this.unsupported("secrets actions are handled by the bridge");
       default:

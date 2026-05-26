@@ -16,6 +16,7 @@ import {
 import type { BridgeAction, BridgeResponse } from "../../shared/protocol.js";
 import type { BrowserDriver } from "../bridge.js";
 import { getSecretStore } from "../secrets.js";
+import { compileUrlMatcher, type UrlPatternType } from "../../shared/urlMatch.js";
 
 interface PlaywrightOptions {
   browserName: string;
@@ -226,6 +227,8 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
         return this.waitForNavigation(params);
       case "wait.networkIdle":
         return this.waitForNetworkIdle(params);
+      case "wait.url":
+        return this.waitForUrl(params);
       case "cookies.get":
         return this.getCookies(params);
       case "cookies.set":
@@ -250,6 +253,7 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
         return this.getNetworkLogs(params);
       case "secrets.put":
       case "secrets.delete":
+      case "secrets.list":
         // Handled in bridge layer, never reaches the driver.
         throw new Error(`secrets actions are handled by the bridge`);
       default:
@@ -1128,6 +1132,18 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
       timeout: Number(params.timeout ?? 10000),
     });
     return null;
+  }
+
+  private async waitForUrl(
+    params: Record<string, unknown>
+  ): Promise<{ url: string }> {
+    const page = this.getPage(params);
+    const pattern = String(params.pattern ?? "");
+    const patternType = (params.patternType as UrlPatternType) ?? "exact";
+    const timeout = Number(params.timeout ?? 30000);
+    const match = compileUrlMatcher(pattern, patternType);
+    await page.waitForURL((url) => match(url.toString()), { timeout });
+    return { url: page.url() };
   }
 
   private async getCookies(

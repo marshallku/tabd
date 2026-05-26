@@ -4,6 +4,7 @@ import {
   randomBytes,
   randomUUID,
 } from "node:crypto";
+import { PersistentSecretStore } from "./persistentSecrets.js";
 
 export interface SecretRecord {
   id: string;
@@ -11,10 +12,18 @@ export interface SecretRecord {
   createdAt: number;
 }
 
+export interface SecretSummary {
+  id: string;
+  label?: string;
+  createdAt: number;
+  preview: string;
+}
+
 export interface SecretStore {
   put(value: string, label?: string): Promise<SecretRecord>;
   get(id: string): Promise<string>;
   delete(id: string): Promise<void>;
+  list(): Promise<SecretSummary[]>;
 }
 
 interface StoredSecret extends SecretRecord {
@@ -74,12 +83,40 @@ export class InMemorySecretStore implements SecretStore {
   async delete(id: string): Promise<void> {
     this.records.delete(id);
   }
+
+  async list(): Promise<SecretSummary[]> {
+    // Plaintext is encrypted in memory; preview just exposes a stable mask.
+    const out: SecretSummary[] = [];
+    for (const record of this.records.values()) {
+      out.push({
+        id: record.id,
+        label: record.label,
+        createdAt: record.createdAt,
+        preview: redact(record.ciphertext, 0),
+      });
+    }
+    return out;
+  }
 }
 
-const defaultStore = new InMemorySecretStore();
+let cachedStore: SecretStore | null = null;
 
 export function getSecretStore(): SecretStore {
-  return defaultStore;
+  if (cachedStore) return cachedStore;
+  const mode = (process.env.AI_BROWSER_SECRET_STORE ?? "memory").toLowerCase();
+  if (mode === "persistent") {
+    // PersistentSecretStore defers key unlock until first put/get, so the
+    // module import itself is side-effect free.
+    cachedStore = new PersistentSecretStore();
+    return cachedStore;
+  }
+  cachedStore = new InMemorySecretStore();
+  return cachedStore;
+}
+
+// Test-only: reset cached store so tests can pick up env changes.
+export function _resetSecretStoreForTests(): void {
+  cachedStore = null;
 }
 
 export function redact(value: string, keepLast = 0): string {

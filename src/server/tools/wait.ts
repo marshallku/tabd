@@ -55,6 +55,46 @@ export function registerWaitTools(server: McpServer): void {
   );
 
   server.tool(
+    "wait_for_url",
+    "Wait until the page URL matches a pattern. Useful for OAuth/2FA redirects.",
+    {
+      pattern: z
+        .string()
+        .describe(
+          "URL pattern to match (literal/glob/regex depending on patternType)"
+        ),
+      patternType: z
+        .enum(["exact", "glob", "regex"])
+        .optional()
+        .describe(
+          "How to interpret pattern. 'exact' = strict equality, 'glob' = * and ? wildcards, 'regex' = RegExp.test. Default: exact"
+        ),
+      timeout: z
+        .number()
+        .optional()
+        .describe("Timeout in milliseconds (default: 30000)"),
+      tabId: z.number().optional().describe("Tab ID (default: active tab)"),
+    },
+    async ({ pattern, patternType, timeout, tabId }) => {
+      const res = await send("wait.url", {
+        pattern,
+        patternType,
+        timeout,
+        tabId,
+      });
+      if (!res.success) {
+        return createBridgeTextResult(false, "", res.error);
+      }
+      const data = res.data as { url?: string } | null;
+      return createBridgeTextResult(
+        true,
+        `URL matched: ${data?.url ?? pattern}`,
+        res.error
+      );
+    }
+  );
+
+  server.tool(
     "wait_for_network_idle",
     "Wait for network activity to settle (no new requests for a period). Useful for SPAs that load data dynamically.",
     {

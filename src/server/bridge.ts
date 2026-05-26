@@ -63,7 +63,7 @@ async function ensureDaemonClient(): Promise<DaemonClient> {
 }
 
 async function handleLocalSecrets(
-  action: "secrets.put" | "secrets.delete",
+  action: "secrets.put" | "secrets.delete" | "secrets.list",
   params: Record<string, unknown>
 ): Promise<BridgeResponse> {
   const store = getSecretStore();
@@ -73,6 +73,10 @@ async function handleLocalSecrets(
       const label = typeof params.label === "string" ? params.label : undefined;
       const record = await store.put(value, label);
       return { id: "", success: true, data: record };
+    }
+    if (action === "secrets.list") {
+      const items = await store.list();
+      return { id: "", success: true, data: items };
     }
     const id = String(params.id ?? params.secretId ?? "");
     if (!id) throw new Error("id is required");
@@ -96,7 +100,9 @@ export async function send(
   // locally so put/delete share the in-process store with interaction.typeSecret.
   if (
     mode === "standalone" &&
-    (action === "secrets.put" || action === "secrets.delete")
+    (action === "secrets.put" ||
+      action === "secrets.delete" ||
+      action === "secrets.list")
   ) {
     return handleLocalSecrets(action, params);
   }

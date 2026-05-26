@@ -6,6 +6,7 @@ import WebSocket from "ws";
 import type { BridgeAction, BridgeResponse } from "../../shared/protocol.js";
 import type { BrowserDriver } from "../bridge.js";
 import { getSecretStore } from "../secrets.js";
+import { compileUrlMatcher, type UrlPatternType } from "../../shared/urlMatch.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -342,6 +343,8 @@ export class CdpBrowserDriver implements BrowserDriver {
         return this.waitForNavigation(params);
       case "wait.networkIdle":
         return this.waitForNetworkIdle(params);
+      case "wait.url":
+        return this.waitForUrl(params);
 
       case "cookies.get":
         return this.getCookies(String(params.url ?? ""));
@@ -371,6 +374,7 @@ export class CdpBrowserDriver implements BrowserDriver {
 
       case "secrets.put":
       case "secrets.delete":
+      case "secrets.list":
         // Handled in bridge layer, never reaches the driver.
         throw new Error(`secrets actions are handled by the bridge`);
 
@@ -1668,6 +1672,36 @@ export class CdpBrowserDriver implements BrowserDriver {
 
     throw new Error(
       `Timed out waiting for network idle (${state.networkPending} pending requests)`
+    );
+  }
+
+  private async waitForUrl(
+    params: Record<string, unknown>
+  ): Promise<{ url: string }> {
+    const targetId = await this.resolveTargetId(params);
+    const pattern = String(params.pattern ?? "");
+    const patternType = (params.patternType as UrlPatternType) ?? "exact";
+    const timeout = Number(params.timeout ?? 30_000);
+    const match = compileUrlMatcher(pattern, patternType);
+    const deadline = Date.now() + timeout;
+    let lastUrl = "";
+
+    while (Date.now() < deadline) {
+      try {
+        lastUrl = String(
+          (await this.evaluate(targetId, "location.href")) ?? ""
+        );
+        if (match(lastUrl)) {
+          return { url: lastUrl };
+        }
+      } catch {
+        // page is navigating; keep polling
+      }
+      await sleep(200);
+    }
+
+    throw new Error(
+      `Timed out waiting for URL pattern (${patternType}) ${pattern}; last seen: ${lastUrl}`
     );
   }
 

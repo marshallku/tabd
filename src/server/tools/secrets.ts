@@ -47,6 +47,22 @@ export function registerSecretTools(server: McpServer): void {
   );
 
   server.tool(
+    "secret_list",
+    "List stored secret handles. Returns metadata only — plaintext is never exposed.",
+    {},
+    async () => {
+      const res = await send("secrets.list", {});
+      if (!res.success) {
+        return createTextResult({
+          text: res.error ?? "secrets.list failed",
+          isError: true,
+        });
+      }
+      return createJsonResult({ data: res.data ?? [] });
+    }
+  );
+
+  server.tool(
     "secret_store_delete",
     "Delete a previously stored secret handle.",
     {

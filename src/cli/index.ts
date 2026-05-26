@@ -9,6 +9,7 @@ import { runDaemon, getDaemonPaths, isProcessAlive } from "../server/daemon.js";
 import { runRepl } from "./repl.js";
 import type { BridgeAction, BridgeResponse } from "../shared/protocol.js";
 import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { writeFile } from "node:fs/promises";
 
 interface SubcommandSpec {
@@ -138,6 +139,12 @@ const SUBCOMMANDS: Record<string, SubcommandSpec> = {
     positional: ["selector"],
     description: "Wait for selector to appear",
   },
+  "wait-url": {
+    action: "wait.url",
+    positional: ["pattern"],
+    description:
+      "Wait until URL matches pattern (--pattern-type exact|glob|regex, --timeout ms)",
+  },
   "wait-network-idle": {
     action: "wait.networkIdle",
     positional: [],
@@ -187,6 +194,22 @@ const SUBCOMMANDS: Record<string, SubcommandSpec> = {
     action: "storage.clear",
     positional: [],
     description: "Clear storage (--type)",
+  },
+  "secret-list": {
+    action: "secrets.list",
+    positional: [],
+    description: "List stored secret handles (ids/labels only — never plaintext)",
+  },
+  "secret-delete": {
+    action: "secrets.delete",
+    positional: ["id"],
+    description: "Delete a stored secret by handle id",
+  },
+  "type-secret": {
+    action: "interaction.typeSecret",
+    positional: ["selector"],
+    description:
+      "Type a stored secret into a field (--secret-id ID, --no-clear to keep value)",
   },
 };
 
@@ -266,17 +289,94 @@ function printHelp(): void {
   console.log("  ai-browser mcp                 (run MCP server on stdio)");
   console.log("");
   console.log("Subcommands:");
-  const names = Object.keys(SUBCOMMANDS).sort();
+  const names = [...Object.keys(SUBCOMMANDS), "secret-put"].sort();
   const maxLen = Math.max(...names.map((n) => n.length));
+  const customDescriptions: Record<string, string> = {
+    "secret-put":
+      "Store a secret from --from-env/--from-file/--stdin (never argv)",
+  };
   for (const name of names) {
-    console.log(
-      `  ${name.padEnd(maxLen)}  ${SUBCOMMANDS[name].description}`
-    );
+    const desc =
+      SUBCOMMANDS[name]?.description ?? customDescriptions[name] ?? "";
+    console.log(`  ${name.padEnd(maxLen)}  ${desc}`);
   }
   console.log("");
   console.log("Output:");
   console.log("  Default: pretty-printed JSON or text. --json: compact JSON.");
   console.log("  --out FILE: write binary results (e.g. screenshot) to FILE.");
+}
+
+async function readStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    process.stdin.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    process.stdin.on("end", () =>
+      resolve(Buffer.concat(chunks).toString("utf8"))
+    );
+    process.stdin.on("error", reject);
+  });
+}
+
+async function handleSecretPut(rest: string[]): Promise<number> {
+  // Normalize `--stdin` into `--stdin=true` so parseArgs (which always treats
+  // `--flag` as value-bearing) does not swallow the following argument.
+  const normalized = rest.map((arg) => (arg === "--stdin" ? "--stdin=true" : arg));
+  const parsed = parseArgs(normalized);
+  const label =
+    typeof parsed.options.label === "string"
+      ? (parsed.options.label as string)
+      : undefined;
+  const fromEnv = parsed.options.fromEnv as string | undefined;
+  const fromFile = parsed.options.fromFile as string | undefined;
+  const fromStdin = parsed.options.stdin === true;
+  const sourcesPicked = [fromEnv, fromFile, fromStdin ? "stdin" : null].filter(
+    Boolean
+  ).length;
+
+  if (sourcesPicked === 0) {
+    console.error(
+      "secret-put: provide --from-env VAR, --from-file PATH, or --stdin"
+    );
+    return 2;
+  }
+  if (sourcesPicked > 1) {
+    console.error(
+      "secret-put: choose exactly one of --from-env, --from-file, --stdin"
+    );
+    return 2;
+  }
+
+  let value: string;
+  if (fromEnv) {
+    const v = process.env[fromEnv];
+    if (v == null) {
+      console.error(`secret-put: env var ${fromEnv} is not set`);
+      return 2;
+    }
+    value = v;
+  } else if (fromFile) {
+    try {
+      // Strip a single trailing newline (common for `echo > file`).
+      value = (await readFile(fromFile, "utf8")).replace(/\r?\n$/, "");
+    } catch (err) {
+      console.error(
+        `secret-put: failed to read ${fromFile}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return 2;
+    }
+  } else {
+    value = (await readStdin()).replace(/\r?\n$/, "");
+  }
+
+  if (!value) {
+    console.error("secret-put: value is empty");
+    return 2;
+  }
+
+  const result = await withDaemon((client) =>
+    client.send("secrets.put", { value, label })
+  );
+  return renderResult(result, parsed);
 }
 
 async function handleDaemon(rest: string[]): Promise<number> {
@@ -443,6 +543,7 @@ export async function runCli(argv: string[]): Promise<number> {
     await runRepl();
     return 0;
   }
+  if (cmd === "secret-put") return handleSecretPut(rest);
   const spec = SUBCOMMANDS[cmd];
   if (!spec) {
     console.error(`unknown subcommand: ${cmd}`);

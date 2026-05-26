@@ -30,7 +30,10 @@
         "e2e:hover": "npm run build && node tests/e2e-hover.mjs",
         "e2e:cdp-parity": "npm run build && node tests/e2e-cdp-parity.mjs",
         "e2e:cli": "npm run build && node tests/e2e-cli.mjs",
-        "e2e:mcp-daemon": "npm run build && node tests/e2e-mcp-daemon.mjs"
+        "e2e:mcp-daemon": "npm run build && node tests/e2e-mcp-daemon.mjs",
+        "e2e:wait-url": "npm run build && node tests/e2e-wait-url.mjs",
+        "e2e:secrets-cli": "npm run build && node tests/e2e-secrets-cli.mjs",
+        "e2e:secrets-persistent": "npm run build && node tests/e2e-secrets-persistent.mjs"
     },
     "publishConfig": {
         "access": "public"
