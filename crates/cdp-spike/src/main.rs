@@ -33,6 +33,24 @@ enum Command {
         #[arg(long, default_value_t = 30_000)]
         timeout: u64,
     },
+    /// High-level text extraction with TS `dom.getText` semantics:
+    /// default selector chain (`main, article, body` then `body` fallback),
+    /// `innerText` with blank-line collapse and trim, `--raw` for unprocessed
+    /// `textContent`, and a `--testid` shortcut for `[data-testid=...]`.
+    GetText {
+        url: String,
+        /// Explicit CSS selector. Mutually exclusive with --testid.
+        #[arg(long, group = "gt_target")]
+        selector: Option<String>,
+        /// data-testid value shortcut. Mutually exclusive with --selector.
+        #[arg(long, group = "gt_target")]
+        testid: Option<String>,
+        /// Return raw textContent (no innerText, no collapse, no trim).
+        #[arg(long)]
+        raw: bool,
+        #[arg(long, default_value_t = 30_000)]
+        timeout: u64,
+    },
 }
 
 #[tokio::main]
@@ -51,5 +69,21 @@ async fn main() -> Result<()> {
             selector,
             timeout,
         } => cmd::fetch_text::run(&url, &selector, timeout).await,
+        Command::GetText {
+            url,
+            selector,
+            testid,
+            raw,
+            timeout,
+        } => {
+            cmd::get_text::run(
+                &url,
+                selector.as_deref(),
+                testid.as_deref(),
+                raw,
+                timeout,
+            )
+            .await
+        }
     }
 }

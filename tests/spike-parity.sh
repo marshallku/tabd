@@ -103,6 +103,59 @@ ts_eval_to() {
   return $rc
 }
 
+# Encode arbitrary HTML (including real newlines) as a base64 data: URL so both
+# sides receive byte-identical input and shell quoting cannot corrupt newlines.
+# Callers MUST pass actual newlines (use $'...' C-quoted strings or here-docs);
+# regular double-quoted strings keep \n as literal backslash-n.
+make_data_url() {
+  local html="$1"
+  local b64
+  b64="$(printf '%s' "$html" | base64 -w0)"
+  printf 'data:text/html;base64,%s' "$b64"
+}
+
+# Run TS dom.getText action. params built from env to avoid shell-quoting traps:
+#   PARITY_URL — data: URL
+#   PARITY_SELECTOR_PRESENT — "1" to include params.selector
+#   PARITY_SELECTOR — selector string (only read when SELECTOR_PRESENT=1)
+#   PARITY_RAW — "1" → true, anything else → false (TS checks `=== true`)
+ts_get_text_to() {
+  local url="$1" selector_opt="$2" raw="$3" out="$4"
+  local tmp
+  tmp="$(mktemp -d -t cdp-spike-parity.XXXX)"
+  local sel_present="0"
+  if [[ -n "${selector_opt}" ]]; then
+    sel_present="1"
+  fi
+  BROWSER_RUNTIME=chromium-cdp \
+  BROWSER_EXECUTABLE="$CHROMIUM_BIN" \
+  BROWSER_USER_DATA_DIR="$tmp" \
+  BROWSER_DEBUG_PORT=19222 \
+  PARITY_URL="$url" \
+  PARITY_SELECTOR_PRESENT="$sel_present" \
+  PARITY_SELECTOR="$selector_opt" \
+  PARITY_RAW="$raw" \
+  node --input-type=module -e '
+    const { createRuntime } = await import("./dist/server/runtime.js");
+    const r = createRuntime();
+    await r.init();
+    const nav = await r.execute("tabs.navigate", { url: process.env.PARITY_URL });
+    if (!nav.success) { console.error("TS navigate failed:", nav); process.exit(1); }
+    const params = {};
+    if (process.env.PARITY_SELECTOR_PRESENT === "1") {
+      params.selector = process.env.PARITY_SELECTOR;
+    }
+    params.raw = process.env.PARITY_RAW === "1";
+    const res = await r.execute("dom.getText", params);
+    if (!res.success) { console.error("TS dom.getText failed:", res); process.exit(1); }
+    console.log(typeof res.data === "string" ? res.data : JSON.stringify(res.data));
+    await r.close();
+  ' > "$out"
+  local rc=$?
+  rm -rf "$tmp"
+  return $rc
+}
+
 # Run only navigate via TS (no executeJs); used for the navigate-only case.
 ts_navigate() {
   local url="$1"
@@ -193,6 +246,32 @@ case_fetch_text() {
   fi
 }
 
+# get-text parity. spike_selector / spike_testid: at most one is non-empty.
+# When both empty, spike uses default chain. ts_selector mirrors spike's effective
+# selector — for testid, it's "[data-testid=\"X\"]" which is equivalent for plain IDs.
+case_get_text() {
+  local label="$1" url="$2"
+  local spike_selector="$3" spike_testid="$4"
+  local ts_selector="$5"
+  local raw="$6"   # "1" or "0"
+  local sf tf
+  sf="$(mktemp)"
+  tf="$(mktemp)"
+  local args=(get-text "$url")
+  if [[ -n "$spike_selector" ]]; then args+=(--selector "$spike_selector"); fi
+  if [[ -n "$spike_testid" ]]; then args+=(--testid "$spike_testid"); fi
+  if [[ "$raw" == "1" ]]; then args+=(--raw); fi
+  "$SPIKE" "${args[@]}" > "$sf"
+  ts_get_text_to "$url" "$ts_selector" "$raw" "$tf"
+  if cmp -s "$sf" "$tf"; then
+    report_pass "$label" "$(cat "$sf" | tr -d '\n')"
+    rm -f "$sf" "$tf"
+  else
+    report_fail "$label" "$(xxd "$sf" | head -1)" "$(xxd "$tf" | head -1)"
+    rm -f "$sf" "$tf"
+  fi
+}
+
 echo "== spike parity smoke =="
 
 case_navigate "navigate data:" "data:text/html,<h1>Hi</h1>"
@@ -212,6 +291,48 @@ case_fetch_text "fetch-text h1" \
 case_fetch_text "fetch-text no-match" \
   "data:text/html,<h1>x</h1>" \
   "no-match"
+
+# get-text: default chain (selector empty on both sides → TS uses "main, article, body")
+case_get_text "get-text default chain → body" \
+  "data:text/html,<main>M</main><article>A</article><body>B</body>" \
+  "" "" "" "0"
+
+case_get_text "get-text default chain (body-only page)" \
+  "data:text/html,<body>Plain body</body>" \
+  "" "" "" "0"
+
+# get-text: explicit selector
+case_get_text "get-text --selector h1" \
+  "data:text/html,<h1>Heading</h1><p>Body</p>" \
+  "h1" "" "h1" "0"
+
+# get-text: selector miss → body fallback (TS's ?? document.body)
+case_get_text "get-text --selector miss → body" \
+  "data:text/html,<body>Fallback content</body>" \
+  "no-match-here" "" "no-match-here" "0"
+
+# get-text: --testid (simple ID). TS-side uses equivalent [data-testid="..."].
+case_get_text "get-text --testid hit (simple ID)" \
+  "data:text/html,<span data-testid=x>V</span><body>B</body>" \
+  "" "x" '[data-testid="x"]' "0"
+
+case_get_text "get-text --testid miss → body" \
+  "data:text/html,<body>Body again</body>" \
+  "" "does-not-exist" '[data-testid="does-not-exist"]' "0"
+
+# get-text: trim. Default mode strips outer whitespace.
+case_get_text "get-text default trim" \
+  "data:text/html,<body>  trim me  </body>" \
+  "" "" "" "0"
+
+# get-text: raw vs default newline collapse. Use base64 data: URL so actual
+# newlines reach the browser (codex round 1 BP4).
+NEWLINE_URL="$(make_data_url $'<pre>a\n\n\n\nb</pre>')"
+case_get_text "get-text default collapses 4 \\n → 2" \
+  "$NEWLINE_URL" "pre" "" "pre" "0"
+
+case_get_text "get-text --raw preserves 4 \\n" \
+  "$NEWLINE_URL" "pre" "" "pre" "1"
 
 echo "== summary =="
 echo "passed: $PASS_COUNT"
