@@ -36,15 +36,24 @@ enum Command {
     /// High-level text extraction with TS `dom.getText` semantics:
     /// default selector chain (`main, article, body` then `body` fallback),
     /// `innerText` with blank-line collapse and trim, `--raw` for unprocessed
-    /// `textContent`, and a `--testid` shortcut for `[data-testid=...]`.
+    /// `textContent`. Element identification supports three mutually exclusive
+    /// modes: `--selector <CSS>`, `--testid <ID>` shortcut for
+    /// `[data-testid=...]`, or `--role <ROLE>` (with optional `--name <NAME>`)
+    /// via CDP `Accessibility.queryAXTree` — first visible (non-ignored) match.
     GetText {
         url: String,
-        /// Explicit CSS selector. Mutually exclusive with --testid.
+        /// Explicit CSS selector. Mutually exclusive with --testid / --role.
         #[arg(long, group = "gt_target")]
         selector: Option<String>,
-        /// data-testid value shortcut. Mutually exclusive with --selector.
+        /// data-testid value shortcut. Mutually exclusive with --selector / --role.
         #[arg(long, group = "gt_target")]
         testid: Option<String>,
+        /// ARIA role for Accessibility.queryAXTree. Mutually exclusive with --selector / --testid.
+        #[arg(long, group = "gt_target")]
+        role: Option<String>,
+        /// Exact accessible name match. Requires --role.
+        #[arg(long, requires = "role")]
+        name: Option<String>,
         /// Return raw textContent (no innerText, no collapse, no trim).
         #[arg(long)]
         raw: bool,
@@ -73,6 +82,8 @@ async fn main() -> Result<()> {
             url,
             selector,
             testid,
+            role,
+            name,
             raw,
             timeout,
         } => {
@@ -80,6 +91,8 @@ async fn main() -> Result<()> {
                 &url,
                 selector.as_deref(),
                 testid.as_deref(),
+                role.as_deref(),
+                name.as_deref(),
                 raw,
                 timeout,
             )

@@ -41,32 +41,46 @@ pub async fn evaluate_value(client: &CdpClient, expr: &str) -> Result<Option<Val
             }),
         )
         .await?;
+    unwrap_runtime_result(&raw, "Runtime.evaluate")
+}
 
+/// Shared unwrap of a Runtime.evaluate / Runtime.callFunctionOn response body.
+/// `op` is the human-readable operation label used in error messages so that
+/// callers (`Runtime.evaluate` vs `Runtime.callFunctionOn`) get accurate
+/// diagnostics.
+///
+/// CDP semantics for the inner RemoteObject:
+///   - `type=="undefined"`               → no value field; treat as `None`
+///   - `unserializableValue` present     → NaN / Infinity / -0 / 1n etc.;
+///                                         surface the literal as a string so
+///                                         callers see the same form DevTools shows
+///   - `value` present                   → the serializable value
+///   - otherwise (object/function w/o by-value) → bail with the type
+pub fn unwrap_runtime_result(raw: &Value, op: &str) -> Result<Option<Value>> {
     if let Some(exc) = raw.get("exceptionDetails") {
         let msg = exc
             .get("exception")
             .and_then(|e| e.get("description"))
             .and_then(Value::as_str)
             .or_else(|| exc.get("text").and_then(Value::as_str))
-            .unwrap_or("evaluate threw");
-        bail!("Runtime.evaluate: {msg}");
+            .unwrap_or("evaluation threw");
+        bail!("{op}: {msg}");
     }
 
     let result_obj = raw
         .get("result")
-        .ok_or_else(|| anyhow!("Runtime.evaluate response missing 'result'"))?;
+        .ok_or_else(|| anyhow!("{op} response missing 'result'"))?;
 
-    // CDP semantics for the inner RemoteObject:
-    //   - type=="undefined"           → no value field; treat as `None`
-    //   - unserializableValue present → NaN / Infinity / -0 / 1n etc.;
-    //                                   surface the literal as a string so
-    //                                   callers see the same form DevTools shows
-    //   - value present               → the serializable value
-    //   - otherwise (object/function w/o by-value)  → bail with the type
-    if matches!(result_obj.get("type").and_then(Value::as_str), Some("undefined")) {
+    if matches!(
+        result_obj.get("type").and_then(Value::as_str),
+        Some("undefined")
+    ) {
         return Ok(None);
     }
-    if let Some(unser) = result_obj.get("unserializableValue").and_then(Value::as_str) {
+    if let Some(unser) = result_obj
+        .get("unserializableValue")
+        .and_then(Value::as_str)
+    {
         return Ok(Some(Value::String(unser.to_owned())));
     }
     if let Some(value) = result_obj.get("value") {
@@ -76,5 +90,42 @@ pub async fn evaluate_value(client: &CdpClient, expr: &str) -> Result<Option<Val
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("<no type>");
-    bail!("Runtime.evaluate returned a non-serializable {type_str}; pass returnByValue-friendly expression or serialize on the JS side");
+    bail!("{op} returned a non-serializable {type_str}; pass returnByValue-friendly expression or serialize on the JS side");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unwrap_runtime_result;
+    use serde_json::json;
+
+    #[test]
+    fn unwrap_returns_string_value() {
+        let raw = json!({ "result": { "type": "string", "value": "hello" } });
+        let v = unwrap_runtime_result(&raw, "Runtime.evaluate").unwrap();
+        assert_eq!(v.unwrap(), json!("hello"));
+    }
+
+    #[test]
+    fn unwrap_undefined_returns_none() {
+        let raw = json!({ "result": { "type": "undefined" } });
+        assert!(unwrap_runtime_result(&raw, "Runtime.evaluate").unwrap().is_none());
+    }
+
+    #[test]
+    fn unwrap_unserializable_becomes_string() {
+        let raw = json!({ "result": { "type": "number", "unserializableValue": "NaN" } });
+        let v = unwrap_runtime_result(&raw, "Runtime.evaluate").unwrap();
+        assert_eq!(v.unwrap(), json!("NaN"));
+    }
+
+    #[test]
+    fn unwrap_exception_uses_operation_label() {
+        let raw = json!({
+            "result": { "type": "undefined" },
+            "exceptionDetails": { "exception": { "description": "boom" } }
+        });
+        let err = unwrap_runtime_result(&raw, "Runtime.callFunctionOn").unwrap_err();
+        assert!(err.to_string().starts_with("Runtime.callFunctionOn:"), "got: {err}");
+        assert!(err.to_string().contains("boom"), "got: {err}");
+    }
 }

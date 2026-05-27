@@ -334,6 +334,76 @@ case_get_text "get-text default collapses 4 \\n → 2" \
 case_get_text "get-text --raw preserves 4 \\n" \
   "$NEWLINE_URL" "pre" "" "pre" "1"
 
+# Phase 1b — Accessibility queryAXTree cases. TS chromium-cdp doesn't expose
+# the Accessibility domain, so these are spike-only checks (no TS parity).
+# Verdict signal: spike command exits as expected (0 for hits, 1 for miss,
+# 2 for clap rejections).
+
+echo "== phase 1b: accessibility (spike-only, no TS parity) =="
+
+ax_case() {
+  local label="$1" url="$2" expected_exit="$3"
+  shift 3
+  local actual_out actual_rc
+  # set -e would normally abort on a non-zero spike exit (e.g. --role miss).
+  # Use `if` to consume the exit status so the smoke can continue testing
+  # both success and failure cases.
+  if actual_out="$("$SPIKE" get-text "$url" "$@" 2>&1)"; then
+    actual_rc=0
+  else
+    actual_rc=$?
+  fi
+  if [[ "$actual_rc" == "$expected_exit" ]]; then
+    report_pass "$label" "$(printf '%s' "$actual_out" | head -1 | tr -d '\n')"
+  else
+    report_fail "$label" "rc=$actual_rc out=$actual_out" "expected rc=$expected_exit"
+  fi
+}
+
+ax_case "AX --role button hit" \
+  "data:text/html,<button>Click</button>" 0 \
+  --role button
+
+ax_case "AX --role button + --name select" \
+  "data:text/html,<button>X</button><button>Click</button>" 0 \
+  --role button --name "Click"
+
+ax_case "AX aria-label computed name → DOM text" \
+  "data:text/html,<button aria-label=\"Save changes\">SAVE</button>" 0 \
+  --role button --name "Save changes"
+
+ax_case "AX <label for> computed name → matches input" \
+  "data:text/html,<label for=\"e\">Email</label><input id=\"e\" type=\"text\" value=\"x\">" 0 \
+  --role textbox --name "Email"
+
+ax_case "AX --role miss exits 1" \
+  "data:text/html,<p>Plain</p>" 1 \
+  --role button
+
+ax_case "AX --role + --name miss exits 1" \
+  "data:text/html,<button>X</button>" 1 \
+  --role button --name "NotHere"
+
+ax_case "AX aria-hidden filtered (first visible wins)" \
+  "data:text/html,<button aria-hidden=\"true\">Hidden</button><button>Visible</button>" 0 \
+  --role button
+
+ax_case "AX --raw preserves whitespace" \
+  "data:text/html,<button>  Trim me  </button>" 0 \
+  --role button --name "Trim me" --raw
+
+ax_case "AX --selector + --role rejected by clap" \
+  "data:text/html,x" 2 \
+  --selector h1 --role button
+
+ax_case "AX --testid + --role rejected by clap" \
+  "data:text/html,x" 2 \
+  --testid foo --role button
+
+ax_case "AX --name without --role rejected by clap" \
+  "data:text/html,x" 2 \
+  --name "Click"
+
 echo "== summary =="
 echo "passed: $PASS_COUNT"
 echo "failed: $FAIL_COUNT"
