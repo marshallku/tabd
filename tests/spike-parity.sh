@@ -404,6 +404,79 @@ ax_case "AX --name without --role rejected by clap" \
   "data:text/html,x" 2 \
   --name "Click"
 
+# Phase 1c — query-all (multi-element extraction). spike-only, no TS parity:
+# TS chromium-cdp returns a different shape (object array, not text array).
+echo "== phase 1c: query-all (spike-only, no TS parity) =="
+
+qa_case() {
+  local label="$1" url="$2" expected_exit="$3" expected_stdout="$4"
+  shift 4
+  local actual_out actual_rc
+  if actual_out="$("$SPIKE" query-all "$url" "$@" 2>&1)"; then
+    actual_rc=0
+  else
+    actual_rc=$?
+  fi
+  local first_line
+  first_line="$(printf '%s' "$actual_out" | head -1)"
+  if [[ "$actual_rc" == "$expected_exit" ]] \
+      && { [[ -z "$expected_stdout" ]] || [[ "$first_line" == "$expected_stdout" ]]; }; then
+    report_pass "$label" "$first_line"
+  else
+    report_fail "$label" \
+      "rc=$actual_rc out=$first_line" \
+      "expected rc=$expected_exit stdout=$expected_stdout"
+  fi
+}
+
+qa_case "QA selector multi (3 lis)" \
+  "data:text/html,<li>a</li><li>b</li><li>c</li>" 0 '["a","b","c"]' \
+  --selector li
+
+qa_case "QA selector empty → []" \
+  "data:text/html,<p>x</p>" 0 '[]' \
+  --selector h1
+
+qa_case "QA selector --limit caps result" \
+  "data:text/html,<li>a</li><li>b</li><li>c</li>" 0 '["a","b"]' \
+  --selector li --limit 2
+
+qa_case "QA testid filters by dataset" \
+  "data:text/html,<span data-testid=item>a</span><span data-testid=item>b</span><span data-testid=other>x</span>" 0 '["a","b"]' \
+  --testid item
+
+qa_case "QA testid single match → single element array" \
+  "data:text/html,<span data-testid=x>v</span><span data-testid=y>w</span>" 0 '["v"]' \
+  --testid x
+
+qa_case "QA role multi (3 buttons)" \
+  "data:text/html,<button>A</button><button>B</button><button>C</button>" 0 '["A","B","C"]' \
+  --role button
+
+qa_case "QA role + name selects one" \
+  "data:text/html,<button>X</button><button>Two</button><button>Three</button>" 0 '["Two"]' \
+  --role button --name "Two"
+
+qa_case "QA role aria-hidden filtered" \
+  "data:text/html,<button aria-hidden=true>Hidden</button><button>Visible</button>" 0 '["Visible"]' \
+  --role button
+
+qa_case "QA role --limit caps result" \
+  "data:text/html,<button>A</button><button>B</button><button>C</button><button>D</button>" 0 '["A","B"]' \
+  --role button --limit 2
+
+qa_case "QA TARGET missing rejected" \
+  "data:text/html,x" 1 "" \
+  --raw
+
+qa_case "QA --selector + --role rejected by clap" \
+  "data:text/html,x" 2 "" \
+  --selector li --role button
+
+qa_case "QA bad CSS selector exits 1" \
+  "data:text/html,<p>x</p>" 1 "" \
+  --selector "[[bad"
+
 echo "== summary =="
 echo "passed: $PASS_COUNT"
 echo "failed: $FAIL_COUNT"

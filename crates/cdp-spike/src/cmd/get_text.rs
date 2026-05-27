@@ -61,7 +61,7 @@ fn validate_target_flags(
 /// Runtime.evaluate path (selector/testid/default) and the Runtime.callFunctionOn
 /// path (AX role/name) wrap this body with their own `const target = ...;` prefix
 /// so the extraction semantics cannot drift between paths.
-fn build_text_body(raw: bool) -> String {
+pub(super) fn build_text_body(raw: bool) -> String {
     let raw_lit = serde_json::to_string(&raw).expect("bool serialization");
     format!(
         r#"if ({raw_lit}) return target.textContent ?? "";
