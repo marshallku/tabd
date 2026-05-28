@@ -1,0 +1,72 @@
+name: Binary Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu,  suffix: linux-x64 }
+          - { os: macos-13,      target: x86_64-apple-darwin,       suffix: darwin-x64 }
+          - { os: macos-14,      target: aarch64-apple-darwin,      suffix: darwin-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rustup target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cargo build
+        run: |
+          cargo build --release \
+            --manifest-path crates/ai-browser/Cargo.toml \
+            --target ${{ matrix.target }}
+
+      - name: Stage binary
+        run: |
+          set -eu
+          src="crates/ai-browser/target/${{ matrix.target }}/release/ai-browser"
+          dest="ai-browser-${{ matrix.suffix }}"
+          cp "$src" "$dest"
+          # strip is broadly available on linux; skip on macOS (-S not always
+          # supported and macOS strip refuses unsigned binaries differently).
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            strip "$dest" || true
+          fi
+          ls -la "$dest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-browser-${{ matrix.suffix }}
+          path: ai-browser-${{ matrix.suffix }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Move binaries into a flat dir
+        run: |
+          set -eu
+          mkdir -p flat
+          find dist -type f -exec cp {} flat/ \;
+          ls -la flat/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" flat/* --generate-notes

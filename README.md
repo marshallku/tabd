@@ -2,6 +2,12 @@
 
 SSH-friendly headless browser MCP server for AI agents.
 
+## Install
+
+- From source: `cargo install --path crates/ai-browser`
+- Pre-built binary: download from the [latest release](https://github.com/marshallku/browser/releases)
+  (built for linux-x64, darwin-x64, darwin-arm64).
+
 Replaces `browser-control`'s WebExtension bridge with direct control. No display, no extension, no interactive session required.
 
 The intended long-term engine is Playwright. The browser engine itself should not be reinvented here; this repo should focus on the AI-facing layer on top of it.
