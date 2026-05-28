@@ -130,6 +130,8 @@ struct DaemonState {
     /// Lazy-init secrets vault. None until the first secrets.* call.
     /// Phase 3f: passphrase mode only ($AI_BROWSER_VAULT_KEY required).
     vault: Arc<Mutex<Option<crate::secrets::VaultStore>>>,
+    /// Cumulative chromium restart count for this daemon process (3g).
+    restart_attempts: Arc<AtomicU32>,
     started_at: Instant,
     pid: u32,
 }
@@ -162,6 +164,7 @@ impl DaemonState {
             browser: Arc::new(Mutex::new(None)),
             action_mutex: Arc::new(Mutex::new(())),
             vault: Arc::new(Mutex::new(None)),
+            restart_attempts: Arc::new(AtomicU32::new(0)),
             started_at: Instant::now(),
             pid: std::process::id(),
         }
@@ -215,15 +218,15 @@ impl DaemonState {
 
     async fn health(&self, id: &str) -> String {
         let last_err = self.last_error.lock().await.clone();
-        // Driver-level health (codex round 1 C4) — phase 2c populates chromium
-        // pid + RSS when the browser is up. restartAttempt is always 0 because
-        // spike does not implement crash-restart supervisor (phase 2c+).
+        let restart_attempts = self.restart_attempts.load(Ordering::Acquire);
+        let ready = self.ready.load(Ordering::Acquire);
         let driver = match self.browser.lock().await.as_ref().and_then(|b| b.pid()) {
             Some(pid) => json!({
                 "chromiumPid": pid,
                 "chromiumRssBytes": read_process_rss_bytes(pid),
-                "restartAttempt": 0,
-                "restarting": false,
+                "restartAttempts": restart_attempts,
+                "restartAttempt": restart_attempts, // legacy field for spike-daemon-compat
+                "restarting": !ready && restart_attempts > 0,
             }),
             None => Value::Null,
         };
@@ -1931,6 +1934,9 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
         }
     });
 
+    // Phase 3g: chromium liveness supervisor.
+    tokio::spawn(supervise(state.clone(), paths.clone()));
+
     // SIGTERM/SIGINT → graceful shutdown
     let sig_state = state.clone();
     tokio::spawn(async move {
@@ -1988,6 +1994,88 @@ async fn boot_browser_and_cdp(state: &DaemonState, paths: &DaemonPaths) -> Resul
     *state.client.lock().await = Some(Arc::new(client));
     *state.browser.lock().await = Some(browser);
     Ok(())
+}
+
+/// Phase 3g supervisor: polls chromium liveness every 2s and rebuilds the
+/// browser + cdp client if it died. Lock-free check via `/proc/{pid}/status`
+/// so it doesn't fight handlers for the state.browser mutex (Linux only —
+/// on other platforms supervision is effectively disabled).
+///
+/// We can't just check `/proc/{pid}` existence: if chromium dies before the
+/// daemon `wait()`s on the child, the kernel keeps a zombie entry around
+/// with `/proc/{pid}/` still present. Read State: from /proc/{pid}/status
+/// and treat Z (zombie) or X (dead) as not alive.
+fn chromium_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/proc/{pid}/status");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("State:") {
+                let state = rest.trim().chars().next();
+                return !matches!(state, Some('Z') | Some('X'));
+            }
+        }
+        true
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+async fn supervise(state: DaemonState, paths: DaemonPaths) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if state.drain_started.load(Ordering::Acquire) {
+            return;
+        }
+        if !state.ready.load(Ordering::Acquire) {
+            continue;
+        }
+        let pid = {
+            let guard = state.browser.lock().await;
+            guard.as_ref().and_then(|b| b.pid())
+        };
+        let Some(pid) = pid else { continue; };
+        if chromium_alive(pid) {
+            continue;
+        }
+        // Crash detected — flip ready off and rebuild.
+        eprintln!("[ai-browser daemon] chromium pid={pid} disappeared; restarting");
+        state.ready.store(false, Ordering::Release);
+        state.restart_attempts.fetch_add(1, Ordering::AcqRel);
+        // Drop the dead client/browser before booting a new one so resources
+        // are freed and the writer mpsc closes.
+        if let Some(client) = state.client.lock().await.take() {
+            let _ = client.close().await;
+        }
+        let _ = state.browser.lock().await.take();
+        let mut delay_ms: u64 = 200;
+        for attempt in 0..5u32 {
+            match boot_browser_and_cdp(&state, &paths).await {
+                Ok(()) => {
+                    state.ready.store(true, Ordering::Release);
+                    state.ready_notify.notify_waiters();
+                    eprintln!(
+                        "[ai-browser daemon] chromium recovered after {} attempt(s)",
+                        attempt + 1
+                    );
+                    break;
+                }
+                Err(err) => {
+                    state
+                        .record_failure("supervisor.restart", &err.to_string())
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    delay_ms = (delay_ms * 2).min(2000);
+                }
+            }
+        }
+    }
 }
 
 // -- Daemon control client (Rust CLI side) ----------------------------------
@@ -2208,6 +2296,23 @@ mod tests {
         assert_eq!(kd.key, "control+a");
         assert_eq!(kd.code, "KeyC");
         assert_eq!(kd.text.as_deref(), Some("control+a"));
+    }
+
+    // -- Phase 3g: supervisor --
+
+    #[test]
+    fn chromium_alive_true_for_self() {
+        // self process must always exist; on non-linux the helper returns
+        // true unconditionally which still satisfies this assertion.
+        assert!(chromium_alive(std::process::id()));
+    }
+
+    #[test]
+    fn chromium_alive_false_for_bogus_pid_on_linux() {
+        #[cfg(target_os = "linux")]
+        assert!(!chromium_alive(99_999_999));
+        #[cfg(not(target_os = "linux"))]
+        assert!(chromium_alive(99_999_999));
     }
 
     #[test]

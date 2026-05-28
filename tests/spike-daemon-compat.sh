@@ -984,6 +984,78 @@ case_secret_list_contains
 case_type_secret_into_input
 case_secret_delete
 
+# Phase 3g — chromium crash-restart supervisor.
+case_supervisor_restart() {
+  # Capture current chromium pid via health.
+  local h1 pid_before attempts_before
+  h1="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" daemon health 2>&1)" || true
+  pid_before="$(printf '%s' "$h1" | node -e '
+    let out = "";
+    try {
+      const s = require("fs").readFileSync(0, "utf8");
+      const start = s.indexOf("{"); const end = s.lastIndexOf("}");
+      const o = JSON.parse(s.slice(start, end + 1));
+      out = String((o.driver && o.driver.chromiumPid) || "");
+    } catch (e) {}
+    process.stdout.write(out);
+  ')"
+  attempts_before="$(printf '%s' "$h1" | node -e '
+    let out = "0";
+    try {
+      const s = require("fs").readFileSync(0, "utf8");
+      const start = s.indexOf("{"); const end = s.lastIndexOf("}");
+      const o = JSON.parse(s.slice(start, end + 1));
+      out = String((o.driver && o.driver.restartAttempts) || 0);
+    } catch (e) {}
+    process.stdout.write(out);
+  ')"
+  if [[ -z "$pid_before" ]]; then
+    report_fail "TS supervisor restart (no chromium pid)" "$h1"
+    return
+  fi
+
+  # Kill chromium (SIGKILL — supervisor should detect and rebuild). The
+  # supervise loop polls every 2s; boot a fresh chromium takes another 3-5s.
+  kill -9 "$pid_before" 2>/dev/null || true
+  sleep 10
+
+  # New health should show different pid + incremented restartAttempts.
+  local h2 pid_after attempts_after
+  h2="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" daemon health 2>&1)" || true
+  pid_after="$(printf '%s' "$h2" | node -e '
+    let out = "";
+    try {
+      const s = require("fs").readFileSync(0, "utf8");
+      const start = s.indexOf("{"); const end = s.lastIndexOf("}");
+      const o = JSON.parse(s.slice(start, end + 1));
+      out = String((o.driver && o.driver.chromiumPid) || "");
+    } catch (e) {}
+    process.stdout.write(out);
+  ')"
+  attempts_after="$(printf '%s' "$h2" | node -e '
+    let out = "0";
+    try {
+      const s = require("fs").readFileSync(0, "utf8");
+      const start = s.indexOf("{"); const end = s.lastIndexOf("}");
+      const o = JSON.parse(s.slice(start, end + 1));
+      out = String((o.driver && o.driver.restartAttempts) || 0);
+    } catch (e) {}
+    process.stdout.write(out);
+  ')"
+
+  if [[ -n "$pid_after" ]] && [[ "$pid_after" != "$pid_before" ]] && (( attempts_after > attempts_before )); then
+    # Bonus: a navigate should still succeed end-to-end on the new chromium.
+    if env "${ts_env[@]}" timeout 15 node "$AI_BROWSER" navigate "data:text/html,<title>R</title>" >/dev/null 2>&1; then
+      report_pass "TS supervisor restarted chromium ($pid_before→$pid_after, attempts $attempts_before→$attempts_after)"
+    else
+      report_fail "TS supervisor navigate after restart" "exit nonzero"
+    fi
+  else
+    report_fail "TS supervisor restart" "pid $pid_before→$pid_after attempts $attempts_before→$attempts_after"
+  fi
+}
+case_supervisor_restart
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true
