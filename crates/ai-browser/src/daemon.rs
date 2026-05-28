@@ -1479,6 +1479,89 @@ async fn handle_content_summary(
     Ok(Some(value))
 }
 
+// -- Phase 3e2: monitor.networkLogs (Network.* event stitching)
+
+async fn handle_network_logs(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100) as usize;
+    let method_filter = params
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let status_filter: Option<(Option<u16>, Option<u16>)> = match params.get("status") {
+        Some(Value::Number(n)) => {
+            n.as_u64().map(|v| (Some(v as u16), Some(v as u16)))
+        }
+        Some(Value::String(s)) => {
+            // "2xx" → (200, 299); fall through to None (no filter) on parse failure.
+            if let Some(first) = s.chars().next().and_then(|c| c.to_digit(10)) {
+                let lo = (first * 100) as u16;
+                let hi = lo + 99;
+                Some((Some(lo), Some(hi)))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let url_pattern_re = match params.get("urlPattern").and_then(Value::as_str) {
+        Some(p) => Some(regex::Regex::new(p).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let include_body = params
+        .get("includeBody")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+    let entries = client
+        .read_tab_state(&tid, |state| state.network_log.clone())
+        .await?;
+
+    let mut filtered: Vec<crate::cdp::NetworkEntry> = entries
+        .into_iter()
+        .filter(|e| match &method_filter {
+            Some(m) => e.method.to_ascii_lowercase() == *m,
+            None => true,
+        })
+        .filter(|e| match status_filter {
+            Some((Some(lo), Some(hi))) => e
+                .status
+                .map(|s| s >= lo && s <= hi)
+                .unwrap_or(false),
+            _ => true,
+        })
+        .filter(|e| match &url_pattern_re {
+            Some(re) => re.is_match(&e.url),
+            None => true,
+        })
+        .collect();
+
+    if !include_body {
+        for entry in filtered.iter_mut() {
+            entry.response_body = None;
+        }
+    }
+
+    if filtered.len() > limit {
+        let excess = filtered.len() - limit;
+        filtered.drain(0..excess);
+    }
+
+    let json = serde_json::to_value(filtered).map_err(|e| e.to_string())?;
+    Ok(Some(json))
+}
+
 // -- Connection / request loop ----------------------------------------------
 
 async fn process_request(state: &DaemonState, line: &str) -> String {
@@ -1539,6 +1622,7 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "monitor.pageErrors" => handle_page_errors(state, &req.params).await,
         "capture.metrics" => handle_metrics(state, &req.params).await,
         "dom.contentSummary" => handle_content_summary(state, &req.params).await,
+        "monitor.networkLogs" => handle_network_logs(state, &req.params).await,
         other => Err(format!("unsupported action: {other}")),
     };
 

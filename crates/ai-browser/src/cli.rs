@@ -63,11 +63,13 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
     m.insert("press-key", Spec { action: "interaction.pressKey", positional: &["key"] });
     m.insert("select-option", Spec { action: "interaction.selectOption", positional: &["selector"] });
     m.insert("check", Spec { action: "interaction.check", positional: &["selector"] });
-    // Phase 3e1 — Tier 5 monitor/diagnostic (network-logs deferred to 3e2).
+    // Phase 3e1 — Tier 5 monitor/diagnostic.
     m.insert("console-logs", Spec { action: "monitor.consoleLogs", positional: &[] });
     m.insert("page-errors", Spec { action: "monitor.pageErrors", positional: &[] });
     m.insert("metrics", Spec { action: "capture.metrics", positional: &[] });
     m.insert("summary", Spec { action: "dom.contentSummary", positional: &[] });
+    // Phase 3e2 — network-logs (event-stitching, body fetch deferred).
+    m.insert("network-logs", Spec { action: "monitor.networkLogs", positional: &[] });
     m
 });
 
@@ -495,9 +497,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_table_has_tier_1_3_4_5_partial() {
+    fn dispatch_table_has_tier_1_3_4_5() {
         // Tier 1 (16 from 3a) + Tier 3 (7 from 3c) + Tier 4 (6 from 3d) +
-        // Tier 5 partial (4 from 3e1 — network-logs deferred to 3e2).
+        // Tier 5 (5 from 3e). Tier 2 (secrets + wait-network-idle) is 3f.
         let tier_1 = [
             "navigate", "eval", "get-text", "get-html", "query", "screenshot",
             "click", "type", "wait-selector", "wait-url",
@@ -511,18 +513,18 @@ mod tests {
         let tier_4 = [
             "hover", "mouse-move", "scroll", "press-key", "select-option", "check",
         ];
-        let tier_5_partial = ["console-logs", "page-errors", "metrics", "summary"];
+        let tier_5 = ["console-logs", "page-errors", "metrics", "summary", "network-logs"];
         for name in tier_1
             .iter()
             .chain(tier_3.iter())
             .chain(tier_4.iter())
-            .chain(tier_5_partial.iter())
+            .chain(tier_5.iter())
         {
             assert!(DISPATCH.contains_key(name), "missing: {name}");
         }
         assert_eq!(
             DISPATCH.len(),
-            tier_1.len() + tier_3.len() + tier_4.len() + tier_5_partial.len()
+            tier_1.len() + tier_3.len() + tier_4.len() + tier_5.len()
         );
     }
 

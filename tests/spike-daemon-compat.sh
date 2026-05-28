@@ -833,6 +833,43 @@ case_page_errors
 case_metrics
 case_content_summary
 
+# Tier 5 phase 3e2 — network-logs (stitched from Network.* events). Body
+# fetch deferred so we verify count + first-entry shape only.
+case_network_logs() {
+  # Inline data: URL fetch triggers requestWillBeSent/responseReceived/
+  # loadingFinished on the page session.
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate \
+    "data:text/html,<script>fetch('data:application/json,{\"x\":1}').catch(()=>{})</script>" \
+    >/dev/null 2>&1 || true
+  sleep 1
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" network-logs --json 2>&1)" || true
+  local check
+  check="$(printf '%s' "$raw" | node -e '
+    let out = "BAD";
+    try {
+      const a = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      if (!Array.isArray(a)) { out = "NOT_ARRAY"; }
+      else if (a.length < 1) { out = "EMPTY"; }
+      else {
+        const e = a[a.length - 1];
+        if (typeof e.requestId === "string" && typeof e.url === "string" && typeof e.method === "string") {
+          out = "OK";
+        } else {
+          out = "BAD_SHAPE:" + JSON.stringify(e);
+        }
+      }
+    } catch (e) { out = "ERR:" + e.message; }
+    process.stdout.write(out);
+  ')"
+  if [[ "$check" == "OK" ]]; then
+    report_pass "TS network-logs captured request(s) with valid shape"
+  else
+    report_fail "TS network-logs" "$check" "$raw"
+  fi
+}
+case_network_logs
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true

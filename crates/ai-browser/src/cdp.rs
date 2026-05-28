@@ -20,6 +20,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 /// runtimes/cdp.ts:100`). 3e2 will add network_log + network_index here.
 const MAX_CONSOLE: usize = 100;
 const MAX_PAGE_ERRORS: usize = 100;
+const MAX_NETWORK: usize = 500;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsoleEntry {
@@ -40,6 +41,57 @@ pub struct ErrorEntry {
     pub timestamp: u64,
 }
 
+/// One stitched request/response cycle for `monitor.networkLogs`. Fields are
+/// camelCase on the wire to match TS NetworkEntry; optional fields are
+/// skipped from JSON when None so consumers see a clean null vs missing
+/// boundary. responseBody is always None for now (body fetch deferred — see
+/// phase 3e2 plan; would need Arc<CdpClient> + spawn task to avoid reader-
+/// task self-deadlock against the registry mutex).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkEntry {
+    pub request_id: String,
+    pub url: String,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<String>,
+    pub response_body_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body_size: Option<u64>,
+    pub start_time: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub from_cache: bool,
+    pub failed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_text: Option<String>,
+}
+
+/// Find the most recent entry with `request_id` (reverse iter — Network.*
+/// events generally arrive close to their requestWillBeSent so the hit lands
+/// in the last few entries). Returns None if missing — happens when the
+/// stub was evicted by ring trim before the response arrived.
+pub fn find_network_entry_mut<'a>(
+    log: &'a mut [NetworkEntry],
+    request_id: &str,
+) -> Option<&'a mut NetworkEntry> {
+    log.iter_mut().rev().find(|e| e.request_id == request_id)
+}
+
 /// Per-tab state. sessionId + event-derived ring buffers. `Clone` removed —
 /// 3e brings Vec<…> buffers that aren't free to copy and the only callsite
 /// that previously needed clone (test helpers) just constructs literals.
@@ -48,6 +100,7 @@ pub struct TabState {
     pub session_id: String,
     pub console_logs: Vec<ConsoleEntry>,
     pub page_errors: Vec<ErrorEntry>,
+    pub network_log: Vec<NetworkEntry>,
 }
 
 impl TabState {
@@ -56,6 +109,7 @@ impl TabState {
             session_id,
             console_logs: Vec::new(),
             page_errors: Vec::new(),
+            network_log: Vec::new(),
         }
     }
 }
@@ -322,7 +376,128 @@ impl CdpClient {
                             trim_ring(&mut state.page_errors, MAX_PAGE_ERRORS);
                         }
                     }
-                    _ => {} // 3e2 will add Network.* arms here.
+                    "Network.requestWillBeSent" => {
+                        let request_id = params
+                            .get("requestId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        if request_id.is_empty() {
+                            continue;
+                        }
+                        let request = params.get("request").cloned().unwrap_or(Value::Null);
+                        let url = request
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let method = request
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or("GET")
+                            .to_owned();
+                        let resource_type = params
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let request_headers = request.get("headers").cloned();
+                        let request_body = request
+                            .get("postData")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        state.network_log.push(NetworkEntry {
+                            request_id,
+                            url,
+                            method,
+                            resource_type,
+                            status: None,
+                            status_text: None,
+                            request_headers,
+                            response_headers: None,
+                            request_body,
+                            response_body: None,
+                            response_body_truncated: false,
+                            response_body_size: None,
+                            start_time: now_ms(),
+                            end_time: None,
+                            duration_ms: None,
+                            from_cache: false,
+                            failed: false,
+                            failure_text: None,
+                        });
+                        trim_ring(&mut state.network_log, MAX_NETWORK);
+                    }
+                    "Network.responseReceived" => {
+                        let request_id =
+                            params.get("requestId").and_then(Value::as_str).unwrap_or("");
+                        if request_id.is_empty() {
+                            continue;
+                        }
+                        let response = params.get("response").cloned().unwrap_or(Value::Null);
+                        let resource_type = params
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let status = response.get("status").and_then(Value::as_u64).map(|n| n as u16);
+                        let status_text = response
+                            .get("statusText")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let response_headers = response.get("headers").cloned();
+                        let from_cache = response
+                            .get("fromDiskCache")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if let Some(entry) =
+                            find_network_entry_mut(&mut state.network_log, request_id)
+                        {
+                            entry.status = status;
+                            entry.status_text = status_text;
+                            entry.response_headers = response_headers;
+                            entry.from_cache = from_cache;
+                            if resource_type.is_some() {
+                                entry.resource_type = resource_type;
+                            }
+                        }
+                    }
+                    "Network.loadingFinished" => {
+                        let request_id =
+                            params.get("requestId").and_then(Value::as_str).unwrap_or("");
+                        if request_id.is_empty() {
+                            continue;
+                        }
+                        let encoded_length =
+                            params.get("encodedDataLength").and_then(Value::as_u64);
+                        let now = now_ms();
+                        if let Some(entry) =
+                            find_network_entry_mut(&mut state.network_log, request_id)
+                        {
+                            entry.end_time = Some(now);
+                            entry.duration_ms = Some(now.saturating_sub(entry.start_time));
+                            entry.response_body_size = encoded_length;
+                        }
+                    }
+                    "Network.loadingFailed" => {
+                        let request_id =
+                            params.get("requestId").and_then(Value::as_str).unwrap_or("");
+                        if request_id.is_empty() {
+                            continue;
+                        }
+                        let error_text = params
+                            .get("errorText")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let now = now_ms();
+                        if let Some(entry) =
+                            find_network_entry_mut(&mut state.network_log, request_id)
+                        {
+                            entry.failed = true;
+                            entry.failure_text = error_text;
+                            entry.end_time = Some(now);
+                            entry.duration_ms = Some(now.saturating_sub(entry.start_time));
+                        }
+                    }
+                    _ => {} // other domain events silently dropped
                 }
             }
             // Stream closed → fail any still-pending requests so callers don't hang.
