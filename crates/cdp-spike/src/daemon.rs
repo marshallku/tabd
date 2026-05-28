@@ -654,6 +654,75 @@ async fn handle_query_selector(
         .map_err(|e| e.to_string())
 }
 
+/// `cookies.get` — CDP `Network.getCookies {urls:[url]}` → cookies array.
+/// Network.* CDP calls are wrapped in a 5s timeout because some chromium
+/// builds hang the request without ever responding (observed on the
+/// Playwright-bundled chromium-1217 used in spike testing). Timeout surfaces
+/// as a clear error rather than a stuck action lock + drain.
+async fn handle_cookies_get(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let url = require_string(params, "url")?;
+    let client = client_or_err(state).await?;
+    let send_fut = client.send("Network.getCookies", json!({ "urls": [url] }));
+    let resp = match tokio::time::timeout(Duration::from_secs(5), send_fut).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(_) => return Err("Network.getCookies timed out after 5s".to_string()),
+    };
+    Ok(Some(
+        resp.get("cookies").cloned().unwrap_or(Value::Array(vec![])),
+    ))
+}
+
+/// `cookies.set` — CDP `Network.setCookie`. Returns null on success (no data
+/// field on wire). Throws if CDP rejects the cookie.
+async fn handle_cookies_set(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let url = require_string(params, "url")?;
+    let name = require_string(params, "name")?;
+    let value = require_string(params, "value")?;
+    let mut p = json!({ "url": url, "name": name, "value": value });
+    for k in &["domain", "path"] {
+        if let Some(v) = params.get(*k).and_then(Value::as_str) {
+            p[*k] = Value::String(v.to_owned());
+        }
+    }
+    for k in &["secure", "httpOnly"] {
+        if let Some(v) = params.get(*k).and_then(Value::as_bool) {
+            p[*k] = Value::Bool(v);
+        }
+    }
+    if let Some(v) = params.get("expirationDate").and_then(Value::as_f64) {
+        p["expires"] = json!(v);
+    }
+    let client = client_or_err(state).await?;
+    let send_fut = client.send("Network.setCookie", p);
+    let resp = match tokio::time::timeout(Duration::from_secs(5), send_fut).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(_) => return Err("Network.setCookie timed out after 5s".to_string()),
+    };
+    let success = resp.get("success").and_then(Value::as_bool).unwrap_or(false);
+    if !success {
+        return Err(format!("CDP rejected the cookie: {resp}"));
+    }
+    Ok(None)
+}
+
+/// `cookies.delete` — CDP `Network.deleteCookies`. Returns null.
+async fn handle_cookies_delete(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let url = require_string(params, "url")?;
+    let name = require_string(params, "name")?;
+    let client = client_or_err(state).await?;
+    let send_fut = client.send("Network.deleteCookies", json!({ "url": url, "name": name }));
+    match tokio::time::timeout(Duration::from_secs(5), send_fut).await {
+        Ok(Ok(_)) => Ok(None),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("Network.deleteCookies timed out after 5s".to_string()),
+    }
+}
+
 async fn handle_wait_url(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
     let pattern = require_string(params, "pattern")?;
     let pattern_type = params
@@ -713,6 +782,9 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "dom.getText" => handle_get_text(state, &req.params).await,
         "dom.getHtml" => handle_get_html(state, &req.params).await,
         "dom.querySelector" => handle_query_selector(state, &req.params).await,
+        "cookies.get" => handle_cookies_get(state, &req.params).await,
+        "cookies.set" => handle_cookies_set(state, &req.params).await,
+        "cookies.delete" => handle_cookies_delete(state, &req.params).await,
         "interaction.click" => handle_click(state, &req.params).await,
         "interaction.type" => handle_type(state, &req.params).await,
         "wait.selector" => handle_wait_selector(state, &req.params).await,

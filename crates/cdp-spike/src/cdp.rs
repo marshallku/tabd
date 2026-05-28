@@ -117,9 +117,12 @@ impl CdpClient {
             .ok_or_else(|| anyhow!("Target.attachToTarget missing sessionId: {attach:?}"))?
             .to_owned();
 
-        // 3. Enable domains on the session.
+        // 3. Enable domains on the session. Network domain is required for
+        // cookies.* actions to receive responses on some chromium builds
+        // (phase 2d found Network.setCookie hanging without it).
         client.send("Page.enable", json!({})).await?;
         client.send("Runtime.enable", json!({})).await?;
+        client.send("Network.enable", json!({})).await?;
 
         Ok(client)
     }
