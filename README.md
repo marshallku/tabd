@@ -141,9 +141,12 @@ bash tests/spike-daemon-compat.sh                                       # 39 cas
 - `secrets.rs` — AES-GCM + PBKDF2 file vault
 - `cmd/` — helper expressions (text/AX/find-all) used by the daemon handlers
 
-## Phase history
+## Docs
 
-`docs/` keeps the design plans from each migration phase
-(`rust-chromium-spike-plan.md`, `spike-phase-*-plan.md`) for context. Phase 3
-(2026-03~05) migrated the entire TypeScript surface to this Rust binary; the
-TypeScript implementation was removed in phase 3i.
+- [`docs/architecture.md`](docs/architecture.md) — why `tabd` is shaped this
+  way (daemon, multi-tab registry, reader task, supervisor, secrets vault).
+- [`docs/operations.md`](docs/operations.md) — running `tabd` as a
+  long-lived service: systemd user unit, launchd LaunchAgent, shell-rc
+  fallback, drain semantics, health watchdog, troubleshooting.
+- [`docs/history/`](docs/history/) — phase 0-3 migration plans, kept as
+  immutable historical record. Not documentation of current behavior.
