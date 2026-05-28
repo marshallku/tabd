@@ -33,6 +33,32 @@ enum Command {
         #[arg(long, default_value_t = 30_000)]
         timeout: u64,
     },
+    /// Extract metadata (tag, text, id, classes, attrs, rect) for each
+    /// matching element as a JSON object array. Exactly one TARGET required;
+    /// same selector/testid/role surface as query-all.
+    FindAll {
+        url: String,
+        /// Explicit CSS selector. Mutually exclusive with --testid / --role.
+        #[arg(long, group = "fa_target")]
+        selector: Option<String>,
+        /// data-testid value shortcut. Mutually exclusive with --selector / --role.
+        #[arg(long, group = "fa_target")]
+        testid: Option<String>,
+        /// ARIA role for Accessibility.queryAXTree. Mutually exclusive with --selector / --testid.
+        #[arg(long, group = "fa_target")]
+        role: Option<String>,
+        /// Exact accessible name match. Requires --role.
+        #[arg(long, requires = "role")]
+        name: Option<String>,
+        /// Use textContent (no innerText, no collapse, no trim) for the text field.
+        #[arg(long)]
+        raw: bool,
+        /// Cap on number of returned metadata objects (default 100).
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        #[arg(long, default_value_t = 30_000)]
+        timeout: u64,
+    },
     /// Extract texts from all matching elements as a JSON array.
     /// Unlike `get-text`, exactly one TARGET (--selector/--testid/--role) is
     /// required — no default chain. Output is a JSON string array on stdout.
@@ -135,6 +161,28 @@ async fn main() -> Result<()> {
             timeout,
         } => {
             cmd::query_all::run(
+                &url,
+                selector.as_deref(),
+                testid.as_deref(),
+                role.as_deref(),
+                name.as_deref(),
+                raw,
+                limit,
+                timeout,
+            )
+            .await
+        }
+        Command::FindAll {
+            url,
+            selector,
+            testid,
+            role,
+            name,
+            raw,
+            limit,
+            timeout,
+        } => {
+            cmd::find_all::run(
                 &url,
                 selector.as_deref(),
                 testid.as_deref(),

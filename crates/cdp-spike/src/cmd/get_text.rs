@@ -1,7 +1,8 @@
-use anyhow::{Result, anyhow, bail};
-use serde_json::{Value, json};
+use anyhow::{Result, bail};
+use serde_json::Value;
 
-use super::eval::{evaluate_value, unwrap_runtime_result};
+use super::ax::traverse_visible_nodes;
+use super::eval::evaluate_value;
 use super::page;
 use crate::cdp::CdpClient;
 
@@ -119,72 +120,60 @@ async fn ax_get_text(
     name: Option<&str>,
     raw: bool,
 ) -> Result<Option<Value>> {
-    // CDP says Accessibility.enable is idempotent — safe to call per query.
-    client.send("Accessibility.enable", json!({})).await?;
-
-    let doc = client.send("DOM.getDocument", json!({ "depth": 0 })).await?;
-    let root_node_id = doc
-        .get("root")
-        .and_then(|r| r.get("nodeId"))
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("DOM.getDocument missing root.nodeId"))?;
-
-    let mut params = json!({ "nodeId": root_node_id, "role": role });
-    if let Some(n) = name {
-        params["accessibleName"] = Value::String(n.to_owned());
-    }
-    let q = client.send("Accessibility.queryAXTree", params).await?;
-    let nodes = q
-        .get("nodes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("Accessibility.queryAXTree missing nodes"))?;
-
-    if nodes.is_empty() {
+    let body = build_text_body(raw);
+    let fn_decl = format!("function() {{\n    const target = this;\n    {body}\n}}");
+    let results = traverse_visible_nodes(client, role, name, 1, &fn_decl).await?;
+    if results.is_empty() {
         bail!(
             "no AX node matches role={role}{}",
             name.map(|n| format!(" name={n:?}")).unwrap_or_default()
         );
     }
-    let visible = nodes.iter().find(|n| {
-        n.get("ignored").and_then(Value::as_bool) != Some(true)
-    });
-    let node = visible.ok_or_else(|| {
-        anyhow!(
-            "no visible AX node matches role={role}{} (all {} match(es) are ignored)",
-            name.map(|n| format!(" name={n:?}")).unwrap_or_default(),
-            nodes.len()
-        )
-    })?;
+    // Single-result path — traverse capped at limit=1 so .into_iter().next() is safe.
+    Ok(results.into_iter().next())
+}
 
-    let backend_node_id = node
-        .get("backendDOMNodeId")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("AX node missing backendDOMNodeId (virtual node?)"))?;
-
-    let resolved = client
-        .send("DOM.resolveNode", json!({ "backendNodeId": backend_node_id }))
-        .await?;
-    let object_id = resolved
-        .get("object")
-        .and_then(|o| o.get("objectId"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("DOM.resolveNode missing object.objectId"))?
-        .to_owned();
-
-    let body = build_text_body(raw);
-    let fn_decl = format!("function() {{\n    const target = this;\n    {body}\n}}");
-    let r = client
-        .send(
-            "Runtime.callFunctionOn",
-            json!({
-                "objectId": object_id,
-                "functionDeclaration": fn_decl,
-                "returnByValue": true,
-                "awaitPromise": true,
-            }),
-        )
-        .await?;
-    unwrap_runtime_result(&r, "Runtime.callFunctionOn")
+/// JS body that defines `textOf`, `liveValueOf`, and `metaOf` on `target`/`el`.
+/// Used by both selector/testid path (Runtime.evaluate inside an IIFE) and the
+/// AX path (Runtime.callFunctionOn — `metaOf(this)`). Single source of truth so
+/// the per-element shape can't drift between paths.
+pub(super) fn build_meta_js_body(raw: bool) -> String {
+    let text_body = build_text_body(raw);
+    format!(
+        r#"const ATTR_KEYS = ["role", "aria-label", "name", "href", "value"];
+const textOf = (target) => {{ {text_body} }};
+const liveValueOf = (el) => {{
+    if (el instanceof HTMLInputElement
+        || el instanceof HTMLTextAreaElement
+        || el instanceof HTMLSelectElement) {{
+        return {{ present: true, value: el.value }};
+    }}
+    const v = el.getAttribute("value");
+    return {{ present: v !== null, value: v }};
+}};
+const metaOf = (el) => {{
+    if (!(el instanceof Element)) return null;
+    const r = el.getBoundingClientRect();
+    const attrs = {{}};
+    for (const k of ATTR_KEYS) {{
+        if (k === "value") {{
+            const lv = liveValueOf(el);
+            if (lv.present) attrs.value = lv.value;
+        }} else {{
+            const v = el.getAttribute(k);
+            if (v !== null) attrs[k] = v;
+        }}
+    }}
+    return {{
+        tag: el.tagName.toLowerCase(),
+        text: textOf(el),
+        id: el.id || null,
+        classes: [...el.classList],
+        attrs,
+        rect: {{ x: r.x, y: r.y, w: r.width, h: r.height }},
+    }};
+}};"#
+    )
 }
 
 #[cfg(test)]

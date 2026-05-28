@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow, bail};
-use serde_json::{Value, json};
 
-use super::eval::{evaluate_value, unwrap_runtime_result};
+use super::ax::traverse_visible_nodes;
+use super::eval::evaluate_value;
 use super::get_text::build_text_body;
 use super::page;
 use crate::cdp::CdpClient;
@@ -37,7 +37,8 @@ pub async fn run(
 
 /// Strict variant of validate_target_flags — requires exactly one of
 /// selector/testid/role. (get-text's variant allows all-none → default chain.)
-fn validate_target_flags_strict(
+/// `pub(super)` so find-all (which has the same TARGET semantics) can reuse it.
+pub(super) fn validate_target_flags_strict(
     selector: Option<&str>,
     testid: Option<&str>,
     role: Option<&str>,
@@ -48,7 +49,7 @@ fn validate_target_flags_strict(
         .filter(|&&x| x)
         .count();
     if count == 0 {
-        bail!("query-all requires --selector, --testid, or --role");
+        bail!("requires --selector, --testid, or --role");
     }
     if count > 1 {
         bail!("--selector, --testid, --role are mutually exclusive");
@@ -59,7 +60,9 @@ fn validate_target_flags_strict(
     Ok(())
 }
 
-fn build_els_expr(selector: Option<&str>, testid: Option<&str>) -> Result<String> {
+/// Build the JS element-source expression for selector/testid TARGET modes.
+/// `pub(super)` so find-all can layer its own metadata mapping on top.
+pub(super) fn build_els_expr(selector: Option<&str>, testid: Option<&str>) -> Result<String> {
     match (selector, testid) {
         (Some(s), None) => {
             let sel_lit = serde_json::to_string(s)?;
@@ -116,74 +119,13 @@ async fn ax_query_all(
     raw: bool,
     limit: u32,
 ) -> Result<Vec<String>> {
-    client.send("Accessibility.enable", json!({})).await?;
-
-    let doc = client.send("DOM.getDocument", json!({ "depth": 0 })).await?;
-    let root_node_id = doc
-        .get("root")
-        .and_then(|r| r.get("nodeId"))
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("DOM.getDocument missing root.nodeId"))?;
-
-    let mut params = json!({ "nodeId": root_node_id, "role": role });
-    if let Some(n) = name {
-        params["accessibleName"] = Value::String(n.to_owned());
-    }
-    let q = client.send("Accessibility.queryAXTree", params).await?;
-    let nodes = q
-        .get("nodes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("Accessibility.queryAXTree missing nodes"))?;
-
     let body = build_text_body(raw);
     let fn_decl = format!("function() {{\n    const target = this;\n    {body}\n}}");
-
-    let mut texts: Vec<String> = Vec::new();
-    for node in nodes {
-        // Limit is a cap on successful results, not inspected nodes.
-        if texts.len() as u32 >= limit {
-            break;
-        }
-        if node.get("ignored").and_then(Value::as_bool) == Some(true) {
-            continue;
-        }
-        let backend_id = match node.get("backendDOMNodeId").and_then(Value::as_u64) {
-            Some(id) => id,
-            None => continue, // virtual AX node, no DOM peer
-        };
-        let resolved = match client
-            .send("DOM.resolveNode", json!({ "backendNodeId": backend_id }))
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => continue, // detached node between queryAXTree and now
-        };
-        let object_id = match resolved
-            .get("object")
-            .and_then(|o| o.get("objectId"))
-            .and_then(Value::as_str)
-        {
-            Some(s) => s.to_owned(),
-            None => continue,
-        };
-        let r = client
-            .send(
-                "Runtime.callFunctionOn",
-                json!({
-                    "objectId": object_id,
-                    "functionDeclaration": fn_decl,
-                    "returnByValue": true,
-                    "awaitPromise": true,
-                }),
-            )
-            .await?;
-        if let Some(s) = unwrap_runtime_result(&r, "Runtime.callFunctionOn")?
-            .and_then(|v| v.as_str().map(String::from))
-        {
-            texts.push(s);
-        }
-    }
-    Ok(texts)
+    let values = traverse_visible_nodes(client, role, name, limit, &fn_decl).await?;
+    Ok(values
+        .into_iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect())
 }
 
 #[cfg(test)]
@@ -195,9 +137,11 @@ mod tests {
     #[test]
     fn strict_rejects_all_none() {
         let err = validate_target_flags_strict(None, None, None, None).unwrap_err();
-        assert!(
-            err.to_string().contains("requires --selector"),
-            "got: {err}"
+        // Message is neutral so both query-all and find-all use the same validator
+        // without leaking the wrong command name.
+        assert_eq!(
+            err.to_string(),
+            "requires --selector, --testid, or --role"
         );
     }
 

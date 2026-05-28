@@ -477,6 +477,147 @@ qa_case "QA bad CSS selector exits 1" \
   "data:text/html,<p>x</p>" 1 "" \
   --selector "[[bad"
 
+# Phase 1d — find-all element metadata extraction. JSON object array output.
+# Spike-only (TS chromium-cdp has no equivalent). Field-level checks via
+# inline node JSON parsing — avoids jq dependency.
+echo "== phase 1d: find-all (spike-only, no TS parity) =="
+
+fa_case_field() {
+  local label="$1" url="$2" jq_filter="$3" expected="$4"
+  shift 4
+  local actual_stdout actual_value stderr_file
+  stderr_file="$(mktemp)"
+  if ! actual_stdout="$("$SPIKE" find-all "$url" "$@" 2>"$stderr_file")"; then
+    local err; err="$(cat "$stderr_file")"; rm -f "$stderr_file"
+    report_fail "$label" "(spike failed: $err)" "($expected)"
+    return
+  fi
+  rm -f "$stderr_file"
+  # node parse/eval failures must not trip set -e — isolate via if-else
+  if ! actual_value="$(printf '%s' "$actual_stdout" | node -e "
+      const arr = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+      const filter = process.argv[1];
+      process.stdout.write(JSON.stringify(eval(filter)));
+    " "$jq_filter" 2>/dev/null)"; then
+    report_fail "$label" "(node parse/eval failed; stdout=$actual_stdout)" "($expected)"
+    return
+  fi
+  if [[ "$actual_value" == "$expected" ]]; then
+    report_pass "$label" "$actual_value"
+  else
+    report_fail "$label" "$actual_value" "$expected"
+  fi
+}
+
+fa_case_exit() {
+  local label="$1" url="$2" expected_exit="$3"
+  shift 3
+  local actual_rc
+  if "$SPIKE" find-all "$url" "$@" >/dev/null 2>&1; then
+    actual_rc=0
+  else
+    actual_rc=$?
+  fi
+  if [[ "$actual_rc" == "$expected_exit" ]]; then
+    report_pass "$label" "exit $actual_rc"
+  else
+    report_fail "$label" "exit $actual_rc" "expected $expected_exit"
+  fi
+}
+
+# Field-level checks: array of li tags
+fa_case_field "FA selector tags" \
+  "data:text/html,<ul><li>a</li><li>b</li><li>c</li></ul>" \
+  'arr.map(x => x.tag)' \
+  '["li","li","li"]' \
+  --selector li
+
+fa_case_field "FA selector texts" \
+  "data:text/html,<ul><li>a</li><li>b</li><li>c</li></ul>" \
+  'arr.map(x => x.text)' \
+  '["a","b","c"]' \
+  --selector li
+
+fa_case_field "FA selector id captured" \
+  "data:text/html,<ul><li id='one'>a</li><li>b</li></ul>" \
+  'arr.map(x => x.id)' \
+  '["one",null]' \
+  --selector li
+
+fa_case_field "FA selector classes array" \
+  "data:text/html,<div class='a b'>x</div><div class='c'>y</div>" \
+  'arr.map(x => x.classes)' \
+  '[["a","b"],["c"]]' \
+  --selector div
+
+fa_case_field "FA selector attrs whitelist" \
+  "data:text/html,<button aria-label='Save' name='go'>X</button>" \
+  'arr[0].attrs' \
+  '{"aria-label":"Save","name":"go"}' \
+  --selector button
+
+fa_case_field "FA selector rect shape" \
+  "data:text/html,<div>x</div>" \
+  'Object.keys(arr[0].rect).sort()' \
+  '["h","w","x","y"]' \
+  --selector div
+
+fa_case_field "FA input live value" \
+  "data:text/html,<input id='e' type='text' value='hello'>" \
+  'arr[0].attrs.value' \
+  '"hello"' \
+  --selector input
+
+fa_case_field "FA input empty live value present" \
+  "data:text/html,<input id='e' type='text'>" \
+  '"value" in arr[0].attrs ? arr[0].attrs.value : "(missing)"' \
+  '""' \
+  --selector input
+
+fa_case_field "FA non-input no value attribute" \
+  "data:text/html,<button>X</button>" \
+  '"value" in arr[0].attrs ? "(present)" : "(missing)"' \
+  '"(missing)"' \
+  --selector button
+
+fa_case_field "FA testid mode" \
+  "data:text/html,<span data-testid='item'>a</span><span data-testid='item'>b</span><span data-testid='other'>x</span>" \
+  'arr.map(x => x.text)' \
+  '["a","b"]' \
+  --testid item
+
+fa_case_field "FA role mode (AX)" \
+  "data:text/html,<button>A</button><button>B</button>" \
+  'arr.map(x => x.tag)' \
+  '["button","button"]' \
+  --role button
+
+fa_case_field "FA role + name select" \
+  "data:text/html,<button>X</button><button>Two</button>" \
+  'arr.length' \
+  '1' \
+  --role button --name "Two"
+
+fa_case_field "FA --limit caps result" \
+  "data:text/html,<li>a</li><li>b</li><li>c</li><li>d</li>" \
+  'arr.length' \
+  '2' \
+  --selector li --limit 2
+
+fa_case_field "FA empty match returns []" \
+  "data:text/html,<p>x</p>" \
+  'arr' \
+  '[]' \
+  --selector h1
+
+fa_case_exit "FA TARGET missing rejected" \
+  "data:text/html,x" 1 \
+  --raw
+
+fa_case_exit "FA --selector + --role rejected by clap" \
+  "data:text/html,x" 2 \
+  --selector li --role button
+
 echo "== summary =="
 echo "passed: $PASS_COUNT"
 echo "failed: $FAIL_COUNT"
