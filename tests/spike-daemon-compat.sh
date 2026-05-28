@@ -722,6 +722,117 @@ case_press_key
 case_select_option
 case_check
 
+# Tier 5 partial (phase 3e1) — console-logs / page-errors / metrics / summary
+# (network-logs deferred to 3e2).
+
+case_console_logs() {
+  local url="data:text/html,<script>console.log('hi-from-daemon-compat')</script>"
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  sleep 0.5
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" console-logs --json 2>&1)" || true
+  local hit
+  hit="$(printf '%s' "$raw" | node -e '
+    let out = "MISS";
+    try {
+      const a = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      if (Array.isArray(a) && a.some(e => e.text && e.text.includes("hi-from-daemon-compat") && e.level === "log")) {
+        out = "HIT";
+      } else {
+        out = "NONE:" + a.length;
+      }
+    } catch (e) { out = "ERR:" + e.message; }
+    process.stdout.write(out);
+  ')"
+  if [[ "$hit" == "HIT" ]]; then
+    report_pass "TS console-logs captured 'hi-from-daemon-compat'"
+  else
+    report_fail "TS console-logs" "$hit" "$raw"
+  fi
+}
+
+case_page_errors() {
+  local url="data:text/html,<script>throw new Error('boom-from-daemon-compat')</script>"
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  sleep 0.5
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" page-errors --json 2>&1)" || true
+  local hit
+  hit="$(printf '%s' "$raw" | node -e '
+    let out = "MISS";
+    try {
+      const a = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      if (Array.isArray(a) && a.some(e => e.message && e.message.includes("boom-from-daemon-compat"))) {
+        out = "HIT";
+      } else {
+        out = "NONE:" + a.length;
+      }
+    } catch (e) { out = "ERR:" + e.message; }
+    process.stdout.write(out);
+  ')"
+  if [[ "$hit" == "HIT" ]]; then
+    report_pass "TS page-errors captured 'boom-from-daemon-compat'"
+  else
+    report_fail "TS page-errors" "$hit" "$raw"
+  fi
+}
+
+case_metrics() {
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate "data:text/html,<title>MetricsT</title><body>Hi</body>" >/dev/null 2>&1 || true
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" metrics --json 2>&1)" || true
+  local shape
+  shape="$(printf '%s' "$raw" | node -e '
+    let out = "BAD";
+    try {
+      const m = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      if (typeof m.url === "string" && typeof m.title === "string"
+          && typeof m.readyState === "string"
+          && typeof m.domNodes === "number" && m.domNodes > 0) {
+        out = "OK:" + m.title;
+      } else {
+        out = "MISSING_FIELDS";
+      }
+    } catch (e) { out = "ERR:" + e.message; }
+    process.stdout.write(out);
+  ')"
+  if [[ "$shape" == "OK:MetricsT" ]]; then
+    report_pass "TS metrics returned url/title/readyState/domNodes>0"
+  else
+    report_fail "TS metrics" "$shape" "$raw"
+  fi
+}
+
+case_content_summary() {
+  local url="data:text/html,<h1>HeadOne</h1><a href=\"/x\">LinkOne</a><form><input name=q></form>"
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" summary --json 2>&1)" || true
+  local check
+  check="$(printf '%s' "$raw" | node -e '
+    let out = "BAD";
+    try {
+      const s = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      const h0 = (s.headings && s.headings[0]) || {};
+      const fs = (s.forms || []).length;
+      const ls = (s.links || []).length;
+      if (h0.text === "HeadOne" && ls >= 1 && fs === 1) out = "OK";
+      else out = "h0=" + JSON.stringify(h0) + " links=" + ls + " forms=" + fs;
+    } catch (e) { out = "ERR:" + e.message; }
+    process.stdout.write(out);
+  ')"
+  if [[ "$check" == "OK" ]]; then
+    report_pass "TS summary returned headings[0]=HeadOne + 1 form + ≥1 link"
+  else
+    report_fail "TS summary" "$check" "$raw"
+  fi
+}
+
+case_console_logs
+case_page_errors
+case_metrics
+case_content_summary
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true

@@ -15,11 +15,49 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-/// Per-tab state. Starts with just sessionId — phase 3e will add
-/// console_logs / network_logs / dialog_state buckets here.
-#[derive(Debug, Clone)]
+/// Per-tab buffers populated by the reader task as chromium streams events.
+/// Caps match TS `MAX_CONSOLE_ENTRIES` / `MAX_ERROR_ENTRIES` (`src/server/
+/// runtimes/cdp.ts:100`). 3e2 will add network_log + network_index here.
+const MAX_CONSOLE: usize = 100;
+const MAX_PAGE_ERRORS: usize = 100;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleEntry {
+    pub level: String,
+    pub text: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorEntry {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<u64>,
+    pub timestamp: u64,
+}
+
+/// Per-tab state. sessionId + event-derived ring buffers. `Clone` removed —
+/// 3e brings Vec<…> buffers that aren't free to copy and the only callsite
+/// that previously needed clone (test helpers) just constructs literals.
+#[derive(Debug)]
 pub struct TabState {
     pub session_id: String,
+    pub console_logs: Vec<ConsoleEntry>,
+    pub page_errors: Vec<ErrorEntry>,
+}
+
+impl TabState {
+    fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            console_logs: Vec::new(),
+            page_errors: Vec::new(),
+        }
+    }
 }
 
 /// Multi-tab registry. Single Mutex guards both fields so split-brain races
@@ -114,7 +152,8 @@ pub struct CdpClient {
     next_id: AtomicU64,
     out_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
-    registry: Mutex<TabRegistry>,
+    // Arc so the reader task can clone-and-move it for event routing.
+    registry: Arc<Mutex<TabRegistry>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -122,15 +161,85 @@ struct InboundFrame {
     id: Option<u64>,
     result: Option<Value>,
     error: Option<Value>,
-    // method/params/sessionId present on events; not used yet (phase 3e will
-    // route per-session events to listeners).
-    #[allow(dead_code)]
+    // Events carry method/params/sessionId. Phase 3e1 routes
+    // Runtime.consoleAPICalled + Runtime.exceptionThrown into per-tab ring
+    // buffers; 3e2 will add Network.*.
     method: Option<String>,
-    #[allow(dead_code)]
     params: Option<Value>,
-    #[allow(dead_code)]
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
+}
+
+/// Current unix epoch in milliseconds (matches TS `Date.now()` field type).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Build a single-string text payload from Runtime.consoleAPICalled args.
+/// Mirrors TS cdp.ts:582-602 — RemoteObject.value if present, else
+/// .description, else "".
+fn console_text_from_args(args: &Value) -> String {
+    let arr = match args.as_array() {
+        Some(a) => a,
+        None => return String::new(),
+    };
+    arr.iter()
+        .map(|arg| {
+            if let Some(value) = arg.get("value") {
+                match value {
+                    Value::String(s) => s.clone(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                }
+            } else if let Some(desc) = arg.get("description").and_then(Value::as_str) {
+                desc.to_owned()
+            } else {
+                String::new()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Read a Runtime.exceptionThrown payload into an ErrorEntry. Returns None
+/// if the payload is shaped unexpectedly (silently drops in that case).
+fn error_entry_from_exception(params: &Value) -> Option<ErrorEntry> {
+    let detail = params.get("exceptionDetails")?;
+    let exception = detail.get("exception");
+    let message = exception
+        .and_then(|e| e.get("description"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            detail
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "Unknown error".to_string());
+    let source = detail
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let line = detail.get("lineNumber").and_then(Value::as_u64);
+    let column = detail.get("columnNumber").and_then(Value::as_u64);
+    Some(ErrorEntry {
+        message,
+        source,
+        line,
+        column,
+        timestamp: now_ms(),
+    })
+}
+
+/// Trim a Vec ring buffer to `max` entries by dropping from the front.
+fn trim_ring<T>(buf: &mut Vec<T>, max: usize) {
+    if buf.len() > max {
+        let excess = buf.len() - max;
+        buf.drain(0..excess);
+    }
 }
 
 impl CdpClient {
@@ -146,6 +255,8 @@ impl CdpClient {
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pending_for_reader = pending.clone();
+        let registry: Arc<Mutex<TabRegistry>> = Arc::new(Mutex::new(TabRegistry::default()));
+        let registry_for_reader = registry.clone();
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
 
@@ -175,9 +286,44 @@ impl CdpClient {
                         };
                         let _ = tx.send(value);
                     }
+                    continue;
                 }
-                // Events (no `id`) ignored — phase 3e will dispatch per-
-                // session event handlers for console/network buffering.
+                // Events: route by sessionId into the matching TabState. RPC
+                // calls from here are forbidden — they'd deadlock against
+                // dispatch() (same registry mutex). Push/trim only.
+                let (Some(method), Some(sid)) = (parsed.method, parsed.session_id) else {
+                    continue;
+                };
+                let params = parsed.params.unwrap_or(Value::Null);
+                let mut reg = registry_for_reader.lock().await;
+                let Some(state) = reg.tabs.values_mut().find(|t| t.session_id == sid) else {
+                    continue;
+                };
+                match method.as_str() {
+                    "Runtime.consoleAPICalled" => {
+                        let level = params
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("log")
+                            .to_owned();
+                        let text = console_text_from_args(
+                            params.get("args").unwrap_or(&Value::Null),
+                        );
+                        state.console_logs.push(ConsoleEntry {
+                            level,
+                            text,
+                            timestamp: now_ms(),
+                        });
+                        trim_ring(&mut state.console_logs, MAX_CONSOLE);
+                    }
+                    "Runtime.exceptionThrown" => {
+                        if let Some(entry) = error_entry_from_exception(&params) {
+                            state.page_errors.push(entry);
+                            trim_ring(&mut state.page_errors, MAX_PAGE_ERRORS);
+                        }
+                    }
+                    _ => {} // 3e2 will add Network.* arms here.
+                }
             }
             // Stream closed → fail any still-pending requests so callers don't hang.
             let mut map = pending_for_reader.lock().await;
@@ -190,7 +336,7 @@ impl CdpClient {
             next_id: AtomicU64::new(1),
             out_tx: Mutex::new(Some(out_tx)),
             pending,
-            registry: Mutex::new(TabRegistry::default()),
+            registry,
         };
 
         // 1. Fresh page target (about:blank — callers navigate later).
@@ -225,7 +371,7 @@ impl CdpClient {
         // `Active` route resolves correctly for the enable calls below.
         {
             let mut reg = client.registry.lock().await;
-            reg.tabs.insert(target_id.clone(), TabState { session_id });
+            reg.tabs.insert(target_id.clone(), TabState::new(session_id));
             reg.active = Some(target_id);
         }
 
@@ -315,7 +461,7 @@ impl CdpClient {
         // Register before enabling domains so send_to() succeeds.
         {
             let mut reg = self.registry.lock().await;
-            reg.tabs.insert(target_id.clone(), TabState { session_id });
+            reg.tabs.insert(target_id.clone(), TabState::new(session_id));
         }
 
         self.send_to(&target_id, "Page.enable", json!({})).await?;
@@ -406,6 +552,22 @@ impl CdpClient {
                 }
             })
             .collect())
+    }
+
+    /// Run a closure with shared access to one tab's state — used by monitor
+    /// handlers to snapshot console/error/network buffers without holding the
+    /// registry lock past the read. Errors if the targetId isn't attached.
+    pub async fn read_tab_state<R>(
+        &self,
+        target_id: &str,
+        f: impl FnOnce(&TabState) -> R,
+    ) -> Result<R, String> {
+        let reg = self.registry.lock().await;
+        let state = reg
+            .tabs
+            .get(target_id)
+            .ok_or_else(|| format!("no session for targetId {target_id:?}"))?;
+        Ok(f(state))
     }
 
     /// Registry-only active flip. Does NOT call CDP `Target.activateTarget`,
@@ -504,12 +666,8 @@ mod tests {
     fn registry_with(active: Option<&str>, entries: &[(&str, &str)]) -> TabRegistry {
         let mut reg = TabRegistry::default();
         for (tid, sid) in entries {
-            reg.tabs.insert(
-                (*tid).to_owned(),
-                TabState {
-                    session_id: (*sid).to_owned(),
-                },
-            );
+            reg.tabs
+                .insert((*tid).to_owned(), TabState::new((*sid).to_owned()));
         }
         reg.active = active.map(str::to_owned);
         reg

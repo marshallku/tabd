@@ -1257,6 +1257,228 @@ async fn handle_check(state: &DaemonState, params: &Value) -> Result<Option<Valu
     Ok(Some(Value::Null))
 }
 
+// -- Phase 3e1: monitor (console/errors) + capture.metrics + dom.contentSummary
+
+async fn handle_console_logs(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let level_filter = params
+        .get("level")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100) as usize;
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+
+    let entries = client
+        .read_tab_state(&tid, |state| {
+            let mut filtered: Vec<crate::cdp::ConsoleEntry> = match &level_filter {
+                Some(l) if l != "all" && !l.is_empty() => state
+                    .console_logs
+                    .iter()
+                    .filter(|e| e.level == *l)
+                    .cloned()
+                    .collect(),
+                _ => state.console_logs.clone(),
+            };
+            if filtered.len() > limit {
+                let excess = filtered.len() - limit;
+                filtered.drain(0..excess);
+            }
+            filtered
+        })
+        .await?;
+    let json = serde_json::to_value(entries).map_err(|e| e.to_string())?;
+    Ok(Some(json))
+}
+
+async fn handle_page_errors(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50) as usize;
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+
+    let entries = client
+        .read_tab_state(&tid, |state| {
+            let mut copy = state.page_errors.clone();
+            if copy.len() > limit {
+                let excess = copy.len() - limit;
+                copy.drain(0..excess);
+            }
+            copy
+        })
+        .await?;
+    let json = serde_json::to_value(entries).map_err(|e| e.to_string())?;
+    Ok(Some(json))
+}
+
+async fn handle_metrics(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+    // Pure JS — no Performance.enable RPC needed (TS chromium-cdp identical).
+    let code = r#"
+        (() => {
+            const nav = performance.getEntriesByType("navigation")[0];
+            return {
+                url: location.href,
+                title: document.title,
+                readyState: document.readyState,
+                domNodes: document.getElementsByTagName("*").length,
+                resources: performance.getEntriesByType("resource").length,
+                navigation: nav ? {
+                    type: nav.type,
+                    domContentLoaded: nav.domContentLoadedEventEnd,
+                    loadEventEnd: nav.loadEventEnd,
+                } : null,
+            };
+        })()
+    "#;
+    let resp = client
+        .send_to(
+            &tid,
+            "Runtime.evaluate",
+            json!({"expression": code, "returnByValue": true}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let value = resp
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(Some(value))
+}
+
+async fn handle_content_summary(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let selector_lit = params
+        .get("selector")
+        .and_then(Value::as_str)
+        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let max_headings = params
+        .get("maxHeadings")
+        .and_then(Value::as_u64)
+        .unwrap_or(20);
+    let max_links = params
+        .get("maxLinks")
+        .and_then(Value::as_u64)
+        .unwrap_or(20);
+    let max_text_length = params
+        .get("maxTextLength")
+        .and_then(Value::as_u64)
+        .unwrap_or(4000);
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+
+    // Port of TS Playwright src/server/runtimes/playwright.ts contentSummary JS
+    // body. CDP runtime (TS) marks this unsupported; we wire it via Runtime.
+    // evaluate so the CLI/MCP wire shape is identical to the Playwright path.
+    // Template-replace 4 params instead of format! so JS object literals
+    // (`{a: 1}`) don't collide with format! placeholder syntax. Two `#`s
+    // because the body has `"#cookie-banner"` which would otherwise close
+    // an `r#"..."#` raw string prematurely.
+    let template = r##"
+        (() => {
+            const selector = __SELECTOR__;
+            const maxHeadings = __MAX_HEADINGS__;
+            const maxLinks = __MAX_LINKS__;
+            const maxTextLength = __MAX_TEXT_LENGTH__;
+            const noiseSelectors = [
+                "script","style","svg","noscript","nav","footer","header","aside",
+                "[role='navigation']","[aria-hidden='true']",".sr-only",
+                ".visually-hidden",".hidden","#cookie-banner","#cookies",
+                ".cookie-banner",".cookie-notice",".advertisement",".ads"
+            ];
+            const pickRoot = () => {
+                if (selector) return document.querySelector(selector);
+                return document.querySelector("main")
+                    || document.querySelector("article")
+                    || document.querySelector("[role='main']")
+                    || document.body;
+            };
+            const root = pickRoot();
+            if (!root) {
+                return { url: location.href, title: document.title, selector: selector ?? null, headings: [], links: [], forms: [], text: "" };
+            }
+            const clone = root.cloneNode(true);
+            clone.querySelectorAll(noiseSelectors.join(",")).forEach(el => el.remove());
+            const cleanText = (t) => (t || "")
+                .replace(/ /g, " ")
+                .replace(/[ \t]+\n/g, "\n")
+                .replace(/\n{3,}/g, "\n\n")
+                .replace(/[ \t]{2,}/g, " ")
+                .trim();
+            const headings = Array.from(clone.querySelectorAll("h1,h2,h3,h4,h5,h6"))
+                .slice(0, maxHeadings)
+                .map(el => ({ level: el.tagName.toLowerCase(), text: cleanText(el.textContent).slice(0, 200) }))
+                .filter(item => item.text);
+            const links = Array.from(clone.querySelectorAll("a[href]"))
+                .slice(0, maxLinks)
+                .map(el => ({ text: cleanText(el.textContent).slice(0, 160), href: el.getAttribute("href") }))
+                .filter(item => item.text || item.href);
+            const forms = Array.from(clone.querySelectorAll("form")).map((form, index) => {
+                const fields = Array.from(form.querySelectorAll("input,textarea,select")).map(el => ({
+                    name: el.getAttribute("name"),
+                    type: el.getAttribute("type") || el.tagName.toLowerCase(),
+                    id: el.id || null,
+                }));
+                return { index, fields };
+            });
+            const text = cleanText(clone.innerText || clone.textContent || "").slice(0, maxTextLength);
+            return {
+                url: location.href,
+                title: document.title,
+                selector: selector ?? null,
+                headings,
+                links,
+                forms,
+                text,
+            };
+        })()
+        "##;
+    let code = template
+        .replace("__SELECTOR__", &selector_lit)
+        .replace("__MAX_HEADINGS__", &max_headings.to_string())
+        .replace("__MAX_LINKS__", &max_links.to_string())
+        .replace("__MAX_TEXT_LENGTH__", &max_text_length.to_string());
+    let resp = client
+        .send_to(
+            &tid,
+            "Runtime.evaluate",
+            json!({"expression": code, "returnByValue": true}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let value = resp
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(Some(value))
+}
+
 // -- Connection / request loop ----------------------------------------------
 
 async fn process_request(state: &DaemonState, line: &str) -> String {
@@ -1313,6 +1535,10 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "interaction.pressKey" => handle_press_key(state, &req.params).await,
         "interaction.selectOption" => handle_select_option(state, &req.params).await,
         "interaction.check" => handle_check(state, &req.params).await,
+        "monitor.consoleLogs" => handle_console_logs(state, &req.params).await,
+        "monitor.pageErrors" => handle_page_errors(state, &req.params).await,
+        "capture.metrics" => handle_metrics(state, &req.params).await,
+        "dom.contentSummary" => handle_content_summary(state, &req.params).await,
         other => Err(format!("unsupported action: {other}")),
     };
 
