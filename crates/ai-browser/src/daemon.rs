@@ -996,7 +996,7 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
                 boot_state.ready_notify.notify_waiters();
             }
             Err(err) => {
-                eprintln!("[cdp-spike daemon] boot failed: {err:#}");
+                eprintln!("[ai-browser daemon] boot failed: {err:#}");
                 let _ = std::fs::remove_file(&boot_paths.socket_path);
                 let _ = std::fs::remove_file(&boot_paths.pid_path);
                 std::process::exit(1);
@@ -1020,7 +1020,7 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
     });
 
     eprintln!(
-        "[cdp-spike daemon] listening on {} (pid={})",
+        "[ai-browser daemon] listening on {} (pid={})",
         paths.socket_path.display(),
         std::process::id()
     );
@@ -1034,7 +1034,7 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
                         tokio::spawn(handle_connection(stream, st));
                     }
                     Err(err) => {
-                        eprintln!("[cdp-spike daemon] accept error: {err}");
+                        eprintln!("[ai-browser daemon] accept error: {err}");
                     }
                 }
             }

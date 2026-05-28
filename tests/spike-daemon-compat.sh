@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # spike-daemon-compat.sh — verify TS CLI (./bin/ai-browser.js) can talk to
-# the Rust spike daemon over the same UDS protocol.
+# the Rust ai-browser daemon over the same UDS protocol.
 #
 # Pre-reqs:
-#   - cargo build --release --manifest-path crates/cdp-spike/Cargo.toml
+#   - cargo build --release --manifest-path crates/ai-browser/Cargo.toml
 #   - npm run build (dist/server/runtime.js)
 #   - $BROWSER_EXECUTABLE resolvable (system chromium or Playwright cache)
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SPIKE="${ROOT_DIR}/crates/cdp-spike/target/release/cdp-spike"
+SPIKE="${ROOT_DIR}/crates/ai-browser/target/release/ai-browser"
 AI_BROWSER="${ROOT_DIR}/bin/ai-browser.js"
 
 if [[ ! -x "$SPIKE" ]]; then
-  echo "Missing spike binary. Run: cargo build --release --manifest-path crates/cdp-spike/Cargo.toml" >&2
+  echo "Missing ai-browser binary. Run: cargo build --release --manifest-path crates/ai-browser/Cargo.toml" >&2
   exit 2
 fi
 if [[ ! -f "$ROOT_DIR/dist/server/runtime.js" ]]; then
@@ -60,8 +60,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Boot the spike daemon. Use the same BROWSER_EXECUTABLE for chromium pinning
-# so cdp-spike's Browser::launch resolves to the test binary.
+# Boot the ai-browser daemon. Use the same BROWSER_EXECUTABLE for chromium
+# pinning so Browser::launch resolves to the test binary on both sides.
 BROWSER_EXECUTABLE="$CHROMIUM_BIN" \
   "$SPIKE" daemon start --base-dir "$TMP" \
   >"$TMP/daemon.log" 2>&1 &

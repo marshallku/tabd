@@ -1,24 +1,32 @@
 #!/usr/bin/env bash
-# spike-parity.sh — compare `cdp-spike` stdout against the TS `chromium-cdp`
-# runtime for the same data: URL scenarios. Byte-exact comparison via `cmp`
-# (preserves trailing newlines, unlike `$(...)` capture).
+# spike-parity.sh — compare `ai-browser` legacy in-process CLI stdout against
+# the TS `chromium-cdp` runtime for the same data: URL scenarios. Byte-exact
+# comparison via `cmp` (preserves trailing newlines, unlike `$(...)` capture).
 #
 # Pre-reqs (no external CLI tools beyond what npm + cargo already bring):
-#   - cargo build --release --manifest-path crates/cdp-spike/Cargo.toml
+#   - cargo build --release --manifest-path crates/ai-browser/Cargo.toml
 #   - npm run build  (produces dist/server/runtime.js)
 #   - node + cargo on $PATH
 #
 # To avoid clashing with a running daemon (spike plan codex C2), the TS side
 # uses BROWSER_USER_DATA_DIR=$(mktemp) and BROWSER_DEBUG_PORT=19222.
+#
+# Phase 3a: legacy spike CLI (navigate/eval/fetch-text/get-text/query-all/
+# find-all) moved under `ai-browser _legacy ...` subcommand group, since the
+# top-level surface is now daemon-routed via dispatcher. `spike()` wraps that.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SPIKE="${ROOT_DIR}/crates/cdp-spike/target/release/cdp-spike"
+SPIKE_BIN="${ROOT_DIR}/crates/ai-browser/target/release/ai-browser"
 DIST_RUNTIME="${ROOT_DIR}/dist/server/runtime.js"
 
-if [[ ! -x "$SPIKE" ]]; then
-  echo "Missing spike binary. Run: cargo build --release --manifest-path crates/cdp-spike/Cargo.toml" >&2
+# Legacy-group wrapper so call sites stay compact (`spike navigate URL` ≡
+# `"$SPIKE_BIN" _legacy navigate URL`).
+spike() { "$SPIKE_BIN" _legacy "$@"; }
+
+if [[ ! -x "$SPIKE_BIN" ]]; then
+  echo "Missing ai-browser binary. Run: cargo build --release --manifest-path crates/ai-browser/Cargo.toml" >&2
   exit 2
 fi
 if [[ ! -f "$DIST_RUNTIME" ]]; then
@@ -197,7 +205,7 @@ report_fail() {
 # this case had no TS invocation before).
 case_navigate() {
   local label="$1" url="$2"
-  if ! "$SPIKE" navigate "$url" >/dev/null 2>&1; then
+  if ! spike navigate "$url" >/dev/null 2>&1; then
     report_fail "$label" "(spike exit != 0)" "(skipped)"
     return
   fi
@@ -214,7 +222,7 @@ case_eval() {
   local sf tf
   sf="$(mktemp)"
   tf="$(mktemp)"
-  "$SPIKE" eval "$url" "$code" > "$sf"
+  spike eval "$url" "$code" > "$sf"
   ts_eval_to "$url" "$code" "$tf"
   if cmp -s "$sf" "$tf"; then
     report_pass "$label" "$(cat "$sf" | tr -d '\n')"
@@ -230,7 +238,7 @@ case_fetch_text() {
   local sf tf
   sf="$(mktemp)"
   tf="$(mktemp)"
-  "$SPIKE" fetch-text "$url" "$selector" > "$sf"
+  spike fetch-text "$url" "$selector" > "$sf"
   # Mirror spike's build_text_expr exactly so the JS executed on the TS side
   # is byte-identical to what spike injects.
   local lit
@@ -261,7 +269,7 @@ case_get_text() {
   if [[ -n "$spike_selector" ]]; then args+=(--selector "$spike_selector"); fi
   if [[ -n "$spike_testid" ]]; then args+=(--testid "$spike_testid"); fi
   if [[ "$raw" == "1" ]]; then args+=(--raw); fi
-  "$SPIKE" "${args[@]}" > "$sf"
+  spike "${args[@]}" > "$sf"
   ts_get_text_to "$url" "$ts_selector" "$raw" "$tf"
   if cmp -s "$sf" "$tf"; then
     report_pass "$label" "$(cat "$sf" | tr -d '\n')"
@@ -348,7 +356,7 @@ ax_case() {
   # set -e would normally abort on a non-zero spike exit (e.g. --role miss).
   # Use `if` to consume the exit status so the smoke can continue testing
   # both success and failure cases.
-  if actual_out="$("$SPIKE" get-text "$url" "$@" 2>&1)"; then
+  if actual_out="$(spike get-text "$url" "$@" 2>&1)"; then
     actual_rc=0
   else
     actual_rc=$?
@@ -412,7 +420,7 @@ qa_case() {
   local label="$1" url="$2" expected_exit="$3" expected_stdout="$4"
   shift 4
   local actual_out actual_rc
-  if actual_out="$("$SPIKE" query-all "$url" "$@" 2>&1)"; then
+  if actual_out="$(spike query-all "$url" "$@" 2>&1)"; then
     actual_rc=0
   else
     actual_rc=$?
@@ -487,7 +495,7 @@ fa_case_field() {
   shift 4
   local actual_stdout actual_value stderr_file
   stderr_file="$(mktemp)"
-  if ! actual_stdout="$("$SPIKE" find-all "$url" "$@" 2>"$stderr_file")"; then
+  if ! actual_stdout="$(spike find-all "$url" "$@" 2>"$stderr_file")"; then
     local err; err="$(cat "$stderr_file")"; rm -f "$stderr_file"
     report_fail "$label" "(spike failed: $err)" "($expected)"
     return
@@ -513,7 +521,7 @@ fa_case_exit() {
   local label="$1" url="$2" expected_exit="$3"
   shift 3
   local actual_rc
-  if "$SPIKE" find-all "$url" "$@" >/dev/null 2>&1; then
+  if spike find-all "$url" "$@" >/dev/null 2>&1; then
     actual_rc=0
   else
     actual_rc=$?

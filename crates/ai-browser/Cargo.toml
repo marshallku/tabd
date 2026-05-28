@@ -1,9 +1,13 @@
 [package]
-name = "cdp-spike"
+name = "ai-browser"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Rust + Chromium CDP spike for ai-browser (parity exploration, not production)"
+description = "Rust + Chromium CDP browser controller (CLI + daemon)"
+
+[[bin]]
+name = "ai-browser"
+path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "time", "sync", "net", "signal"] }
@@ -16,6 +20,7 @@ anyhow = "1"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 regex = "1"
+base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
