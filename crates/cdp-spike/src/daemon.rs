@@ -211,6 +211,18 @@ impl DaemonState {
 
     async fn health(&self, id: &str) -> String {
         let last_err = self.last_error.lock().await.clone();
+        // Driver-level health (codex round 1 C4) — phase 2c populates chromium
+        // pid + RSS when the browser is up. restartAttempt is always 0 because
+        // spike does not implement crash-restart supervisor (phase 2c+).
+        let driver = match self.browser.lock().await.as_ref().and_then(|b| b.pid()) {
+            Some(pid) => json!({
+                "chromiumPid": pid,
+                "chromiumRssBytes": read_process_rss_bytes(pid),
+                "restartAttempt": 0,
+                "restarting": false,
+            }),
+            None => Value::Null,
+        };
         let body = json!({
             "pid": self.pid,
             "uptimeMs": self.started_at.elapsed().as_millis() as u64,
@@ -219,9 +231,7 @@ impl DaemonState {
             "inflight": self.inflight.load(Ordering::Acquire),
             "totalRequests": self.total_requests.load(Ordering::Acquire),
             "lastError": last_err,
-            // Driver-level health (chromium pid, rss, supervisor) is phase 2c;
-            // TS chromium-cdp also returns null here.
-            "driver": Value::Null,
+            "driver": driver,
         });
         success_response(id, body)
     }
@@ -344,6 +354,40 @@ async fn handle_get_text(state: &DaemonState, params: &Value) -> Result<Option<V
         .await
         .map(|opt| Some(opt.unwrap_or(Value::String(String::new()))))
         .map_err(|e| e.to_string())
+}
+
+// -- Phase 2c: driver health helpers ---------------------------------------
+
+/// Read VmRSS from /proc/<pid>/status on Linux. Returns 0 on any failure
+/// (file missing, not Linux, parsing problems). The TS daemon also returns
+/// 0 when the procfs read fails.
+fn read_process_rss_bytes(pid: u32) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/proc/{pid}/status");
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return 0;
+        };
+        for line in contents.lines() {
+            // Lines look like: "VmRSS:	   12345 kB"
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb_str = rest
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .trim_end_matches("kB")
+                    .trim();
+                if let Ok(kb) = kb_str.parse::<u64>() {
+                    return kb.saturating_mul(1024);
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        0
+    }
 }
 
 // -- Phase 2b: interaction + wait helpers ----------------------------------
@@ -922,5 +966,26 @@ mod tests {
     fn url_matcher_invalid_regex() {
         let err = compile_url_matcher("[bad", "regex").err().unwrap();
         assert!(err.contains("invalid regex pattern"), "got: {err}");
+    }
+
+    // -- Phase 2c: driver health --
+
+    #[test]
+    fn rss_returns_nonzero_for_self_pid_on_linux() {
+        // The current process should always have a measurable RSS on Linux.
+        // On other OSes the helper returns 0 by design.
+        let rss = read_process_rss_bytes(std::process::id());
+        #[cfg(target_os = "linux")]
+        assert!(rss > 0, "expected non-zero RSS on Linux; got {rss}");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(rss, 0);
+    }
+
+    #[test]
+    fn rss_returns_zero_for_bogus_pid() {
+        // Very unlikely a process with this PID exists; even if it does it
+        // would belong to another user and procfs read fails → 0.
+        let rss = read_process_rss_bytes(99_999_999);
+        assert_eq!(rss, 0);
     }
 }

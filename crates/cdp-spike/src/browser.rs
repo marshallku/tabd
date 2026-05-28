@@ -93,6 +93,13 @@ impl Browser {
         &self.ws_endpoint
     }
 
+    /// PID of the spawned Chromium process. `None` if the child has already
+    /// been reaped or was never assigned a PID by the OS (shouldn't happen
+    /// post-launch, but std::process::Child::id returns Option).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Graceful shutdown: SIGTERM → wait up to `GRACEFUL_WAIT` → SIGKILL fallback.
     /// `kill_on_drop(true)` covers panic / early-drop paths separately.
     /// Once cdp.rs lands (task #16) this can additionally send CDP `Browser.close`

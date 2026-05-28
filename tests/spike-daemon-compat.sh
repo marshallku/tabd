@@ -105,28 +105,52 @@ ts_env=(
   "AI_BROWSER_BASE_DIR=$TMP"
 )
 
-# 1. TS CLI daemon health → JSON, verify pid matches spike daemon.
+# 1. TS CLI daemon health → JSON, verify pid matches spike daemon + driver shape.
 case_health() {
-  local raw pid_in_response
+  local raw
   if ! raw="$(env "${ts_env[@]}" timeout 15 node "$AI_BROWSER" daemon health 2>&1)"; then
     report_fail "TS daemon health" "$raw"
     return
   fi
-  # Output is multi-line pretty JSON. Pipe the whole stdout to node which
-  # extracts the {...} block (last balanced one) and reads .pid.
-  pid_in_response="$(printf '%s' "$raw" | node -e '
-    const s = require("fs").readFileSync(0, "utf8");
-    // pick the last JSON object in the output
-    const start = s.lastIndexOf("{");
-    const end = s.lastIndexOf("}");
-    if (start < 0 || end <= start) { process.exit(1); }
-    const obj = JSON.parse(s.slice(start, end + 1));
-    process.stdout.write(String(obj.pid || ""));
-  ' 2>/dev/null || true)"
+  # Single node call — emits "<pid> <chromiumPid> <hasRss>" or "ERR" on parse fail.
+  local extracted
+  extracted="$(printf '%s' "$raw" | node -e '
+    try {
+      const s = require("fs").readFileSync(0, "utf8");
+      // Whole JSON spans first { … last } (pretty-printed → no nesting risk
+      // when picking outer braces this way).
+      const start = s.indexOf("{");
+      const end = s.lastIndexOf("}");
+      if (start < 0 || end <= start) throw new Error("no JSON");
+      const obj = JSON.parse(s.slice(start, end + 1));
+      const pid = obj.pid ?? "";
+      const cpid = (obj.driver && obj.driver.chromiumPid) || "";
+      const rss = (obj.driver && obj.driver.chromiumRssBytes) || 0;
+      const hasRss = rss > 0 ? "yes" : "no";
+      process.stdout.write([pid, cpid, hasRss].join(" "));
+    } catch (e) { process.stdout.write("ERR"); }
+  ')"
+
+  if [[ "$extracted" == "ERR" ]] || [[ -z "$extracted" ]]; then
+    report_fail "TS daemon health: parse failed" "$raw"
+    return
+  fi
+  local pid_in_response chromium_pid has_rss
+  read -r pid_in_response chromium_pid has_rss <<< "$extracted"
+
   if [[ "$pid_in_response" == "$DAEMON_PID" ]]; then
     report_pass "TS daemon health → pid matches spike daemon ($pid_in_response)"
   else
     report_fail "TS daemon health pid mismatch" "$pid_in_response" "$DAEMON_PID"
+    return
+  fi
+
+  if [[ -n "$chromium_pid" ]] && [[ "$has_rss" == "yes" ]]; then
+    report_pass "TS daemon health → driver has chromiumPid=$chromium_pid + non-zero RSS"
+  else
+    report_fail "TS daemon health driver field incomplete" \
+      "chromiumPid=$chromium_pid hasRss=$has_rss" \
+      "all populated"
   fi
 }
 
