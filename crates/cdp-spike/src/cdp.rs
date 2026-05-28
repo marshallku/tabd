@@ -6,19 +6,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// CDP JSON-RPC client. Attaches to a fresh page target with flatten mode,
 /// auto-routes responses by id, and exposes `send()` for method calls on
 /// the attached session (sessionId is added automatically).
+///
+/// `close(&self)` is idempotent — drops the writer mpsc sender so background
+/// reader/writer tasks exit naturally (sink close → reader EOF). No JoinHandle
+/// tracking; tasks are expected to terminate on process exit if not before.
 pub struct CdpClient {
     next_id: AtomicU64,
-    out_tx: mpsc::UnboundedSender<String>,
+    // Mutex<Option<Sender>> so close() can take + drop the sender. Subsequent
+    // dispatch attempts see None and return a clear error.
+    out_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     session_id: String,
-    reader: Option<JoinHandle<()>>,
-    writer: Option<JoinHandle<()>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -48,7 +51,7 @@ impl CdpClient {
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
 
-        let writer = tokio::spawn(async move {
+        tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
                 if sink.send(Message::Text(msg.into())).await.is_err() {
                     break;
@@ -57,7 +60,7 @@ impl CdpClient {
             let _ = sink.close().await;
         });
 
-        let reader = tokio::spawn(async move {
+        tokio::spawn(async move {
             while let Some(msg) = stream.next().await {
                 let Ok(Message::Text(text)) = msg else {
                     continue;
@@ -86,11 +89,9 @@ impl CdpClient {
 
         let mut client = CdpClient {
             next_id: AtomicU64::new(1),
-            out_tx,
+            out_tx: Mutex::new(Some(out_tx)),
             pending,
             session_id: String::new(),
-            reader: Some(reader),
-            writer: Some(writer),
         };
 
         // 1. Fresh page target (about:blank — real URL comes via Page.navigate later).
@@ -145,9 +146,20 @@ impl CdpClient {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
-        if let Err(err) = self.out_tx.send(text) {
-            // Writer is gone; reclaim the pending entry so it does not leak
-            // until ws drain (codex I1).
+        // Grab the sender under lock. If close() already took it, fail fast
+        // and reclaim the pending entry.
+        let send_result = {
+            let guard = self.out_tx.lock().await;
+            match guard.as_ref() {
+                Some(sender) => sender.send(text),
+                None => {
+                    drop(guard);
+                    self.pending.lock().await.remove(&id);
+                    return Err(anyhow!("cdp writer task closed"));
+                }
+            }
+        };
+        if let Err(err) = send_result {
             self.pending.lock().await.remove(&id);
             return Err(anyhow::Error::new(err).context("cdp writer task closed"));
         }
@@ -156,15 +168,11 @@ impl CdpClient {
             .map_err(|_| anyhow!("cdp pending reply dropped"))?
     }
 
-    /// Close the websocket and join background tasks. Idempotent.
-    pub async fn close(mut self) -> Result<()> {
-        drop(self.out_tx);
-        if let Some(w) = self.writer.take() {
-            let _ = w.await;
-        }
-        if let Some(r) = self.reader.take() {
-            let _ = r.await;
-        }
+    /// Drop the writer mpsc sender. Background tasks (writer/reader) exit
+    /// naturally on sender drop → mpsc closed → sink close → reader EOF.
+    /// Idempotent — calling close twice is safe.
+    pub async fn close(&self) -> Result<()> {
+        let _ = self.out_tx.lock().await.take();
         Ok(())
     }
 }

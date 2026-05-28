@@ -6,7 +6,7 @@ publish = false
 description = "Rust + Chromium CDP spike for ai-browser (parity exploration, not production)"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "time", "sync", "net", "signal"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

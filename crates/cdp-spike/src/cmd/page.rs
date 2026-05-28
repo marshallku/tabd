@@ -38,6 +38,12 @@ pub async fn open(url: &str, timeout_ms: u64) -> Result<(Browser, CdpClient)> {
     }
 }
 
+/// Navigate using an already-connected CdpClient (no browser launch) and wait
+/// for readyState. Used by the daemon (one Chromium reused across requests).
+pub async fn navigate_existing(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<()> {
+    navigate_and_wait(client, url, timeout_ms).await
+}
+
 async fn navigate_and_wait(client: &CdpClient, url: &str, timeout_ms: u64) -> Result<()> {
     let nav = client.send("Page.navigate", json!({ "url": url })).await?;
     if let Some(err) = nav.get("errorText").and_then(|v| v.as_str())

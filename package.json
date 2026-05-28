@@ -39,7 +39,8 @@
         "e2e:crash-restore": "npm run build && node tests/e2e-crash-restore.mjs",
         "e2e:rss-monitor": "npm run build && node tests/e2e-rss-monitor.mjs",
         "e2e:run-once": "npm run build && node tests/e2e-run-once.mjs",
-        "e2e:spike-parity": "npm run build && cargo build --release --manifest-path crates/cdp-spike/Cargo.toml && bash tests/spike-parity.sh"
+        "e2e:spike-parity": "npm run build && cargo build --release --manifest-path crates/cdp-spike/Cargo.toml && bash tests/spike-parity.sh",
+        "e2e:spike-daemon-compat": "npm run build && cargo build --release --manifest-path crates/cdp-spike/Cargo.toml && bash tests/spike-daemon-compat.sh"
     },
     "publishConfig": {
         "access": "public"

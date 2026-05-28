@@ -1,9 +1,35 @@
 mod browser;
 mod cdp;
 mod cmd;
+mod daemon;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Run the daemon in the foreground (blocks until SIGTERM or daemon.shutdown).
+    Start {
+        /// Override base directory. Defaults to $AI_BROWSER_BASE_DIR or $XDG_RUNTIME_DIR/ai-browser-rs.
+        #[arg(long)]
+        base_dir: Option<String>,
+    },
+    /// Send daemon.shutdown to a running daemon.
+    Stop {
+        #[arg(long)]
+        base_dir: Option<String>,
+    },
+    /// Send daemon.ping. Prints raw JSON response.
+    Ping {
+        #[arg(long)]
+        base_dir: Option<String>,
+    },
+    /// Send daemon.health. Prints raw JSON response.
+    Health {
+        #[arg(long)]
+        base_dir: Option<String>,
+    },
+}
 
 #[derive(Parser)]
 #[command(name = "cdp-spike", about = "Rust + Chromium CDP spike for ai-browser")]
@@ -32,6 +58,11 @@ enum Command {
         selector: String,
         #[arg(long, default_value_t = 30_000)]
         timeout: u64,
+    },
+    /// TS-protocol-compatible Rust daemon over UDS.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
     },
     /// Extract metadata (tag, text, id, classes, attrs, rect) for each
     /// matching element as a JSON object array. Exactly one TARGET required;
@@ -172,6 +203,27 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Daemon { cmd } => match cmd {
+            DaemonCmd::Start { base_dir } => daemon::run(base_dir.as_deref()).await,
+            DaemonCmd::Stop { base_dir } => {
+                let paths = daemon::resolve_paths(base_dir.as_deref())?;
+                let resp = daemon::send_control_action(&paths.socket_path, "daemon.shutdown").await?;
+                println!("{}", serde_json::to_string(&resp)?);
+                Ok(())
+            }
+            DaemonCmd::Ping { base_dir } => {
+                let paths = daemon::resolve_paths(base_dir.as_deref())?;
+                let resp = daemon::send_control_action(&paths.socket_path, "daemon.ping").await?;
+                println!("{}", serde_json::to_string(&resp)?);
+                Ok(())
+            }
+            DaemonCmd::Health { base_dir } => {
+                let paths = daemon::resolve_paths(base_dir.as_deref())?;
+                let resp = daemon::send_control_action(&paths.socket_path, "daemon.health").await?;
+                println!("{}", serde_json::to_string(&resp)?);
+                Ok(())
+            }
+        },
         Command::FindAll {
             url,
             selector,
