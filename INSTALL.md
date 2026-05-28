@@ -15,8 +15,8 @@ unsupported because the daemon talks over Unix domain sockets.
 ### From source (recommended)
 
 ```bash
-git clone https://github.com/marshallku/browser.git
-cd browser
+git clone https://github.com/marshallku/tabd.git
+cd tabd
 cargo install --path crates/tabd
 ```
 
