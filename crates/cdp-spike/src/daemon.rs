@@ -726,6 +726,24 @@ async fn handle_cookies_delete(
 /// `storage.get` — evaluate-based wrapper over local/sessionStorage.
 /// If `key` is provided, returns the single value. Otherwise dumps the whole
 /// storage as `{ key: value }` object.
+/// `capture.screenshot` — CDP `Page.captureScreenshot {format:"png"}` →
+/// base64. Returns a `data:image/png;base64,...` URL (TS chromium-cdp parity).
+/// TS CLI's renderResult decodes the data: URL when `--out FILE` is passed.
+async fn handle_screenshot(state: &DaemonState, _params: &Value) -> Result<Option<Value>, String> {
+    let client = client_or_err(state).await?;
+    let send_fut = client.send("Page.captureScreenshot", json!({ "format": "png" }));
+    let resp = match tokio::time::timeout(Duration::from_secs(10), send_fut).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(_) => return Err("Page.captureScreenshot timed out after 10s".to_string()),
+    };
+    let data = resp
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Page.captureScreenshot response missing 'data'".to_string())?;
+    Ok(Some(Value::String(format!("data:image/png;base64,{data}"))))
+}
+
 async fn handle_storage_get(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
     let storage_type = if params.get("type").and_then(Value::as_str) == Some("session") {
         "sessionStorage"
@@ -845,6 +863,7 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "storage.get" => handle_storage_get(state, &req.params).await,
         "storage.set" => handle_storage_set(state, &req.params).await,
         "storage.clear" => handle_storage_clear(state, &req.params).await,
+        "capture.screenshot" => handle_screenshot(state, &req.params).await,
         "interaction.click" => handle_click(state, &req.params).await,
         "interaction.type" => handle_type(state, &req.params).await,
         "wait.selector" => handle_wait_selector(state, &req.params).await,

@@ -457,6 +457,34 @@ case_storage() {
 
 case_storage
 
+# Phase 2d-5: capture.screenshot — save PNG via --out, verify file is a valid PNG.
+case_screenshot() {
+  env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" navigate \
+    "data:text/html,<h1 style='color:red;font-size:50px'>SNAP</h1>" \
+    >/dev/null 2>&1 || { report_fail "TS screenshot navigate setup"; return; }
+  local out="$TMP/shot.png"
+  if ! env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" screenshot --out "$out" >/dev/null 2>&1; then
+    report_fail "TS screenshot via spike daemon"
+    return
+  fi
+  # Verify PNG magic bytes (89 50 4E 47 = "\x89PNG").
+  if [[ ! -f "$out" ]]; then
+    report_fail "TS screenshot file not written"
+    return
+  fi
+  local magic
+  magic="$(head -c 4 "$out" | xxd -p)"
+  if [[ "$magic" == "89504e47" ]]; then
+    local size
+    size="$(stat -c '%s' "$out")"
+    report_pass "TS screenshot wrote valid PNG (${size} bytes)"
+  else
+    report_fail "TS screenshot file is not a PNG" "magic=$magic" "89504e47"
+  fi
+}
+
+case_screenshot
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true
