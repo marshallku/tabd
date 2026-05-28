@@ -78,10 +78,10 @@ fi
 
 # Case 2: second call uses the same daemon — health pid should be stable.
 HEALTH1="$("$BIN" daemon health --base-dir "$TMP" 2>/dev/null || true)"
-PID1="$(printf '%s' "$HEALTH1" | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String((d.data&&d.data.pid)||""))' 2>/dev/null || true)"
+PID1="$(printf '%s' "$HEALTH1" | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String(d.pid||""))' 2>/dev/null || true)"
 "$BIN" eval "1+1" >/dev/null 2>&1 || true
 HEALTH2="$("$BIN" daemon health --base-dir "$TMP" 2>/dev/null || true)"
-PID2="$(printf '%s' "$HEALTH2" | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String((d.data&&d.data.pid)||""))' 2>/dev/null || true)"
+PID2="$(printf '%s' "$HEALTH2" | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String(d.pid||""))' 2>/dev/null || true)"
 if [[ -n "$PID1" && "$PID1" == "$PID2" ]]; then
   pass "idempotent spawn (daemon pid stable: $PID1)"
 else
