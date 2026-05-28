@@ -34,13 +34,13 @@ pub struct DaemonPaths {
 pub fn resolve_paths(override_base: Option<&str>) -> Result<DaemonPaths> {
     let base_dir: PathBuf = if let Some(p) = override_base {
         PathBuf::from(p)
-    } else if let Ok(d) = std::env::var("AI_BROWSER_BASE_DIR") {
+    } else if let Ok(d) = std::env::var("TABD_BASE_DIR") {
         PathBuf::from(d)
     } else if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(d).join("ai-browser-rs")
+        PathBuf::from(d).join("tabd")
     } else {
         let home = std::env::var("HOME").context("HOME not set")?;
-        PathBuf::from(home).join(".cache/ai-browser-rs")
+        PathBuf::from(home).join(".cache/tabd")
     };
     Ok(DaemonPaths {
         socket_path: base_dir.join("daemon.sock"),
@@ -128,7 +128,7 @@ struct DaemonState {
     browser: Arc<Mutex<Option<Browser>>>,
     action_mutex: Arc<Mutex<()>>,
     /// Lazy-init secrets vault. None until the first secrets.* call.
-    /// Phase 3f: passphrase mode only ($AI_BROWSER_VAULT_KEY required).
+    /// Phase 3f: passphrase mode only ($TABD_VAULT_KEY required).
     vault: Arc<Mutex<Option<crate::secrets::VaultStore>>>,
     /// Cumulative chromium restart count for this daemon process (3g).
     restart_attempts: Arc<AtomicU32>,
@@ -257,7 +257,7 @@ impl DaemonState {
 
     async fn run_drain(&self) {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let timeout_ms = std::env::var("AI_BROWSER_DRAIN_TIMEOUT_MS")
+        let timeout_ms = std::env::var("TABD_DRAIN_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(10_000);
@@ -1531,14 +1531,14 @@ async fn handle_wait_network_idle(
 }
 
 /// Resolve the vault, opening it lazily on first use. Errors with a clear
-/// message if AI_BROWSER_VAULT_KEY env isn't set.
+/// message if TABD_VAULT_KEY env isn't set.
 async fn vault_or_err(
     state: &DaemonState,
 ) -> Result<tokio::sync::MutexGuard<'_, Option<crate::secrets::VaultStore>>, String> {
     let mut guard = state.vault.lock().await;
     if guard.is_none() {
-        let passphrase = std::env::var("AI_BROWSER_VAULT_KEY")
-            .map_err(|_| "AI_BROWSER_VAULT_KEY env not set; secrets unavailable".to_string())?;
+        let passphrase = std::env::var("TABD_VAULT_KEY")
+            .map_err(|_| "TABD_VAULT_KEY env not set; secrets unavailable".to_string())?;
         let store = crate::secrets::VaultStore::open_or_create(&passphrase)
             .map_err(|e| format!("vault open failed: {e}"))?;
         *guard = Some(store);
@@ -1926,7 +1926,7 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
                 boot_state.ready_notify.notify_waiters();
             }
             Err(err) => {
-                eprintln!("[ai-browser daemon] boot failed: {err:#}");
+                eprintln!("[tabd daemon] boot failed: {err:#}");
                 let _ = std::fs::remove_file(&boot_paths.socket_path);
                 let _ = std::fs::remove_file(&boot_paths.pid_path);
                 std::process::exit(1);
@@ -1953,7 +1953,7 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
     });
 
     eprintln!(
-        "[ai-browser daemon] listening on {} (pid={})",
+        "[tabd daemon] listening on {} (pid={})",
         paths.socket_path.display(),
         std::process::id()
     );
@@ -1967,7 +1967,7 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
                         tokio::spawn(handle_connection(stream, st));
                     }
                     Err(err) => {
-                        eprintln!("[ai-browser daemon] accept error: {err}");
+                        eprintln!("[tabd daemon] accept error: {err}");
                     }
                 }
             }
@@ -2045,7 +2045,7 @@ async fn supervise(state: DaemonState, paths: DaemonPaths) {
             continue;
         }
         // Crash detected — flip ready off and rebuild.
-        eprintln!("[ai-browser daemon] chromium pid={pid} disappeared; restarting");
+        eprintln!("[tabd daemon] chromium pid={pid} disappeared; restarting");
         state.ready.store(false, Ordering::Release);
         state.restart_attempts.fetch_add(1, Ordering::AcqRel);
         // Drop the dead client/browser before booting a new one so resources
@@ -2061,7 +2061,7 @@ async fn supervise(state: DaemonState, paths: DaemonPaths) {
                     state.ready.store(true, Ordering::Release);
                     state.ready_notify.notify_waiters();
                     eprintln!(
-                        "[ai-browser daemon] chromium recovered after {} attempt(s)",
+                        "[tabd daemon] chromium recovered after {} attempt(s)",
                         attempt + 1
                     );
                     break;

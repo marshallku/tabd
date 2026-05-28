@@ -1,11 +1,10 @@
-//! TS-CLI-compatible dispatcher. Mirrors `src/cli/index.ts` semantics so a
-//! Rust `ai-browser <subcommand>` invocation behaves byte-identically to the
-//! TS one: same argv parsing rules, same render-result branches, same daemon
-//! auto-spawn behavior. Tier 1 (16 daemon actions) is the only surface; new
-//! subcommands land in phase 3b~3f.
+//! CLI dispatcher: argv parsing, dispatch table, daemon auto-spawn, result
+//! rendering. Reads `tabd <subcommand>` argv, dispatches the matching daemon
+//! action, and renders the response. The shape mirrors the long-retired TS
+//! CLI for tooling that still parses the JSON output.
 //!
-//! Why one file: per phase-3a plan, render/dispatch/args/daemon-client stay
-//! together until the Rule of Three triggers a split in later phases.
+//! Why one file: per the original phase-3a plan, render/dispatch/args/daemon-
+//! client stay together until the Rule of Three triggers a split.
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -281,8 +280,8 @@ async fn ping(socket_path: &Path) -> Result<()> {
 }
 
 /// Make sure a daemon is reachable at the given base_dir. If none is running
-/// and `AI_BROWSER_NO_AUTO_SPAWN` is unset, spawn one in detached mode and
-/// poll until it's ready (or the deadline elapses).
+/// and `TABD_NO_AUTO_SPAWN` is unset, spawn one in detached mode and poll
+/// until it's ready (or the deadline elapses).
 async fn ensure_daemon(base_dir: Option<&str>) -> Result<daemon::DaemonPaths> {
     let paths = daemon::resolve_paths(base_dir)?;
 
@@ -290,15 +289,15 @@ async fn ensure_daemon(base_dir: Option<&str>) -> Result<daemon::DaemonPaths> {
         return Ok(paths);
     }
 
-    if std::env::var("AI_BROWSER_NO_AUTO_SPAWN").is_ok() {
+    if std::env::var("TABD_NO_AUTO_SPAWN").is_ok() {
         bail!(
-            "daemon not running at {} and AI_BROWSER_NO_AUTO_SPAWN is set",
+            "daemon not running at {} and TABD_NO_AUTO_SPAWN is set",
             paths.socket_path.display()
         );
     }
 
     // Detached spawn: child inherits no stdio (avoids zombie/SIGPIPE), and
-    // carries AI_BROWSER_NO_AUTO_SPAWN so it cannot recursively respawn.
+    // carries TABD_NO_AUTO_SPAWN so it cannot recursively respawn.
     let exe = std::env::current_exe().context("current_exe")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("daemon").arg("start");
@@ -308,7 +307,7 @@ async fn ensure_daemon(base_dir: Option<&str>) -> Result<daemon::DaemonPaths> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .env("AI_BROWSER_NO_AUTO_SPAWN", "1");
+        .env("TABD_NO_AUTO_SPAWN", "1");
     let child = cmd.spawn().context("spawn daemon")?;
     drop(child); // detach — init/PID 1 reaps it on exit.
 

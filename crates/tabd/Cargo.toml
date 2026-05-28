@@ -1,12 +1,12 @@
 [package]
-name = "ai-browser"
+name = "tabd"
 version = "0.1.0"
 edition = "2024"
 publish = false
 description = "Rust + Chromium CDP browser controller (CLI + daemon)"
 
 [[bin]]
-name = "ai-browser"
+name = "tabd"
 path = "src/main.rs"
 
 [dependencies]

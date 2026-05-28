@@ -1,24 +1,19 @@
 #!/usr/bin/env bash
-# spike-daemon-compat.sh — end-to-end smoke for the Rust ai-browser binary
-# against a real chromium. Boots the daemon, exercises Tier 1~5 + Tier 2
-# actions plus the supervisor restart path, then shuts the daemon down.
-# Phase 3i: TS removed; all calls go through the Rust binary directly.
+# spike-daemon-compat.sh — end-to-end smoke for the Rust tabd binary against a
+# real chromium. Boots the daemon, exercises Tier 1~5 + Tier 2 actions plus
+# the supervisor restart path, then shuts the daemon down.
 #
 # Pre-reqs:
-#   - cargo build --release --manifest-path crates/ai-browser/Cargo.toml
+#   - cargo build --release --manifest-path crates/tabd/Cargo.toml
 #   - $BROWSER_EXECUTABLE resolvable (system chromium or Playwright cache)
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SPIKE="${ROOT_DIR}/crates/ai-browser/target/release/ai-browser"
-# Alias kept for legacy variable name — same binary as $SPIKE. Removed the
-# Node TS CLI ("$AI_BROWSER" used to point at bin/ai-browser.js) along with
-# the rest of the TS source in phase 3i.
-AI_BROWSER="$SPIKE"
+BIN="${ROOT_DIR}/crates/tabd/target/release/tabd"
 
-if [[ ! -x "$SPIKE" ]]; then
-  echo "Missing ai-browser binary. Run: cargo build --release --manifest-path crates/ai-browser/Cargo.toml" >&2
+if [[ ! -x "$BIN" ]]; then
+  echo "Missing tabd binary. Run: cargo build --release --manifest-path crates/tabd/Cargo.toml" >&2
   exit 2
 fi
 
@@ -62,12 +57,12 @@ VAULT_KEY="daemon-compat-${RANDOM}"
 VAULT_PATH="$TMP/vault.enc"
 SECRET_TEST_VALUE="login-token-from-compat-${RANDOM}"
 
-# Boot the ai-browser daemon. Use the same BROWSER_EXECUTABLE for chromium
+# Boot the tabd daemon. Use the same BROWSER_EXECUTABLE for chromium
 # pinning so Browser::launch resolves to the test binary on both sides.
 BROWSER_EXECUTABLE="$CHROMIUM_BIN" \
-  AI_BROWSER_VAULT_KEY="$VAULT_KEY" \
-  AI_BROWSER_VAULT_PATH="$VAULT_PATH" \
-  "$SPIKE" daemon start --base-dir "$TMP" \
+  TABD_VAULT_KEY="$VAULT_KEY" \
+  TABD_VAULT_PATH="$VAULT_PATH" \
+  "$BIN" daemon start --base-dir "$TMP" \
   >"$TMP/daemon.log" 2>&1 &
 DAEMON_PID=$!
 echo "spike daemon started, pid=$DAEMON_PID"
@@ -85,7 +80,7 @@ fi
 
 # Wait until daemon reports ready (chromium+cdp boot done).
 for _ in $(seq 1 30); do
-  resp="$("$SPIKE" daemon ping --base-dir "$TMP" 2>/dev/null || true)"
+  resp="$("$BIN" daemon ping --base-dir "$TMP" 2>/dev/null || true)"
   if echo "$resp" | grep -q '"ready":true'; then
     break
   fi
@@ -107,14 +102,14 @@ report_fail() {
 ts_env=(
   "BROWSER_RUNTIME=chromium-cdp"
   "BROWSER_EXECUTABLE=$CHROMIUM_BIN"
-  "AI_BROWSER_BASE_DIR=$TMP"
+  "TABD_BASE_DIR=$TMP"
   "SECRET_TEST_VALUE=$SECRET_TEST_VALUE"
 )
 
 # 1. TS CLI daemon health → JSON, verify pid matches spike daemon + driver shape.
 case_health() {
   local raw
-  if ! raw="$(env "${ts_env[@]}" timeout 15 "$AI_BROWSER" daemon health 2>&1)"; then
+  if ! raw="$(env "${ts_env[@]}" timeout 15 "$BIN" daemon health 2>&1)"; then
     report_fail "TS daemon health" "$raw"
     return
   fi
@@ -163,7 +158,7 @@ case_health() {
 # 2. TS CLI navigate via spike daemon.
 case_navigate() {
   local out rc
-  if out="$(env "${ts_env[@]}" "$AI_BROWSER" navigate "data:text/html,<h1>Hi</h1>" 2>&1)"; then
+  if out="$(env "${ts_env[@]}" "$BIN" navigate "data:text/html,<h1>Hi</h1>" 2>&1)"; then
     rc=0
   else
     rc=$?
@@ -178,7 +173,7 @@ case_navigate() {
 # 3. TS CLI eval via spike daemon.
 case_eval() {
   local out rc
-  if out="$(env "${ts_env[@]}" "$AI_BROWSER" eval "document.title" 2>&1)"; then
+  if out="$(env "${ts_env[@]}" "$BIN" eval "document.title" 2>&1)"; then
     rc=0
   else
     rc=$?
@@ -194,8 +189,8 @@ case_eval() {
 case_get_text() {
   local out rc
   # navigate first so the page state is the same one we'll read from.
-  env "${ts_env[@]}" "$AI_BROWSER" navigate "data:text/html,<h1>Hello</h1>" >/dev/null 2>&1 || true
-  if out="$(env "${ts_env[@]}" "$AI_BROWSER" get-text --selector h1 2>&1)"; then
+  env "${ts_env[@]}" "$BIN" navigate "data:text/html,<h1>Hello</h1>" >/dev/null 2>&1 || true
+  if out="$(env "${ts_env[@]}" "$BIN" get-text --selector h1 2>&1)"; then
     rc=0
   else
     rc=$?
@@ -223,13 +218,13 @@ case_click() {
   # navigate to a page with a button that sets window.clicked on click,
   # then click via TS CLI, then verify window.clicked via TS eval.
   local navout clickout evalout
-  env "${ts_env[@]}" timeout 30 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 30 "$BIN" navigate \
     "data:text/html,<button id=b onclick='window.clicked=1'>Go</button>" \
     >/dev/null 2>&1 || { report_fail "TS click navigate setup"; return; }
-  if ! clickout="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" click "#b" 2>&1)"; then
+  if ! clickout="$(env "${ts_env[@]}" timeout 30 "$BIN" click "#b" 2>&1)"; then
     report_fail "TS click via spike daemon" "$clickout"; return
   fi
-  if ! evalout="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" eval "window.clicked" 2>&1)"; then
+  if ! evalout="$(env "${ts_env[@]}" timeout 30 "$BIN" eval "window.clicked" 2>&1)"; then
     report_fail "TS click verify (eval after click)" "$evalout"; return
   fi
   # eval output is the value (1) or possibly "1" — check trimmed contains "1"
@@ -243,13 +238,13 @@ case_click() {
 
 case_type() {
   local navout typeout evalout
-  env "${ts_env[@]}" timeout 30 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 30 "$BIN" navigate \
     "data:text/html,<input id=i type=text>" \
     >/dev/null 2>&1 || { report_fail "TS type navigate setup"; return; }
-  if ! typeout="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" type "#i" "hello world" 2>&1)"; then
+  if ! typeout="$(env "${ts_env[@]}" timeout 30 "$BIN" type "#i" "hello world" 2>&1)"; then
     report_fail "TS type via spike daemon" "$typeout"; return
   fi
-  if ! evalout="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" eval "document.querySelector('#i').value" 2>&1)"; then
+  if ! evalout="$(env "${ts_env[@]}" timeout 30 "$BIN" eval "document.querySelector('#i').value" 2>&1)"; then
     report_fail "TS type verify (read value back)" "$evalout"; return
   fi
   local first; first="$(printf '%s' "$evalout" | head -1)"
@@ -264,10 +259,10 @@ case_type() {
 case_wait_selector() {
   # Navigate to a page that injects an element after 300ms. wait-selector
   # should succeed within default timeout.
-  env "${ts_env[@]}" timeout 30 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 30 "$BIN" navigate \
     "data:text/html,<script>setTimeout(()=>{document.body.innerHTML+='<div id=late>here</div>'},300)</script>" \
     >/dev/null 2>&1 || { report_fail "TS wait-selector navigate setup"; return; }
-  if env "${ts_env[@]}" timeout 30 "$AI_BROWSER" wait-selector "#late" >/dev/null 2>&1; then
+  if env "${ts_env[@]}" timeout 30 "$BIN" wait-selector "#late" >/dev/null 2>&1; then
     report_pass "TS wait-selector found delayed #late"
   else
     report_fail "TS wait-selector timed out or failed"
@@ -277,11 +272,11 @@ case_wait_selector() {
 case_wait_url() {
   # Navigate to a data: URL, then wait-url with a glob that matches it.
   # Tests both the glob compilation and the polling/match path.
-  env "${ts_env[@]}" timeout 30 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 30 "$BIN" navigate \
     "data:text/html,<h1>here</h1>" \
     >/dev/null 2>&1 || { report_fail "TS wait-url navigate setup"; return; }
   # Glob "data:*" should match any data: URL — immediate match on poll.
-  if env "${ts_env[@]}" timeout 30 "$AI_BROWSER" wait-url "data:*" --pattern-type glob >/dev/null 2>&1; then
+  if env "${ts_env[@]}" timeout 30 "$BIN" wait-url "data:*" --pattern-type glob >/dev/null 2>&1; then
     report_pass "TS wait-url glob 'data:*' matched current URL"
   else
     report_fail "TS wait-url did not match current data: URL"
@@ -295,12 +290,12 @@ case_wait_url
 
 # Phase 2d-1: dom.getHtml
 case_get_html() {
-  env "${ts_env[@]}" timeout 30 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 30 "$BIN" navigate \
     "data:text/html,<body><h1 id=t>hi</h1><script>var x=1</script></body>" \
     >/dev/null 2>&1 || { report_fail "TS get-html navigate setup"; return; }
   # 1) outerHTML of h1 should be exactly <h1 id="t">hi</h1>
   local html
-  if ! html="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" get-html --selector "h1" 2>&1)"; then
+  if ! html="$(env "${ts_env[@]}" timeout 30 "$BIN" get-html --selector "h1" 2>&1)"; then
     report_fail "TS get-html (outer) via spike daemon" "$html"; return
   fi
   local first; first="$(printf '%s' "$html" | head -1 | tr -d '\r')"
@@ -310,7 +305,7 @@ case_get_html() {
     report_fail "TS get-html outerHTML mismatch" "$first" '<h1 id="t">hi</h1>'
   fi
   # 2) clean=true (default) removes <script> when scoping to body
-  if ! html="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" get-html --selector "body" 2>&1)"; then
+  if ! html="$(env "${ts_env[@]}" timeout 30 "$BIN" get-html --selector "body" 2>&1)"; then
     report_fail "TS get-html body via spike daemon" "$html"; return
   fi
   if ! printf '%s' "$html" | grep -q "<script"; then
@@ -324,11 +319,11 @@ case_get_html
 
 # Phase 2d-2: dom.querySelector
 case_query() {
-  env "${ts_env[@]}" timeout 30 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 30 "$BIN" navigate \
     "data:text/html,<ul><li class='a'>one</li><li class='b'>two</li></ul>" \
     >/dev/null 2>&1 || { report_fail "TS query navigate setup"; return; }
   local out
-  if ! out="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" query "li" 2>&1)"; then
+  if ! out="$(env "${ts_env[@]}" timeout 30 "$BIN" query "li" 2>&1)"; then
     report_fail "TS query via spike daemon" "$out"; return
   fi
   local check
@@ -358,17 +353,17 @@ case_query
 
 # Phase 2d-3: cookies.set / cookies.get / cookies.delete round-trip.
 case_cookies() {
-  env "${ts_env[@]}" timeout 30 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 30 "$BIN" navigate \
     "data:text/html,<h1>ck</h1>" \
     >/dev/null 2>&1 || { report_fail "TS cookies navigate setup"; return; }
   # Set cookie at example.com (CDP does not require the page to be on that origin)
-  if ! env "${ts_env[@]}" timeout 30 "$AI_BROWSER" cookies-set \
+  if ! env "${ts_env[@]}" timeout 30 "$BIN" cookies-set \
         --url "https://example.com/" --name "ck" --value "vv" >/dev/null 2>&1; then
     report_fail "TS cookies-set rejected"; return
   fi
   # Get cookies for the same URL
   local out
-  if ! out="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" cookies-get "https://example.com/" 2>&1)"; then
+  if ! out="$(env "${ts_env[@]}" timeout 30 "$BIN" cookies-get "https://example.com/" 2>&1)"; then
     report_fail "TS cookies-get failed" "$out"; return
   fi
   local check
@@ -391,11 +386,11 @@ case_cookies() {
     return
   fi
   # Delete it, then verify it's gone
-  if ! env "${ts_env[@]}" timeout 30 "$AI_BROWSER" cookies-delete "ck" \
+  if ! env "${ts_env[@]}" timeout 30 "$BIN" cookies-delete "ck" \
         --url "https://example.com/" >/dev/null 2>&1; then
     report_fail "TS cookies-delete failed"; return
   fi
-  out="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" cookies-get "https://example.com/" 2>&1)"
+  out="$(env "${ts_env[@]}" timeout 30 "$BIN" cookies-get "https://example.com/" 2>&1)"
   check="$(printf '%s' "$out" | node -e '
     try {
       const s = require("fs").readFileSync(0, "utf8");
@@ -432,13 +427,13 @@ case_storage() {
   local html="$TMP/store.html"
   printf '%s\n' '<!doctype html><html><body><h1>store</h1></body></html>' > "$html"
   local file_url="file://$html"
-  env "${ts_env[@]}" timeout 30 "$AI_BROWSER" navigate "$file_url" \
+  env "${ts_env[@]}" timeout 30 "$BIN" navigate "$file_url" \
     >/dev/null 2>&1 || { report_fail "TS storage navigate setup"; return; }
-  if ! env "${ts_env[@]}" timeout 30 "$AI_BROWSER" storage-set --key "k" --value "v" >/dev/null 2>&1; then
+  if ! env "${ts_env[@]}" timeout 30 "$BIN" storage-set --key "k" --value "v" >/dev/null 2>&1; then
     report_fail "TS storage-set"; return
   fi
   local out
-  if ! out="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" storage-get --key "k" 2>&1)"; then
+  if ! out="$(env "${ts_env[@]}" timeout 30 "$BIN" storage-get --key "k" 2>&1)"; then
     report_fail "TS storage-get" "$out"; return
   fi
   local first; first="$(printf '%s' "$out" | head -1 | tr -d '"')"
@@ -448,10 +443,10 @@ case_storage() {
     report_fail "TS storage-get mismatch" "$first" '"v"'
     return
   fi
-  if ! env "${ts_env[@]}" timeout 30 "$AI_BROWSER" storage-clear >/dev/null 2>&1; then
+  if ! env "${ts_env[@]}" timeout 30 "$BIN" storage-clear >/dev/null 2>&1; then
     report_fail "TS storage-clear"; return
   fi
-  out="$(env "${ts_env[@]}" timeout 30 "$AI_BROWSER" storage-get --key "k" 2>&1)"
+  out="$(env "${ts_env[@]}" timeout 30 "$BIN" storage-get --key "k" 2>&1)"
   first="$(printf '%s' "$out" | head -1)"
   # TS CLI renders null data as "ok" (renderResult in src/cli/index.ts).
   if [[ "$first" == "ok" ]]; then
@@ -465,11 +460,11 @@ case_storage
 
 # Phase 2d-5: capture.screenshot — save PNG via --out, verify file is a valid PNG.
 case_screenshot() {
-  env "${ts_env[@]}" timeout 30 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 30 "$BIN" navigate \
     "data:text/html,<h1 style='color:red;font-size:50px'>SNAP</h1>" \
     >/dev/null 2>&1 || { report_fail "TS screenshot navigate setup"; return; }
   local out="$TMP/shot.png"
-  if ! env "${ts_env[@]}" timeout 30 "$AI_BROWSER" screenshot --out "$out" >/dev/null 2>&1; then
+  if ! env "${ts_env[@]}" timeout 30 "$BIN" screenshot --out "$out" >/dev/null 2>&1; then
     report_fail "TS screenshot via spike daemon"
     return
   fi
@@ -502,7 +497,7 @@ OPEN_TARGET_ID=""
 
 case_tabs_baseline() {
   local raw
-  if ! raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" list-tabs --json 2>&1)"; then
+  if ! raw="$(env "${ts_env[@]}" timeout 10 "$BIN" list-tabs --json 2>&1)"; then
     report_fail "TS list-tabs baseline" "$raw"
     return
   fi
@@ -518,7 +513,7 @@ case_tabs_baseline() {
 
 case_tabs_open() {
   local raw
-  if ! raw="$(env "${ts_env[@]}" timeout 15 "$AI_BROWSER" open-tab "data:text/html,<title>Second</title>" --json 2>&1)"; then
+  if ! raw="$(env "${ts_env[@]}" timeout 15 "$BIN" open-tab "data:text/html,<title>Second</title>" --json 2>&1)"; then
     report_fail "TS open-tab" "$raw"
     return
   fi
@@ -550,7 +545,7 @@ case_tabs_list_grew() {
     return
   fi
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" list-tabs --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" list-tabs --json 2>&1)" || true
   local result
   result="$(printf '%s' "$raw" | node -e '
     let out;
@@ -580,12 +575,12 @@ case_tabs_list_grew() {
 
 case_tabs_activate() {
   # Flip active to baseline tab #1 — must exist by construction.
-  if ! env "${ts_env[@]}" timeout 10 "$AI_BROWSER" activate-tab --tab 1 >/dev/null 2>&1; then
+  if ! env "${ts_env[@]}" timeout 10 "$BIN" activate-tab --tab 1 >/dev/null 2>&1; then
     report_fail "TS activate-tab --tab 1" "exit nonzero"
     return
   fi
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" list-tabs --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" list-tabs --json 2>&1)" || true
   local active1
   active1="$(printf '%s' "$raw" | node -e 'try{const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String((a.find(t=>t.tabId===1)||{}).active))}catch(e){process.stdout.write("ERR")}')"
   if [[ "$active1" == "true" ]]; then
@@ -596,7 +591,7 @@ case_tabs_activate() {
 }
 
 case_tabs_reload() {
-  if env "${ts_env[@]}" timeout 15 "$AI_BROWSER" reload >/dev/null 2>&1; then
+  if env "${ts_env[@]}" timeout 15 "$BIN" reload >/dev/null 2>&1; then
     report_pass "TS reload (active tab succeeded)"
   else
     report_fail "TS reload" "exit nonzero"
@@ -608,12 +603,12 @@ case_tabs_close() {
     report_fail "TS close-tab (no captured tabId)" "OPEN_TAB_ID empty"
     return
   fi
-  if ! env "${ts_env[@]}" timeout 10 "$AI_BROWSER" close-tab --tab "$OPEN_TAB_ID" >/dev/null 2>&1; then
+  if ! env "${ts_env[@]}" timeout 10 "$BIN" close-tab --tab "$OPEN_TAB_ID" >/dev/null 2>&1; then
     report_fail "TS close-tab --tab $OPEN_TAB_ID" "exit nonzero"
     return
   fi
   local raw count
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" list-tabs --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" list-tabs --json 2>&1)" || true
   count="$(printf '%s' "$raw" | node -e 'try{const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String(Array.isArray(a)?a.length:"ERR"))}catch(e){process.stdout.write("ERR")}')"
   if [[ "$count" == "$TABS_BASELINE" ]]; then
     report_pass "TS close-tab restored baseline (count=$count)"
@@ -635,13 +630,13 @@ case_tabs_close
 
 case_hover() {
   local url="data:text/html,<button id=b style='position:absolute;left:50px;top:80px;width:60px;height:30px' onmouseover='window.hovered=1'>X</button>"
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
-  if ! env "${ts_env[@]}" timeout 10 "$AI_BROWSER" hover '#b' >/dev/null 2>&1; then
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 "$BIN" hover '#b' >/dev/null 2>&1; then
     report_fail "TS hover #b" "exit nonzero"
     return
   fi
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" eval "window.hovered === 1" --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" eval "window.hovered === 1" --json 2>&1)" || true
   if [[ "$raw" == "true" ]]; then
     report_pass "TS hover triggered onmouseover (window.hovered=1)"
   else
@@ -653,13 +648,13 @@ case_scroll() {
   # Tall page with marker far below; scroll into view, then check marker is
   # near top of viewport (top < 300 means it's been brought up).
   local url="data:text/html,<div style='height:3000px'></div><div id=m style='height:50px'>M</div>"
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
-  if ! env "${ts_env[@]}" timeout 10 "$AI_BROWSER" scroll --selector '#m' >/dev/null 2>&1; then
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 "$BIN" scroll --selector '#m' >/dev/null 2>&1; then
     report_fail "TS scroll --selector #m" "exit nonzero"
     return
   fi
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" eval "Math.abs(document.getElementById('m').getBoundingClientRect().top) < 400" --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" eval "Math.abs(document.getElementById('m').getBoundingClientRect().top) < 400" --json 2>&1)" || true
   if [[ "$raw" == "true" ]]; then
     report_pass "TS scroll brought #m into view"
   else
@@ -669,13 +664,13 @@ case_scroll() {
 
 case_press_key() {
   local url="data:text/html,<input id=t><script>document.getElementById('t').focus()</script>"
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
-  if ! env "${ts_env[@]}" timeout 10 "$AI_BROWSER" press-key 'a' --selector '#t' >/dev/null 2>&1; then
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 "$BIN" press-key 'a' --selector '#t' >/dev/null 2>&1; then
     report_fail "TS press-key 'a'" "exit nonzero"
     return
   fi
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" eval "document.getElementById('t').value" --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" eval "document.getElementById('t').value" --json 2>&1)" || true
   if [[ "$raw" == '"a"' ]]; then
     report_pass "TS press-key typed 'a' into input"
   else
@@ -685,13 +680,13 @@ case_press_key() {
 
 case_select_option() {
   local url="data:text/html,<select id=s><option value=red>R</option><option value=blue>B</option><option value=green>G</option></select>"
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
-  if ! env "${ts_env[@]}" timeout 10 "$AI_BROWSER" select-option '#s' --value blue >/dev/null 2>&1; then
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 "$BIN" select-option '#s' --value blue >/dev/null 2>&1; then
     report_fail "TS select-option --value blue" "exit nonzero"
     return
   fi
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" eval "document.getElementById('s').value" --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" eval "document.getElementById('s').value" --json 2>&1)" || true
   if [[ "$raw" == '"blue"' ]]; then
     report_pass "TS select-option picked 'blue'"
   else
@@ -701,20 +696,20 @@ case_select_option() {
 
 case_check() {
   local url="data:text/html,<input id=c type=checkbox>"
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
-  if ! env "${ts_env[@]}" timeout 10 "$AI_BROWSER" check '#c' >/dev/null 2>&1; then
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 "$BIN" check '#c' >/dev/null 2>&1; then
     report_fail "TS check #c" "exit nonzero"
     return
   fi
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" eval "document.getElementById('c').checked" --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" eval "document.getElementById('c').checked" --json 2>&1)" || true
   if [[ "$raw" != "true" ]]; then
     report_fail "TS check default true" "got=$raw"
     return
   fi
   # Now uncheck.
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" check '#c' --checked false >/dev/null 2>&1 || true
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" eval "document.getElementById('c').checked" --json 2>&1)" || true
+  env "${ts_env[@]}" timeout 10 "$BIN" check '#c' --checked false >/dev/null 2>&1 || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" eval "document.getElementById('c').checked" --json 2>&1)" || true
   if [[ "$raw" == "false" ]]; then
     report_pass "TS check #c toggled (true→false)"
   else
@@ -733,10 +728,10 @@ case_check
 
 case_console_logs() {
   local url="data:text/html,<script>console.log('hi-from-daemon-compat')</script>"
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate "$url" >/dev/null 2>&1 || true
   sleep 0.5
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" console-logs --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" console-logs --json 2>&1)" || true
   local hit
   hit="$(printf '%s' "$raw" | node -e '
     let out = "MISS";
@@ -759,10 +754,10 @@ case_console_logs() {
 
 case_page_errors() {
   local url="data:text/html,<script>throw new Error('boom-from-daemon-compat')</script>"
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate "$url" >/dev/null 2>&1 || true
   sleep 0.5
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" page-errors --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" page-errors --json 2>&1)" || true
   local hit
   hit="$(printf '%s' "$raw" | node -e '
     let out = "MISS";
@@ -784,9 +779,9 @@ case_page_errors() {
 }
 
 case_metrics() {
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate "data:text/html,<title>MetricsT</title><body>Hi</body>" >/dev/null 2>&1 || true
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate "data:text/html,<title>MetricsT</title><body>Hi</body>" >/dev/null 2>&1 || true
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" metrics --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" metrics --json 2>&1)" || true
   local shape
   shape="$(printf '%s' "$raw" | node -e '
     let out = "BAD";
@@ -811,9 +806,9 @@ case_metrics() {
 
 case_content_summary() {
   local url="data:text/html,<h1>HeadOne</h1><a href=\"/x\">LinkOne</a><form><input name=q></form>"
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate "$url" >/dev/null 2>&1 || true
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" summary --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" summary --json 2>&1)" || true
   local check
   check="$(printf '%s' "$raw" | node -e '
     let out = "BAD";
@@ -844,12 +839,12 @@ case_content_summary
 case_network_logs() {
   # Inline data: URL fetch triggers requestWillBeSent/responseReceived/
   # loadingFinished on the page session.
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate \
     "data:text/html,<script>fetch('data:application/json,{\"x\":1}').catch(()=>{})</script>" \
     >/dev/null 2>&1 || true
   sleep 1
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" network-logs --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" network-logs --json 2>&1)" || true
   local check
   check="$(printf '%s' "$raw" | node -e '
     let out = "BAD";
@@ -883,9 +878,9 @@ case_network_logs
 case_wait_network_idle() {
   # Navigate with no further network activity, then wait. Should resolve
   # in roughly the idle window (~500 ms default).
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate \
     "data:text/html,<title>Idle</title>" >/dev/null 2>&1 || true
-  if env "${ts_env[@]}" timeout 15 "$AI_BROWSER" wait-network-idle --idle-time 300 --timeout 5000 >/dev/null 2>&1; then
+  if env "${ts_env[@]}" timeout 15 "$BIN" wait-network-idle --idle-time 300 --timeout 5000 >/dev/null 2>&1; then
     report_pass "TS wait-network-idle resolved"
   else
     report_fail "TS wait-network-idle" "exit nonzero"
@@ -895,7 +890,7 @@ case_wait_network_idle() {
 SECRET_ID=""
 case_secret_put() {
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" secret-put --label demo --from-env SECRET_TEST_VALUE --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" secret-put --label demo --from-env SECRET_TEST_VALUE --json 2>&1)" || true
   SECRET_ID="$(printf '%s' "$raw" | node -e '
     let out = "";
     try {
@@ -917,7 +912,7 @@ case_secret_put() {
 
 case_secret_list_contains() {
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" secret-list --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" secret-list --json 2>&1)" || true
   local check
   check="$(printf '%s' "$raw" | node -e '
     let out = "BAD";
@@ -940,14 +935,14 @@ case_secret_list_contains() {
 }
 
 case_type_secret_into_input() {
-  env "${ts_env[@]}" timeout 10 "$AI_BROWSER" navigate \
+  env "${ts_env[@]}" timeout 10 "$BIN" navigate \
     "data:text/html,<input id=p type=password>" >/dev/null 2>&1 || true
-  if ! env "${ts_env[@]}" timeout 10 "$AI_BROWSER" type-secret '#p' --secret-id "$SECRET_ID" >/dev/null 2>&1; then
+  if ! env "${ts_env[@]}" timeout 10 "$BIN" type-secret '#p' --secret-id "$SECRET_ID" >/dev/null 2>&1; then
     report_fail "TS type-secret" "exit nonzero"
     return
   fi
   local raw
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" eval "document.getElementById('p').value" --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" eval "document.getElementById('p').value" --json 2>&1)" || true
   # The decrypted value should match $SECRET_TEST_VALUE — compare raw JSON-
   # encoded string.
   local expected
@@ -960,12 +955,12 @@ case_type_secret_into_input() {
 }
 
 case_secret_delete() {
-  if ! env "${ts_env[@]}" timeout 10 "$AI_BROWSER" secret-delete "$SECRET_ID" >/dev/null 2>&1; then
+  if ! env "${ts_env[@]}" timeout 10 "$BIN" secret-delete "$SECRET_ID" >/dev/null 2>&1; then
     report_fail "TS secret-delete" "exit nonzero"
     return
   fi
   local raw count
-  raw="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" secret-list --json 2>&1)" || true
+  raw="$(env "${ts_env[@]}" timeout 10 "$BIN" secret-list --json 2>&1)" || true
   count="$(printf '%s' "$raw" | node -e 'try{const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String(Array.isArray(a)?a.length:"ERR"))}catch(e){process.stdout.write("ERR")}')"
   if [[ "$count" == "0" ]]; then
     report_pass "TS secret-delete removed entry (list empty)"
@@ -984,7 +979,7 @@ case_secret_delete
 case_supervisor_restart() {
   # Capture current chromium pid via health.
   local h1 pid_before attempts_before
-  h1="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" daemon health 2>&1)" || true
+  h1="$(env "${ts_env[@]}" timeout 10 "$BIN" daemon health 2>&1)" || true
   pid_before="$(printf '%s' "$h1" | node -e '
     let out = "";
     try {
@@ -1017,7 +1012,7 @@ case_supervisor_restart() {
 
   # New health should show different pid + incremented restartAttempts.
   local h2 pid_after attempts_after
-  h2="$(env "${ts_env[@]}" timeout 10 "$AI_BROWSER" daemon health 2>&1)" || true
+  h2="$(env "${ts_env[@]}" timeout 10 "$BIN" daemon health 2>&1)" || true
   pid_after="$(printf '%s' "$h2" | node -e '
     let out = "";
     try {
@@ -1041,7 +1036,7 @@ case_supervisor_restart() {
 
   if [[ -n "$pid_after" ]] && [[ "$pid_after" != "$pid_before" ]] && (( attempts_after > attempts_before )); then
     # Bonus: a navigate should still succeed end-to-end on the new chromium.
-    if env "${ts_env[@]}" timeout 15 "$AI_BROWSER" navigate "data:text/html,<title>R</title>" >/dev/null 2>&1; then
+    if env "${ts_env[@]}" timeout 15 "$BIN" navigate "data:text/html,<title>R</title>" >/dev/null 2>&1; then
       report_pass "TS supervisor restarted chromium ($pid_before→$pid_after, attempts $attempts_before→$attempts_after)"
     else
       report_fail "TS supervisor navigate after restart" "exit nonzero"
@@ -1054,7 +1049,7 @@ case_supervisor_restart
 
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
-env "${ts_env[@]}" "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true
+env "${ts_env[@]}" "$BIN" daemon stop >/dev/null 2>&1 || true
 
 # Wait for socket + pid file removal (up to 5s).
 for _ in 1 2 3 4 5 6 7 8 9 10; do

@@ -1,7 +1,7 @@
 //! Encrypted credential vault for `secrets.*` daemon actions and the CLI
 //! `secret-put` / `secret-list` / `secret-delete` / `type-secret` surface.
 //!
-//! Format: AES-256-GCM with a key derived from `$AI_BROWSER_VAULT_KEY` via
+//! Format: AES-256-GCM with a key derived from `$TABD_VAULT_KEY` via
 //! PBKDF2-SHA256 (200,000 iters, 16-byte random salt). Each record has its
 //! own 12-byte IV and 16-byte auth tag. File is JSON, mode `0o600`. List
 //! never decrypts — preview is a fixed `****` mask so callers can enumerate
@@ -85,7 +85,7 @@ impl VaultStore {
 
     /// Same as `open_or_create` but at an explicit path — bypasses env var
     /// lookup. Mostly for tests; production goes through `vault_path()` to
-    /// honor AI_BROWSER_VAULT_PATH / XDG_CONFIG_HOME.
+    /// honor TABD_VAULT_PATH / XDG_CONFIG_HOME.
     pub fn open_or_create_at(path: PathBuf, passphrase: &str) -> Result<Self> {
         std::fs::create_dir_all(
             path.parent()
@@ -214,7 +214,7 @@ impl VaultStore {
 }
 
 fn vault_path() -> Result<PathBuf> {
-    if let Ok(explicit) = std::env::var("AI_BROWSER_VAULT_PATH") {
+    if let Ok(explicit) = std::env::var("TABD_VAULT_PATH") {
         return Ok(PathBuf::from(explicit));
     }
     let base = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
@@ -223,7 +223,7 @@ fn vault_path() -> Result<PathBuf> {
         let home = std::env::var("HOME").context("HOME not set")?;
         PathBuf::from(home).join(".config")
     };
-    Ok(base.join("ai-browser").join("secrets.enc"))
+    Ok(base.join("tabd").join("secrets.enc"))
 }
 
 fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; KEY_BYTES] {

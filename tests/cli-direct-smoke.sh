@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# cli-direct-smoke.sh — verify the Rust `ai-browser` binary's CLI dispatcher
+# cli-direct-smoke.sh — verify the Rust `tabd` binary's CLI dispatcher
 # end-to-end: argv parsing, daemon auto-spawn, --json/--out rendering. Calls
 # the binary directly (no TS bridge), matching how a graduated phase-B install
 # would be used.
 #
 # Pre-reqs:
-#   - cargo build --release --manifest-path crates/ai-browser/Cargo.toml
+#   - cargo build --release --manifest-path crates/tabd/Cargo.toml
 #   - $BROWSER_EXECUTABLE resolvable (system chromium or Playwright cache)
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${ROOT_DIR}/crates/ai-browser/target/release/ai-browser"
+BIN="${ROOT_DIR}/crates/tabd/target/release/tabd"
 
 if [[ ! -x "$BIN" ]]; then
-  echo "Missing ai-browser binary. Run: cargo build --release --manifest-path crates/ai-browser/Cargo.toml" >&2
+  echo "Missing tabd binary. Run: cargo build --release --manifest-path crates/tabd/Cargo.toml" >&2
   exit 2
 fi
 
@@ -41,8 +41,8 @@ CHROMIUM_BIN="$(resolve_chromium || true)"
 [[ -n "$CHROMIUM_BIN" ]] || { echo "no chromium found"; exit 2; }
 export BROWSER_EXECUTABLE="$CHROMIUM_BIN"
 
-TMP="$(mktemp -d -t ai-browser-cli-direct.XXXX)"
-export AI_BROWSER_BASE_DIR="$TMP"
+TMP="$(mktemp -d -t tabd-cli-direct.XXXX)"
+export TABD_BASE_DIR="$TMP"
 
 cleanup() {
   # Best-effort daemon stop — auto-spawned daemons need an explicit shutdown.

@@ -14,7 +14,7 @@ use std::process::ExitCode;
 enum DaemonCmd {
     /// Run the daemon in the foreground (blocks until SIGTERM or daemon.shutdown).
     Start {
-        /// Override base directory. Defaults to $AI_BROWSER_BASE_DIR or $XDG_RUNTIME_DIR/ai-browser-rs.
+        /// Override base directory. Defaults to $TABD_BASE_DIR or $XDG_RUNTIME_DIR/tabd.
         #[arg(long)]
         base_dir: Option<String>,
     },
@@ -36,7 +36,7 @@ enum DaemonCmd {
 }
 
 #[derive(Parser)]
-#[command(name = "ai-browser", about = "Rust + Chromium CDP browser controller")]
+#[command(name = "tabd", about = "Rust + Chromium CDP browser controller")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
