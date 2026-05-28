@@ -48,6 +48,14 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
     m.insert("storage-get", Spec { action: "storage.get", positional: &[] });
     m.insert("storage-set", Spec { action: "storage.set", positional: &[] });
     m.insert("storage-clear", Spec { action: "storage.clear", positional: &[] });
+    // Phase 3c — Tier 3 multi-tab actions.
+    m.insert("open-tab", Spec { action: "tabs.open", positional: &["url"] });
+    m.insert("close-tab", Spec { action: "tabs.close", positional: &[] });
+    m.insert("list-tabs", Spec { action: "tabs.list", positional: &[] });
+    m.insert("activate-tab", Spec { action: "tabs.activate", positional: &[] });
+    m.insert("back", Spec { action: "tabs.goBack", positional: &[] });
+    m.insert("forward", Spec { action: "tabs.goForward", positional: &[] });
+    m.insert("reload", Spec { action: "tabs.reload", positional: &[] });
     m
 });
 
@@ -314,6 +322,12 @@ pub async fn run(args: Vec<OsString>) -> Result<i32> {
         }
     }
 
+    // TS parity: `--tab N` is a CLI shorthand for `--tabId N` (TS's
+    // `applyTab` helper in src/cli/index.ts). Rewrite before sending.
+    if let Some(tab) = parsed.options.remove("tab") {
+        parsed.options.entry("tabId".to_string()).or_insert(tab);
+    }
+
     // `--base-dir` is consumed by ensure_daemon, not forwarded as a param.
     let base_dir = parsed
         .options
@@ -469,17 +483,33 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_table_has_tier_1_16() {
-        // Sanity check that all 16 Tier 1 subcommands are registered.
-        let expected = [
+    fn dispatch_table_has_tier_1_and_3() {
+        // Tier 1 (16 actions from phase 3a) + Tier 3 (7 multi-tab actions
+        // from phase 3c). Tier 4/5/2 land in later phases.
+        let tier_1 = [
             "navigate", "eval", "get-text", "get-html", "query", "screenshot",
             "click", "type", "wait-selector", "wait-url",
             "cookies-get", "cookies-set", "cookies-delete",
             "storage-get", "storage-set", "storage-clear",
         ];
-        assert_eq!(DISPATCH.len(), 16);
-        for name in expected {
+        let tier_3 = [
+            "open-tab", "close-tab", "list-tabs", "activate-tab",
+            "back", "forward", "reload",
+        ];
+        for name in tier_1.iter().chain(tier_3.iter()) {
             assert!(DISPATCH.contains_key(name), "missing: {name}");
         }
+        assert_eq!(DISPATCH.len(), tier_1.len() + tier_3.len());
+    }
+
+    #[test]
+    fn apply_tab_rewrites_tab_to_tab_id() {
+        // Mirrors TS `applyTab` in src/cli/index.ts.
+        let mut p = parse_args(&args(&["--tab", "2"]));
+        if let Some(tab) = p.options.remove("tab") {
+            p.options.entry("tabId".to_string()).or_insert(tab);
+        }
+        assert!(p.options.get("tab").is_none());
+        assert_eq!(p.options.get("tabId"), Some(&json!(2.0)));
     }
 }

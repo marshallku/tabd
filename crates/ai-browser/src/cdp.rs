@@ -408,6 +408,20 @@ impl CdpClient {
             .collect())
     }
 
+    /// Registry-only active flip. Does NOT call CDP `Target.activateTarget`,
+    /// so it's safe to use for internal bookkeeping (e.g. `tabs.open` setting
+    /// the new tab as active without an OS-focus RPC that can no-op or fail
+    /// on headless chromium). For user-driven `tabs.activate`, use
+    /// `activate_tab` instead.
+    pub async fn set_active(&self, target_id: &str) -> Result<()> {
+        let mut reg = self.registry.lock().await;
+        if !reg.tabs.contains_key(target_id) {
+            return Err(anyhow!("no session for targetId {target_id:?}"));
+        }
+        reg.active = Some(target_id.to_owned());
+        Ok(())
+    }
+
     /// Switch the active tab. Refreshes once via `list_tabs()` if the targetId
     /// isn't in the registry (covers the case where chromium created the
     /// target but we haven't observed it yet). Internal active updates

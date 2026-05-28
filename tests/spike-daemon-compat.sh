@@ -485,6 +485,144 @@ case_screenshot() {
 
 case_screenshot
 
+# Tier 3 (phase 3c) — multi-tab actions via TS CLI → Rust daemon.
+# Earlier cases left the active tab on a data: URL and chromium's launch arg
+# adds an initial about:blank target, so we don't assume a 1-tab baseline.
+# Instead, snapshot the count up-front and verify delta semantics.
+
+TABS_BASELINE=""
+OPEN_TAB_ID=""
+OPEN_TARGET_ID=""
+
+case_tabs_baseline() {
+  local raw
+  if ! raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" list-tabs --json 2>&1)"; then
+    report_fail "TS list-tabs baseline" "$raw"
+    return
+  fi
+  local count
+  count="$(printf '%s' "$raw" | node -e 'try{const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String(Array.isArray(a)?a.length:"ERR"))}catch(e){process.stdout.write("ERR")}')"
+  if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -ge 1 ]]; then
+    TABS_BASELINE="$count"
+    report_pass "TS list-tabs baseline (count=$count)"
+  else
+    report_fail "TS list-tabs baseline" "count=$count out=$raw"
+  fi
+}
+
+case_tabs_open() {
+  local raw
+  if ! raw="$(env "${ts_env[@]}" timeout 15 node "$AI_BROWSER" open-tab "data:text/html,<title>Second</title>" --json 2>&1)"; then
+    report_fail "TS open-tab" "$raw"
+    return
+  fi
+  local check
+  check="$(printf '%s' "$raw" | node -e '
+    let out;
+    try {
+      const o = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      if (typeof o.tabId !== "number" || typeof o.targetId !== "string" || typeof o.url !== "string") {
+        out = "MISSING_FIELD";
+      } else {
+        out = o.tabId + "|" + o.targetId;
+      }
+    } catch (e) { out = "ERR"; }
+    process.stdout.write(out);
+  ')"
+  if [[ "$check" == "MISSING_FIELD" ]] || [[ "$check" == "ERR" ]]; then
+    report_fail "TS open-tab response shape" "$check" "$raw"
+    return
+  fi
+  OPEN_TAB_ID="${check%%|*}"
+  OPEN_TARGET_ID="${check##*|}"
+  report_pass "TS open-tab returned tabId=$OPEN_TAB_ID with targetId+url"
+}
+
+case_tabs_list_grew() {
+  if [[ -z "$TABS_BASELINE" ]] || [[ -z "$OPEN_TARGET_ID" ]]; then
+    report_fail "TS list-tabs grew (prereqs missing)" "baseline=$TABS_BASELINE tid=$OPEN_TARGET_ID"
+    return
+  fi
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" list-tabs --json 2>&1)" || true
+  local result
+  result="$(printf '%s' "$raw" | node -e '
+    let out;
+    try {
+      const a = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      const expected = parseInt(process.argv[1], 10) + 1;
+      const tid = process.argv[2];
+      const newTab = a.find(t => t.targetId === tid);
+      if (a.length !== expected) {
+        out = "WRONG_LEN:" + a.length;
+      } else if (!newTab) {
+        out = "NO_NEW_TAB";
+      } else if (!newTab.active) {
+        out = "NOT_ACTIVE";
+      } else {
+        out = "OK";
+      }
+    } catch (e) { out = "ERR:" + e.message; }
+    process.stdout.write(out);
+  ' "$TABS_BASELINE" "$OPEN_TARGET_ID")"
+  if [[ "$result" == "OK" ]]; then
+    report_pass "TS list-tabs grew to $((TABS_BASELINE+1)) (new tab active)"
+  else
+    report_fail "TS list-tabs after open" "$result" "$raw"
+  fi
+}
+
+case_tabs_activate() {
+  # Flip active to baseline tab #1 — must exist by construction.
+  if ! env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" activate-tab --tab 1 >/dev/null 2>&1; then
+    report_fail "TS activate-tab --tab 1" "exit nonzero"
+    return
+  fi
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" list-tabs --json 2>&1)" || true
+  local active1
+  active1="$(printf '%s' "$raw" | node -e 'try{const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String((a.find(t=>t.tabId===1)||{}).active))}catch(e){process.stdout.write("ERR")}')"
+  if [[ "$active1" == "true" ]]; then
+    report_pass "TS activate-tab 1 (active flipped)"
+  else
+    report_fail "TS activate-tab 1" "active=$active1" "$raw"
+  fi
+}
+
+case_tabs_reload() {
+  if env "${ts_env[@]}" timeout 15 node "$AI_BROWSER" reload >/dev/null 2>&1; then
+    report_pass "TS reload (active tab succeeded)"
+  else
+    report_fail "TS reload" "exit nonzero"
+  fi
+}
+
+case_tabs_close() {
+  if [[ -z "$OPEN_TAB_ID" ]]; then
+    report_fail "TS close-tab (no captured tabId)" "OPEN_TAB_ID empty"
+    return
+  fi
+  if ! env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" close-tab --tab "$OPEN_TAB_ID" >/dev/null 2>&1; then
+    report_fail "TS close-tab --tab $OPEN_TAB_ID" "exit nonzero"
+    return
+  fi
+  local raw count
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" list-tabs --json 2>&1)" || true
+  count="$(printf '%s' "$raw" | node -e 'try{const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String(Array.isArray(a)?a.length:"ERR"))}catch(e){process.stdout.write("ERR")}')"
+  if [[ "$count" == "$TABS_BASELINE" ]]; then
+    report_pass "TS close-tab restored baseline (count=$count)"
+  else
+    report_fail "TS close-tab" "count=$count expected=$TABS_BASELINE raw=$raw"
+  fi
+}
+
+case_tabs_baseline
+case_tabs_open
+case_tabs_list_grew
+case_tabs_activate
+case_tabs_reload
+case_tabs_close
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true

@@ -825,6 +825,144 @@ async fn handle_wait_url(state: &DaemonState, params: &Value) -> Result<Option<V
     }
 }
 
+// -- Phase 3c: multi-tab actions --------------------------------------------
+
+/// Resolve a 1-based tabId to a chromium targetId. Mirrors TS
+/// `resolveTargetId` in `src/server/runtimes/cdp.ts:1948` — when no tabId is
+/// passed, prefer the active tab; otherwise fall back to the first listed.
+/// Error strings are byte-exact with TS so `spike-daemon-compat` checks pass.
+async fn resolve_target_id(
+    client: &Arc<CdpClient>,
+    tab_id: Option<u32>,
+) -> Result<String, String> {
+    let tabs = client.list_tabs().await.map_err(|e| e.to_string())?;
+    match tab_id {
+        Some(n) => {
+            let idx = (n as usize)
+                .checked_sub(1)
+                .ok_or_else(|| format!("Tab not found: {n}"))?;
+            tabs.get(idx)
+                .map(|t| t.target_id.clone())
+                .ok_or_else(|| format!("Tab not found: {n}"))
+        }
+        None => {
+            if tabs.is_empty() {
+                return Err("No browser tabs are open".to_string());
+            }
+            Ok(tabs
+                .iter()
+                .find(|t| t.active)
+                .map(|t| t.target_id.clone())
+                .unwrap_or_else(|| tabs[0].target_id.clone()))
+        }
+    }
+}
+
+fn require_tab_id(params: &Value) -> Result<u32, String> {
+    params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "tabId is required".to_string())
+        .map(|n| n as u32)
+}
+
+async fn handle_tabs_list(state: &DaemonState, _params: &Value) -> Result<Option<Value>, String> {
+    let client = client_or_err(state).await?;
+    let tabs = client.list_tabs().await.map_err(|e| e.to_string())?;
+    let arr: Vec<Value> = tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            json!({
+                "tabId": i + 1,
+                "targetId": t.target_id,
+                "title": t.title,
+                "url": t.url,
+                "active": t.active,
+            })
+        })
+        .collect();
+    Ok(Some(Value::Array(arr)))
+}
+
+async fn handle_tabs_open(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let url = require_string(params, "url")?;
+    let client = client_or_err(state).await?;
+    let new_tid = client.create_tab(&url).await.map_err(|e| e.to_string())?;
+    // Registry-only flip — no Target.activateTarget RPC (TS parity).
+    client
+        .set_active(&new_tid)
+        .await
+        .map_err(|e| e.to_string())?;
+    let tabs = client.list_tabs().await.map_err(|e| e.to_string())?;
+    let tab_id = tabs
+        .iter()
+        .enumerate()
+        .find(|(_, t)| t.target_id == new_tid)
+        .map(|(i, _)| i + 1)
+        .unwrap_or(1); // dead path — TS does the same `?? 1`.
+    Ok(Some(json!({
+        "tabId": tab_id,
+        "targetId": new_tid,
+        "url": url,
+    })))
+}
+
+async fn handle_tabs_close(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let tab_id = require_tab_id(params)?;
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, Some(tab_id)).await?;
+    client.close_tab(&tid).await.map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
+async fn handle_tabs_activate(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let tab_id = require_tab_id(params)?;
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, Some(tab_id)).await?;
+    client.activate_tab(&tid).await.map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
+async fn handle_tabs_history(
+    state: &DaemonState,
+    params: &Value,
+    expr: &str,
+) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+    client
+        .send_to(
+            &tid,
+            "Runtime.evaluate",
+            json!({
+                "expression": expr,
+                "returnByValue": true,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
+async fn handle_tabs_reload(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+    client
+        .send_to(&tid, "Page.reload", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
 // -- Connection / request loop ----------------------------------------------
 
 async fn process_request(state: &DaemonState, line: &str) -> String {
@@ -868,6 +1006,13 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "interaction.type" => handle_type(state, &req.params).await,
         "wait.selector" => handle_wait_selector(state, &req.params).await,
         "wait.url" => handle_wait_url(state, &req.params).await,
+        "tabs.list" => handle_tabs_list(state, &req.params).await,
+        "tabs.open" => handle_tabs_open(state, &req.params).await,
+        "tabs.close" => handle_tabs_close(state, &req.params).await,
+        "tabs.activate" => handle_tabs_activate(state, &req.params).await,
+        "tabs.goBack" => handle_tabs_history(state, &req.params, "history.back(); null;").await,
+        "tabs.goForward" => handle_tabs_history(state, &req.params, "history.forward(); null;").await,
+        "tabs.reload" => handle_tabs_reload(state, &req.params).await,
         other => Err(format!("unsupported action: {other}")),
     };
 
