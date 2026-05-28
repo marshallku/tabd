@@ -60,9 +60,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Phase 3f: secrets vault config. Daemon inherits these on spawn; vault file
+# is per-temp-dir so this test never touches a real ~/.config vault.
+VAULT_KEY="daemon-compat-${RANDOM}"
+VAULT_PATH="$TMP/vault.enc"
+SECRET_TEST_VALUE="login-token-from-compat-${RANDOM}"
+
 # Boot the ai-browser daemon. Use the same BROWSER_EXECUTABLE for chromium
 # pinning so Browser::launch resolves to the test binary on both sides.
 BROWSER_EXECUTABLE="$CHROMIUM_BIN" \
+  AI_BROWSER_VAULT_KEY="$VAULT_KEY" \
+  AI_BROWSER_VAULT_PATH="$VAULT_PATH" \
   "$SPIKE" daemon start --base-dir "$TMP" \
   >"$TMP/daemon.log" 2>&1 &
 DAEMON_PID=$!
@@ -98,11 +106,13 @@ report_fail() {
   FAIL_COUNT=$((FAIL_COUNT+1))
 }
 
-# Common env for every TS CLI call.
+# Common env for every TS CLI call. SECRET_TEST_VALUE is read by the secret-
+# put case via --from-env (never on argv).
 ts_env=(
   "BROWSER_RUNTIME=chromium-cdp"
   "BROWSER_EXECUTABLE=$CHROMIUM_BIN"
   "AI_BROWSER_BASE_DIR=$TMP"
+  "SECRET_TEST_VALUE=$SECRET_TEST_VALUE"
 )
 
 # 1. TS CLI daemon health → JSON, verify pid matches spike daemon + driver shape.
@@ -869,6 +879,110 @@ case_network_logs() {
   fi
 }
 case_network_logs
+
+# Tier 2 (phase 3f) — login automation: wait-network-idle + secrets vault
+# + type-secret. Vault is keyed by $VAULT_KEY (random per run) at $VAULT_PATH
+# in $TMP, so this test never touches the user's real vault.
+
+case_wait_network_idle() {
+  # Navigate with no further network activity, then wait. Should resolve
+  # in roughly the idle window (~500 ms default).
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate \
+    "data:text/html,<title>Idle</title>" >/dev/null 2>&1 || true
+  if env "${ts_env[@]}" timeout 15 node "$AI_BROWSER" wait-network-idle --idle-time 300 --timeout 5000 >/dev/null 2>&1; then
+    report_pass "TS wait-network-idle resolved"
+  else
+    report_fail "TS wait-network-idle" "exit nonzero"
+  fi
+}
+
+SECRET_ID=""
+case_secret_put() {
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" secret-put --label demo --from-env SECRET_TEST_VALUE --json 2>&1)" || true
+  SECRET_ID="$(printf '%s' "$raw" | node -e '
+    let out = "";
+    try {
+      const o = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      if (typeof o.secretId === "string" && o.preview === "****" && o.label === "demo") {
+        out = o.secretId;
+      } else {
+        out = "BAD_SHAPE:" + JSON.stringify(o);
+      }
+    } catch (e) { out = "ERR:" + e.message; }
+    process.stdout.write(out);
+  ')"
+  if [[ -n "$SECRET_ID" ]] && [[ "$SECRET_ID" != BAD* ]] && [[ "$SECRET_ID" != ERR* ]]; then
+    report_pass "TS secret-put stored value (id=$SECRET_ID)"
+  else
+    report_fail "TS secret-put" "$SECRET_ID" "$raw"
+  fi
+}
+
+case_secret_list_contains() {
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" secret-list --json 2>&1)" || true
+  local check
+  check="$(printf '%s' "$raw" | node -e '
+    let out = "BAD";
+    try {
+      const a = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      const id = process.argv[1];
+      const m = a.find(e => e.secretId === id);
+      if (!m) out = "NOT_FOUND";
+      else if (m.preview !== "****") out = "BAD_PREVIEW:" + m.preview;
+      else if (m.label !== "demo") out = "BAD_LABEL:" + m.label;
+      else out = "OK";
+    } catch (e) { out = "ERR:" + e.message; }
+    process.stdout.write(out);
+  ' "$SECRET_ID")"
+  if [[ "$check" == "OK" ]]; then
+    report_pass "TS secret-list contains demo entry with masked preview"
+  else
+    report_fail "TS secret-list" "$check" "$raw"
+  fi
+}
+
+case_type_secret_into_input() {
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate \
+    "data:text/html,<input id=p type=password>" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" type-secret '#p' --secret-id "$SECRET_ID" >/dev/null 2>&1; then
+    report_fail "TS type-secret" "exit nonzero"
+    return
+  fi
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" eval "document.getElementById('p').value" --json 2>&1)" || true
+  # The decrypted value should match $SECRET_TEST_VALUE — compare raw JSON-
+  # encoded string.
+  local expected
+  expected="\"$SECRET_TEST_VALUE\""
+  if [[ "$raw" == "$expected" ]]; then
+    report_pass "TS type-secret wrote decrypted value into input"
+  else
+    report_fail "TS type-secret" "got=$raw expected=$expected"
+  fi
+}
+
+case_secret_delete() {
+  if ! env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" secret-delete "$SECRET_ID" >/dev/null 2>&1; then
+    report_fail "TS secret-delete" "exit nonzero"
+    return
+  fi
+  local raw count
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" secret-list --json 2>&1)" || true
+  count="$(printf '%s' "$raw" | node -e 'try{const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String(Array.isArray(a)?a.length:"ERR"))}catch(e){process.stdout.write("ERR")}')"
+  if [[ "$count" == "0" ]]; then
+    report_pass "TS secret-delete removed entry (list empty)"
+  else
+    report_fail "TS secret-delete" "count=$count raw=$raw"
+  fi
+}
+
+case_wait_network_idle
+case_secret_put
+case_secret_list_contains
+case_type_secret_into_input
+case_secret_delete
 
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."

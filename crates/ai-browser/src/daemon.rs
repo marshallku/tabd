@@ -127,6 +127,9 @@ struct DaemonState {
     client: Arc<Mutex<Option<Arc<CdpClient>>>>,
     browser: Arc<Mutex<Option<Browser>>>,
     action_mutex: Arc<Mutex<()>>,
+    /// Lazy-init secrets vault. None until the first secrets.* call.
+    /// Phase 3f: passphrase mode only ($AI_BROWSER_VAULT_KEY required).
+    vault: Arc<Mutex<Option<crate::secrets::VaultStore>>>,
     started_at: Instant,
     pid: u32,
 }
@@ -158,6 +161,7 @@ impl DaemonState {
             client: Arc::new(Mutex::new(None)),
             browser: Arc::new(Mutex::new(None)),
             action_mutex: Arc::new(Mutex::new(())),
+            vault: Arc::new(Mutex::new(None)),
             started_at: Instant::now(),
             pid: std::process::id(),
         }
@@ -1479,6 +1483,169 @@ async fn handle_content_summary(
     Ok(Some(value))
 }
 
+// -- Phase 3f: Tier 2 (wait-network-idle + secrets + type-secret)
+
+async fn handle_wait_network_idle(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let timeout_ms = params
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .unwrap_or(10_000);
+    let idle_ms = params
+        .get("idleTime")
+        .and_then(Value::as_u64)
+        .unwrap_or(500);
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut idle_since: Option<Instant> = None;
+    loop {
+        let pending = client
+            .read_tab_state(&tid, |state| state.network_pending)
+            .await?;
+        if pending == 0 {
+            let mark = idle_since.get_or_insert_with(Instant::now);
+            if mark.elapsed() >= Duration::from_millis(idle_ms) {
+                return Ok(Some(Value::Null));
+            }
+        } else {
+            idle_since = None;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Timed out waiting for network idle ({pending} pending requests)"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Resolve the vault, opening it lazily on first use. Errors with a clear
+/// message if AI_BROWSER_VAULT_KEY env isn't set.
+async fn vault_or_err(
+    state: &DaemonState,
+) -> Result<tokio::sync::MutexGuard<'_, Option<crate::secrets::VaultStore>>, String> {
+    let mut guard = state.vault.lock().await;
+    if guard.is_none() {
+        let passphrase = std::env::var("AI_BROWSER_VAULT_KEY")
+            .map_err(|_| "AI_BROWSER_VAULT_KEY env not set; secrets unavailable".to_string())?;
+        let store = crate::secrets::VaultStore::open_or_create(&passphrase)
+            .map_err(|e| format!("vault open failed: {e}"))?;
+        *guard = Some(store);
+    }
+    Ok(guard)
+}
+
+async fn handle_secrets_put(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let value = require_string(params, "value")?;
+    let label = params
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut guard = vault_or_err(state).await?;
+    let store = guard.as_mut().ok_or_else(|| "vault not initialized".to_string())?;
+    let resp = store
+        .put(&value, label.as_deref())
+        .map_err(|e| e.to_string())?;
+    let json = serde_json::to_value(resp).map_err(|e| e.to_string())?;
+    Ok(Some(json))
+}
+
+async fn handle_secrets_list(state: &DaemonState, _params: &Value) -> Result<Option<Value>, String> {
+    let guard = vault_or_err(state).await?;
+    let store = guard.as_ref().ok_or_else(|| "vault not initialized".to_string())?;
+    let list = store.list();
+    let json = serde_json::to_value(list).map_err(|e| e.to_string())?;
+    Ok(Some(json))
+}
+
+async fn handle_secrets_delete(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let id = params
+        .get("id")
+        .or_else(|| params.get("secretId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "id is required".to_string())?
+        .to_owned();
+    let mut guard = vault_or_err(state).await?;
+    let store = guard.as_mut().ok_or_else(|| "vault not initialized".to_string())?;
+    store.delete(&id).map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
+async fn handle_type_secret(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let selector = require_string(params, "selector")?;
+    let secret_id = params
+        .get("secretId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "secretId is required".to_string())?
+        .to_owned();
+    let clear = params
+        .get("clear")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let plaintext = {
+        let guard = vault_or_err(state).await?;
+        let store = guard.as_ref().ok_or_else(|| "vault not initialized".to_string())?;
+        store.get(&secret_id).map_err(|e| e.to_string())?
+    };
+
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+    wait_for_selector_visible(&client, &selector, 30_000).await?;
+
+    let sel_lit = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
+    let value_lit = serde_json::to_string(&plaintext).map_err(|e| e.to_string())?;
+    let clear_lit = if clear { "true" } else { "false" };
+    let expr = format!(
+        r#"
+        (() => {{
+            const el = document.querySelector({sel_lit});
+            if (!el) throw new Error("type-secret: selector miss");
+            const editable = (el instanceof HTMLInputElement)
+                || (el instanceof HTMLTextAreaElement)
+                || (el instanceof HTMLElement && el.isContentEditable);
+            if (!editable) throw new Error("type-secret: element is not editable");
+            el.scrollIntoView({{ block: "center", inline: "center" }});
+            el.focus();
+            const value = {value_lit};
+            if ({clear_lit}) {{
+                if ("value" in el) el.value = "";
+                else el.textContent = "";
+            }}
+            if ("value" in el) el.value = value;
+            else document.execCommand("insertText", false, value);
+            el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+            el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+            return null;
+        }})()
+        "#
+    );
+    client
+        .send_to(
+            &tid,
+            "Runtime.evaluate",
+            json!({"expression": expr, "returnByValue": true}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
 // -- Phase 3e2: monitor.networkLogs (Network.* event stitching)
 
 async fn handle_network_logs(
@@ -1623,6 +1790,11 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "capture.metrics" => handle_metrics(state, &req.params).await,
         "dom.contentSummary" => handle_content_summary(state, &req.params).await,
         "monitor.networkLogs" => handle_network_logs(state, &req.params).await,
+        "wait.networkIdle" => handle_wait_network_idle(state, &req.params).await,
+        "secrets.put" => handle_secrets_put(state, &req.params).await,
+        "secrets.list" => handle_secrets_list(state, &req.params).await,
+        "secrets.delete" => handle_secrets_delete(state, &req.params).await,
+        "interaction.typeSecret" => handle_type_secret(state, &req.params).await,
         other => Err(format!("unsupported action: {other}")),
     };
 

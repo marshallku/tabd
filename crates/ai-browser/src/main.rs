@@ -3,6 +3,7 @@ mod cdp;
 mod cli;
 mod cmd;
 mod daemon;
+mod secrets;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

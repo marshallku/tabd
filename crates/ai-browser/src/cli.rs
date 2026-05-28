@@ -70,6 +70,13 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
     m.insert("summary", Spec { action: "dom.contentSummary", positional: &[] });
     // Phase 3e2 — network-logs (event-stitching, body fetch deferred).
     m.insert("network-logs", Spec { action: "monitor.networkLogs", positional: &[] });
+    // Phase 3f — Tier 2 (login automation). `secret-put` is handled outside
+    // this table (custom branch in run()) because it must keep plaintext
+    // off argv via --from-env/--from-file/--stdin.
+    m.insert("wait-network-idle", Spec { action: "wait.networkIdle", positional: &[] });
+    m.insert("secret-list", Spec { action: "secrets.list", positional: &[] });
+    m.insert("secret-delete", Spec { action: "secrets.delete", positional: &["id"] });
+    m.insert("type-secret", Spec { action: "interaction.typeSecret", positional: &["selector"] });
     m
 });
 
@@ -102,14 +109,21 @@ fn camel(kebab: &str) -> String {
     out
 }
 
-/// TS coerce: true/false/null/number/string. Numbers are emitted as f64 so the
-/// wire shape matches TS Number (no i64/f64 split).
+/// TS coerce: true/false/null/number/string. Integers stay i64 so daemon
+/// handlers using `.as_u64()` / `.as_i64()` see numbers correctly; floats
+/// (with a `.`) fall through to f64 (matches TS Number wire shape, since
+/// integer JSON tokens have no decimal point either).
 fn coerce(value: &str) -> Value {
     if value == "true" { return Value::Bool(true); }
     if value == "false" { return Value::Bool(false); }
     if value == "null" { return Value::Null; }
     static NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^-?\d+(\.\d+)?$").unwrap());
     if NUM_RE.is_match(value) {
+        if !value.contains('.') {
+            if let Ok(n) = value.parse::<i64>() {
+                return Value::Number(serde_json::Number::from(n));
+            }
+        }
         if let Ok(n) = value.parse::<f64>() {
             if let Some(num) = serde_json::Number::from_f64(n) {
                 return Value::Number(num);
@@ -322,6 +336,15 @@ pub async fn run(args: Vec<OsString>) -> Result<i32> {
     let Some(name) = argv.first() else {
         bail!("missing subcommand");
     };
+
+    // Phase 3f: `secret-put` keeps plaintext off argv via --from-env /
+    // --from-file / --stdin. Routed through a custom branch instead of the
+    // generic DISPATCH so the source is read locally before forwarding the
+    // value via the daemon's secrets.put action.
+    if name == "secret-put" {
+        return run_secret_put(&argv[1..]).await;
+    }
+
     let Some(spec) = DISPATCH.get(name.as_str()) else {
         bail!("unknown subcommand: {name}");
     };
@@ -355,6 +378,72 @@ pub async fn run(args: Vec<OsString>) -> Result<i32> {
     render_result(&resp, &parsed).await
 }
 
+/// Custom handler for `secret-put`. Refuses plaintext via argv; pulls the
+/// value from one of `--from-env VAR`, `--from-file PATH`, or `--stdin`.
+async fn run_secret_put(args: &[String]) -> Result<i32> {
+    // Treat bare `--stdin` like `--stdin=true` so parse_args doesn't swallow
+    // the next flag as its value. Mirrors the TS `secret-put` CLI handler.
+    let normalized: Vec<String> = args
+        .iter()
+        .map(|a| if a == "--stdin" { "--stdin=true".to_string() } else { a.clone() })
+        .collect();
+    let parsed = parse_args(&normalized);
+    let label = parsed.options.get("label").and_then(Value::as_str).map(str::to_owned);
+    let from_env = parsed.options.get("fromEnv").and_then(Value::as_str).map(str::to_owned);
+    let from_file = parsed.options.get("fromFile").and_then(Value::as_str).map(str::to_owned);
+    let from_stdin = parsed.options.get("stdin").and_then(Value::as_bool).unwrap_or(false);
+
+    let mut picked = 0;
+    if from_env.is_some() { picked += 1; }
+    if from_file.is_some() { picked += 1; }
+    if from_stdin { picked += 1; }
+    if picked == 0 {
+        eprintln!("secret-put: provide --from-env VAR, --from-file PATH, or --stdin");
+        return Ok(2);
+    }
+    if picked > 1 {
+        eprintln!("secret-put: choose exactly one of --from-env, --from-file, --stdin");
+        return Ok(2);
+    }
+
+    let value: String = if let Some(var) = from_env {
+        match std::env::var(&var) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("secret-put: env var {var} is not set");
+                return Ok(2);
+            }
+        }
+    } else if let Some(path) = from_file {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("read {path}"))?;
+        raw.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        let mut buf = String::new();
+        use std::io::Read;
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf.trim_end_matches(['\r', '\n']).to_string()
+    };
+
+    if value.is_empty() {
+        eprintln!("secret-put: value is empty");
+        return Ok(2);
+    }
+
+    let base_dir = parsed
+        .options
+        .get("baseDir")
+        .and_then(|v| v.as_str().map(str::to_string));
+    let paths = ensure_daemon(base_dir.as_deref()).await?;
+    let mut params = serde_json::Map::new();
+    params.insert("value".to_string(), Value::String(value));
+    if let Some(lbl) = label {
+        params.insert("label".to_string(), Value::String(lbl));
+    }
+    let resp = send_action(&paths.socket_path, "secrets.put", Value::Object(params)).await?;
+    render_result(&resp, &parsed).await
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -383,11 +472,14 @@ mod tests {
     }
 
     #[test]
-    fn coerce_numbers_are_f64() {
-        // Matches TS Number — integer is still f64 on the wire.
-        assert_eq!(coerce("42"), json!(42.0));
-        assert_eq!(coerce("-7"), json!(-7.0));
+    fn coerce_numbers_are_integer_or_float() {
+        // Integers stay i64 so daemon `.as_u64()` works on filter/timeout
+        // params. Floats keep their decimal precision via f64.
+        assert_eq!(coerce("42"), json!(42));
+        assert_eq!(coerce("-7"), json!(-7));
         assert_eq!(coerce("3.14"), json!(3.14));
+        // Sanity: integer token serializes without a decimal point.
+        assert_eq!(serde_json::to_string(&coerce("42")).unwrap(), "42");
     }
 
     #[test]
@@ -420,7 +512,7 @@ mod tests {
     #[test]
     fn parse_equals_form() {
         let p = parse_args(&args(&["--timeout=5000"]));
-        assert_eq!(p.options.get("timeout"), Some(&json!(5000.0)));
+        assert_eq!(p.options.get("timeout"), Some(&json!(5000)));
     }
 
     #[test]
@@ -453,9 +545,9 @@ mod tests {
         ]));
         assert_eq!(p.positional, vec!["https://x"]);
         assert!(p.json);
-        assert_eq!(p.options.get("timeout"), Some(&json!(1000.0)));
+        assert_eq!(p.options.get("timeout"), Some(&json!(1000)));
         assert_eq!(p.options.get("raw"), Some(&Value::Bool(false)));
-        assert_eq!(p.options.get("limit"), Some(&json!(50.0)));
+        assert_eq!(p.options.get("limit"), Some(&json!(50)));
     }
 
     #[tokio::test]
@@ -497,9 +589,11 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_table_has_tier_1_3_4_5() {
-        // Tier 1 (16 from 3a) + Tier 3 (7 from 3c) + Tier 4 (6 from 3d) +
-        // Tier 5 (5 from 3e). Tier 2 (secrets + wait-network-idle) is 3f.
+    fn dispatch_table_has_all_tiers() {
+        // Tier 1 (16) + Tier 3 (7) + Tier 4 (6) + Tier 5 (5) + Tier 2 partial
+        // (4: wait-network-idle, secret-list, secret-delete, type-secret).
+        // `secret-put` is a custom branch outside DISPATCH so the table
+        // length excludes it.
         let tier_1 = [
             "navigate", "eval", "get-text", "get-html", "query", "screenshot",
             "click", "type", "wait-selector", "wait-url",
@@ -514,18 +608,22 @@ mod tests {
             "hover", "mouse-move", "scroll", "press-key", "select-option", "check",
         ];
         let tier_5 = ["console-logs", "page-errors", "metrics", "summary", "network-logs"];
+        let tier_2 = ["wait-network-idle", "secret-list", "secret-delete", "type-secret"];
         for name in tier_1
             .iter()
             .chain(tier_3.iter())
             .chain(tier_4.iter())
             .chain(tier_5.iter())
+            .chain(tier_2.iter())
         {
             assert!(DISPATCH.contains_key(name), "missing: {name}");
         }
         assert_eq!(
             DISPATCH.len(),
-            tier_1.len() + tier_3.len() + tier_4.len() + tier_5.len()
+            tier_1.len() + tier_3.len() + tier_4.len() + tier_5.len() + tier_2.len()
         );
+        // Ensure secret-put is NOT in the table (custom branch only).
+        assert!(!DISPATCH.contains_key("secret-put"));
     }
 
     #[test]
@@ -536,6 +634,6 @@ mod tests {
             p.options.entry("tabId".to_string()).or_insert(tab);
         }
         assert!(p.options.get("tab").is_none());
-        assert_eq!(p.options.get("tabId"), Some(&json!(2.0)));
+        assert_eq!(p.options.get("tabId"), Some(&json!(2)));
     }
 }

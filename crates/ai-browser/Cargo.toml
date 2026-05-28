@@ -21,6 +21,12 @@ tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 regex = "1"
 base64 = "0.22"
+# Phase 3f secrets vault.
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

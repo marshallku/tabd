@@ -101,6 +101,10 @@ pub struct TabState {
     pub console_logs: Vec<ConsoleEntry>,
     pub page_errors: Vec<ErrorEntry>,
     pub network_log: Vec<NetworkEntry>,
+    /// Inflight count for `wait.networkIdle`. requestWillBeSent inc,
+    /// loadingFinished/loadingFailed dec (saturating). Reader task writes,
+    /// handler reads.
+    pub network_pending: u32,
 }
 
 impl TabState {
@@ -110,6 +114,7 @@ impl TabState {
             console_logs: Vec::new(),
             page_errors: Vec::new(),
             network_log: Vec::new(),
+            network_pending: 0,
         }
     }
 }
@@ -426,6 +431,7 @@ impl CdpClient {
                             failure_text: None,
                         });
                         trim_ring(&mut state.network_log, MAX_NETWORK);
+                        state.network_pending = state.network_pending.saturating_add(1);
                     }
                     "Network.responseReceived" => {
                         let request_id =
@@ -476,6 +482,7 @@ impl CdpClient {
                             entry.duration_ms = Some(now.saturating_sub(entry.start_time));
                             entry.response_body_size = encoded_length;
                         }
+                        state.network_pending = state.network_pending.saturating_sub(1);
                     }
                     "Network.loadingFailed" => {
                         let request_id =
@@ -496,6 +503,7 @@ impl CdpClient {
                             entry.end_time = Some(now);
                             entry.duration_ms = Some(now.saturating_sub(entry.start_time));
                         }
+                        state.network_pending = state.network_pending.saturating_sub(1);
                     }
                     _ => {} // other domain events silently dropped
                 }
