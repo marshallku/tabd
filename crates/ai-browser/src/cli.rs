@@ -56,6 +56,13 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
     m.insert("back", Spec { action: "tabs.goBack", positional: &[] });
     m.insert("forward", Spec { action: "tabs.goForward", positional: &[] });
     m.insert("reload", Spec { action: "tabs.reload", positional: &[] });
+    // Phase 3d — Tier 4 interaction extras.
+    m.insert("hover", Spec { action: "interaction.hover", positional: &["selector"] });
+    m.insert("mouse-move", Spec { action: "interaction.mouseMove", positional: &[] });
+    m.insert("scroll", Spec { action: "interaction.scroll", positional: &[] });
+    m.insert("press-key", Spec { action: "interaction.pressKey", positional: &["key"] });
+    m.insert("select-option", Spec { action: "interaction.selectOption", positional: &["selector"] });
+    m.insert("check", Spec { action: "interaction.check", positional: &["selector"] });
     m
 });
 
@@ -483,9 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_table_has_tier_1_and_3() {
-        // Tier 1 (16 actions from phase 3a) + Tier 3 (7 multi-tab actions
-        // from phase 3c). Tier 4/5/2 land in later phases.
+    fn dispatch_table_has_tier_1_3_4() {
+        // Tier 1 (16 actions from phase 3a) + Tier 3 (7 multi-tab from 3c) +
+        // Tier 4 (6 interaction extras from 3d). Tier 5/2 land in later phases.
         let tier_1 = [
             "navigate", "eval", "get-text", "get-html", "query", "screenshot",
             "click", "type", "wait-selector", "wait-url",
@@ -496,10 +503,16 @@ mod tests {
             "open-tab", "close-tab", "list-tabs", "activate-tab",
             "back", "forward", "reload",
         ];
-        for name in tier_1.iter().chain(tier_3.iter()) {
+        let tier_4 = [
+            "hover", "mouse-move", "scroll", "press-key", "select-option", "check",
+        ];
+        for name in tier_1.iter().chain(tier_3.iter()).chain(tier_4.iter()) {
             assert!(DISPATCH.contains_key(name), "missing: {name}");
         }
-        assert_eq!(DISPATCH.len(), tier_1.len() + tier_3.len());
+        assert_eq!(
+            DISPATCH.len(),
+            tier_1.len() + tier_3.len() + tier_4.len()
+        );
     }
 
     #[test]

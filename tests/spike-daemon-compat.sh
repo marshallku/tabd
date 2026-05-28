@@ -623,6 +623,105 @@ case_tabs_activate
 case_tabs_reload
 case_tabs_close
 
+# Tier 4 (phase 3d) — interaction extras (hover/scroll/press-key/select-option/check).
+# Each navigates to a small data: URL on the active tab first, then runs the
+# action, then verifies side effects via eval. Single tab; no cross-tab state.
+
+case_hover() {
+  local url="data:text/html,<button id=b style='position:absolute;left:50px;top:80px;width:60px;height:30px' onmouseover='window.hovered=1'>X</button>"
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" hover '#b' >/dev/null 2>&1; then
+    report_fail "TS hover #b" "exit nonzero"
+    return
+  fi
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" eval "window.hovered === 1" --json 2>&1)" || true
+  if [[ "$raw" == "true" ]]; then
+    report_pass "TS hover triggered onmouseover (window.hovered=1)"
+  else
+    report_fail "TS hover" "eval=$raw"
+  fi
+}
+
+case_scroll() {
+  # Tall page with marker far below; scroll into view, then check marker is
+  # near top of viewport (top < 300 means it's been brought up).
+  local url="data:text/html,<div style='height:3000px'></div><div id=m style='height:50px'>M</div>"
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" scroll --selector '#m' >/dev/null 2>&1; then
+    report_fail "TS scroll --selector #m" "exit nonzero"
+    return
+  fi
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" eval "Math.abs(document.getElementById('m').getBoundingClientRect().top) < 400" --json 2>&1)" || true
+  if [[ "$raw" == "true" ]]; then
+    report_pass "TS scroll brought #m into view"
+  else
+    report_fail "TS scroll" "rect check=$raw"
+  fi
+}
+
+case_press_key() {
+  local url="data:text/html,<input id=t><script>document.getElementById('t').focus()</script>"
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" press-key 'a' --selector '#t' >/dev/null 2>&1; then
+    report_fail "TS press-key 'a'" "exit nonzero"
+    return
+  fi
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" eval "document.getElementById('t').value" --json 2>&1)" || true
+  if [[ "$raw" == '"a"' ]]; then
+    report_pass "TS press-key typed 'a' into input"
+  else
+    report_fail "TS press-key" "input value=$raw"
+  fi
+}
+
+case_select_option() {
+  local url="data:text/html,<select id=s><option value=red>R</option><option value=blue>B</option><option value=green>G</option></select>"
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" select-option '#s' --value blue >/dev/null 2>&1; then
+    report_fail "TS select-option --value blue" "exit nonzero"
+    return
+  fi
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" eval "document.getElementById('s').value" --json 2>&1)" || true
+  if [[ "$raw" == '"blue"' ]]; then
+    report_pass "TS select-option picked 'blue'"
+  else
+    report_fail "TS select-option" "value=$raw"
+  fi
+}
+
+case_check() {
+  local url="data:text/html,<input id=c type=checkbox>"
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" navigate "$url" >/dev/null 2>&1 || true
+  if ! env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" check '#c' >/dev/null 2>&1; then
+    report_fail "TS check #c" "exit nonzero"
+    return
+  fi
+  local raw
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" eval "document.getElementById('c').checked" --json 2>&1)" || true
+  if [[ "$raw" != "true" ]]; then
+    report_fail "TS check default true" "got=$raw"
+    return
+  fi
+  # Now uncheck.
+  env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" check '#c' --checked false >/dev/null 2>&1 || true
+  raw="$(env "${ts_env[@]}" timeout 10 node "$AI_BROWSER" eval "document.getElementById('c').checked" --json 2>&1)" || true
+  if [[ "$raw" == "false" ]]; then
+    report_pass "TS check #c toggled (true→false)"
+  else
+    report_fail "TS check --checked false" "got=$raw"
+  fi
+}
+
+case_hover
+case_scroll
+case_press_key
+case_select_option
+case_check
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true

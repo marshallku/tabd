@@ -963,6 +963,300 @@ async fn handle_tabs_reload(state: &DaemonState, params: &Value) -> Result<Optio
     Ok(Some(Value::Null))
 }
 
+// -- Phase 3d: interaction extras (hover/mouseMove/scroll/pressKey/selectOption/check)
+
+/// CDP Input.dispatchKeyEvent fields for one logical keypress. Matches the
+/// shape of TS `resolveKey()` output in `src/server/runtimes/cdp.ts:2031`.
+/// `text` is Some for printable characters (drives input/change events),
+/// None for special keys (Arrow, F-keys, Escape, etc.).
+#[derive(Debug, Clone, PartialEq)]
+struct KeyDef {
+    key: String,
+    code: String,
+    text: Option<String>,
+    key_code: u32,
+}
+
+/// Map a CLI key string to a KeyDef. Mirrors TS resolveKey: 20-ish special
+/// keys + single-char fallback. Chord parsing ("Control+A") is intentionally
+/// not implemented — TS doesn't either, and adding it here would diverge.
+fn resolve_key(input: &str) -> KeyDef {
+    let special: &[(&str, &str, &str, u32)] = &[
+        ("Enter", "Enter", "Enter", 13),
+        ("Tab", "Tab", "Tab", 9),
+        ("Escape", "Escape", "Escape", 27),
+        ("Backspace", "Backspace", "Backspace", 8),
+        ("Delete", "Delete", "Delete", 46),
+        ("ArrowLeft", "ArrowLeft", "ArrowLeft", 37),
+        ("ArrowUp", "ArrowUp", "ArrowUp", 38),
+        ("ArrowRight", "ArrowRight", "ArrowRight", 39),
+        ("ArrowDown", "ArrowDown", "ArrowDown", 40),
+        ("Home", "Home", "Home", 36),
+        ("End", "End", "End", 35),
+        ("PageUp", "PageUp", "PageUp", 33),
+        ("PageDown", "PageDown", "PageDown", 34),
+        ("Space", " ", "Space", 32),
+        ("F1", "F1", "F1", 112),
+        ("F2", "F2", "F2", 113),
+        ("F3", "F3", "F3", 114),
+        ("F4", "F4", "F4", 115),
+        ("F5", "F5", "F5", 116),
+        ("F6", "F6", "F6", 117),
+        ("F7", "F7", "F7", 118),
+        ("F8", "F8", "F8", 119),
+        ("F9", "F9", "F9", 120),
+        ("F10", "F10", "F10", 121),
+        ("F11", "F11", "F11", 122),
+        ("F12", "F12", "F12", 123),
+    ];
+    for (name, key, code, kc) in special {
+        if input == *name {
+            // Space's "key" field is " " (single space); no text dispatch
+            // because the platform event already carries it via key.
+            return KeyDef {
+                key: (*key).to_string(),
+                code: (*code).to_string(),
+                text: None,
+                key_code: *kc,
+            };
+        }
+    }
+    // Single-char fallback: emit text so the page sees an `input` event.
+    let lower = input.to_lowercase();
+    let upper = input.to_uppercase();
+    let first_upper_char = upper.chars().next().unwrap_or('\0');
+    KeyDef {
+        key: lower.clone(),
+        code: format!("Key{}", first_upper_char),
+        text: Some(lower.clone()),
+        key_code: first_upper_char as u32,
+    }
+}
+
+async fn handle_hover(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let selector = require_string(params, "selector")?;
+    let offset_x = params.get("x").and_then(Value::as_f64);
+    let offset_y = params.get("y").and_then(Value::as_f64);
+    let client = client_or_err(state).await?;
+    wait_for_selector_visible(&client, &selector, 30_000).await?;
+
+    let sel_lit = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
+    let ox = offset_x
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let oy = offset_y
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let expr = format!(
+        r#"
+        (() => {{
+            const el = document.querySelector({sel_lit});
+            if (!el) throw new Error("hover: selector miss");
+            const r = el.getBoundingClientRect();
+            const ox = {ox};
+            const oy = {oy};
+            return [r.x + (ox !== null ? ox : r.width / 2), r.y + (oy !== null ? oy : r.height / 2)];
+        }})()
+        "#
+    );
+    let rect = crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "hover: rect computation returned undefined".to_string())?;
+    let arr = rect
+        .as_array()
+        .ok_or_else(|| "hover: rect not an array".to_string())?;
+    let x = arr
+        .first()
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "hover: missing x".to_string())?;
+    let y = arr
+        .get(1)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "hover: missing y".to_string())?;
+
+    client
+        .send(
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseMoved", "x": x, "y": y, "button": "none"}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
+async fn handle_mouse_move(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let x = params
+        .get("x")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "x is required".to_string())?;
+    let y = params
+        .get("y")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "y is required".to_string())?;
+    let client = client_or_err(state).await?;
+    client
+        .send(
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseMoved", "x": x, "y": y, "button": "none"}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
+async fn handle_scroll(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let selector = params.get("selector").and_then(Value::as_str);
+    let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+    let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    let client = client_or_err(state).await?;
+    let expr = if let Some(sel) = selector {
+        let sel_lit = serde_json::to_string(sel).map_err(|e| e.to_string())?;
+        format!(
+            r#"
+            (() => {{
+                const el = document.querySelector({sel_lit});
+                if (!el) throw new Error("scroll: selector miss");
+                el.scrollIntoView({{ block: "center", inline: "center" }});
+                return null;
+            }})()
+            "#
+        )
+    } else {
+        format!("window.scrollBy({x}, {y}); null")
+    };
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
+async fn handle_press_key(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let key = require_string(params, "key")?;
+    let selector = params
+        .get("selector")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let client = client_or_err(state).await?;
+    if let Some(sel) = selector {
+        let sel_lit = serde_json::to_string(&sel).map_err(|e| e.to_string())?;
+        let focus_expr = format!(
+            r#"
+            (() => {{
+                const el = document.querySelector({sel_lit});
+                if (el && typeof el.focus === "function") el.focus();
+                return null;
+            }})()
+            "#
+        );
+        crate::cmd::eval::evaluate_value(&client, &focus_expr)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let kd = resolve_key(&key);
+    let mut down = json!({
+        "type": "keyDown",
+        "key": kd.key,
+        "code": kd.code,
+        "windowsVirtualKeyCode": kd.key_code,
+        "nativeVirtualKeyCode": kd.key_code,
+    });
+    if let Some(text) = &kd.text {
+        down["text"] = json!(text);
+    }
+    let up = json!({
+        "type": "keyUp",
+        "key": kd.key,
+        "code": kd.code,
+        "windowsVirtualKeyCode": kd.key_code,
+        "nativeVirtualKeyCode": kd.key_code,
+    });
+    client
+        .send("Input.dispatchKeyEvent", down)
+        .await
+        .map_err(|e| e.to_string())?;
+    client
+        .send("Input.dispatchKeyEvent", up)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
+async fn handle_select_option(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let selector = require_string(params, "selector")?;
+    let client = client_or_err(state).await?;
+    wait_for_selector_visible(&client, &selector, 30_000).await?;
+
+    let value_lit = params
+        .get("value")
+        .and_then(Value::as_str)
+        .map(|s| serde_json::to_string(s).unwrap())
+        .unwrap_or_else(|| "null".to_string());
+    let label_lit = params
+        .get("label")
+        .and_then(Value::as_str)
+        .map(|s| serde_json::to_string(s).unwrap())
+        .unwrap_or_else(|| "null".to_string());
+    let index_lit = params
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let sel_lit = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
+    let expr = format!(
+        r#"
+        (() => {{
+            const sel = document.querySelector({sel_lit});
+            if (!sel || sel.tagName !== "SELECT") throw new Error("selectOption: not a SELECT");
+            const targetValue = {value_lit};
+            const targetLabel = {label_lit};
+            const targetIndex = {index_lit};
+            const opts = Array.from(sel.options);
+            let chosen = null;
+            if (targetValue !== null) chosen = opts.find(o => o.value === targetValue);
+            else if (targetLabel !== null) chosen = opts.find(o => o.label === targetLabel);
+            else if (targetIndex !== null) chosen = opts[targetIndex];
+            if (!chosen) throw new Error("Requested option was not found");
+            sel.value = chosen.value;
+            sel.dispatchEvent(new Event("input", {{ bubbles: true }}));
+            sel.dispatchEvent(new Event("change", {{ bubbles: true }}));
+            return null;
+        }})()
+        "#
+    );
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
+async fn handle_check(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let selector = require_string(params, "selector")?;
+    let checked = params
+        .get("checked")
+        .and_then(Value::as_bool)
+        .unwrap_or(true); // TS: checked !== false
+    let client = client_or_err(state).await?;
+    wait_for_selector_visible(&client, &selector, 30_000).await?;
+    let sel_lit = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
+    let expr = format!(
+        r#"
+        (() => {{
+            const el = document.querySelector({sel_lit});
+            if (!el) throw new Error("check: selector miss");
+            el.checked = {checked};
+            el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+            el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+            return null;
+        }})()
+        "#
+    );
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(Value::Null))
+}
+
 // -- Connection / request loop ----------------------------------------------
 
 async fn process_request(state: &DaemonState, line: &str) -> String {
@@ -1013,6 +1307,12 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "tabs.goBack" => handle_tabs_history(state, &req.params, "history.back(); null;").await,
         "tabs.goForward" => handle_tabs_history(state, &req.params, "history.forward(); null;").await,
         "tabs.reload" => handle_tabs_reload(state, &req.params).await,
+        "interaction.hover" => handle_hover(state, &req.params).await,
+        "interaction.mouseMove" => handle_mouse_move(state, &req.params).await,
+        "interaction.scroll" => handle_scroll(state, &req.params).await,
+        "interaction.pressKey" => handle_press_key(state, &req.params).await,
+        "interaction.selectOption" => handle_select_option(state, &req.params).await,
+        "interaction.check" => handle_check(state, &req.params).await,
         other => Err(format!("unsupported action: {other}")),
     };
 
@@ -1388,5 +1688,52 @@ mod tests {
         // would belong to another user and procfs read fails → 0.
         let rss = read_process_rss_bytes(99_999_999);
         assert_eq!(rss, 0);
+    }
+
+    // -- Phase 3d: resolve_key --
+
+    #[test]
+    fn resolve_key_enter_is_special() {
+        let kd = resolve_key("Enter");
+        assert_eq!(kd.key, "Enter");
+        assert_eq!(kd.code, "Enter");
+        assert_eq!(kd.key_code, 13);
+        assert!(kd.text.is_none(), "Enter is special; no text dispatch");
+    }
+
+    #[test]
+    fn resolve_key_arrow_left() {
+        let kd = resolve_key("ArrowLeft");
+        assert_eq!(kd.key, "ArrowLeft");
+        assert_eq!(kd.code, "ArrowLeft");
+        assert_eq!(kd.key_code, 37);
+        assert!(kd.text.is_none());
+    }
+
+    #[test]
+    fn resolve_key_printable_letter() {
+        let kd = resolve_key("a");
+        assert_eq!(kd.key, "a");
+        assert_eq!(kd.code, "KeyA");
+        assert_eq!(kd.text.as_deref(), Some("a"));
+        assert_eq!(kd.key_code, 'A' as u32);
+    }
+
+    #[test]
+    fn resolve_key_chord_treated_as_literal() {
+        // Mirrors TS behavior — chord support is intentionally NOT implemented.
+        let kd = resolve_key("Control+A");
+        assert_eq!(kd.key, "control+a");
+        assert_eq!(kd.code, "KeyC");
+        assert_eq!(kd.text.as_deref(), Some("control+a"));
+    }
+
+    #[test]
+    fn resolve_key_f5() {
+        let kd = resolve_key("F5");
+        assert_eq!(kd.key, "F5");
+        assert_eq!(kd.code, "F5");
+        assert_eq!(kd.key_code, 116);
+        assert!(kd.text.is_none());
     }
 }
