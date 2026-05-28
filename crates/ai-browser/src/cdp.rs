@@ -1,27 +1,120 @@
+// Multi-tab APIs (TabInfo / ResolvedTarget::Explicit / create_tab / close_tab
+// / list_tabs / activate_tab / send_to / reconcile) are called from phase 3c
+// daemon handlers, which land in the next stage. Silence dead-code warnings
+// at the module level until then so release builds stay quiet.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-/// CDP JSON-RPC client. Attaches to a fresh page target with flatten mode,
-/// auto-routes responses by id, and exposes `send()` for method calls on
-/// the attached session (sessionId is added automatically).
+/// Per-tab state. Starts with just sessionId — phase 3e will add
+/// console_logs / network_logs / dialog_state buckets here.
+#[derive(Debug, Clone)]
+pub struct TabState {
+    pub session_id: String,
+}
+
+/// Multi-tab registry. Single Mutex guards both fields so split-brain races
+/// between `tabs` and `active` are impossible.
+#[derive(Debug, Default)]
+pub struct TabRegistry {
+    pub tabs: HashMap<String, TabState>, // targetId → state
+    pub active: Option<String>,          // currently focused targetId
+}
+
+#[derive(Debug)]
+pub enum ResolveError {
+    NoActiveTab,
+    NoSessionFor(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoActiveTab => write!(f, "no active tab"),
+            Self::NoSessionFor(t) => write!(f, "no session for targetId {t:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+impl TabRegistry {
+    /// Resolve a target descriptor to a sessionId clone (for dispatch).
+    /// Root → None (sessionId omitted from frame). Active/Explicit → Some.
+    pub fn resolve(&self, target: &ResolvedTarget) -> Result<Option<String>, ResolveError> {
+        match target {
+            ResolvedTarget::Root => Ok(None),
+            ResolvedTarget::Active => {
+                let tid = self.active.as_ref().ok_or(ResolveError::NoActiveTab)?;
+                let state = self
+                    .tabs
+                    .get(tid)
+                    .ok_or_else(|| ResolveError::NoSessionFor(tid.clone()))?;
+                Ok(Some(state.session_id.clone()))
+            }
+            ResolvedTarget::Explicit(tid) => {
+                let state = self
+                    .tabs
+                    .get(tid)
+                    .ok_or_else(|| ResolveError::NoSessionFor(tid.clone()))?;
+                Ok(Some(state.session_id.clone()))
+            }
+        }
+    }
+
+    /// Drop tabs not present in the fresh chromium-reported set and clear
+    /// `active` if it's gone. Used by `list_tabs()` to self-heal stale state
+    /// without event subscription.
+    pub fn reconcile(&mut self, fresh_ids: &HashSet<String>) {
+        self.tabs.retain(|tid, _| fresh_ids.contains(tid));
+        if let Some(a) = &self.active {
+            if !fresh_ids.contains(a) {
+                self.active = None;
+            }
+        }
+    }
+}
+
+/// Tab info reported by `list_tabs()`. Every entry is a real chromium page
+/// target at the moment of the call (reconciliation happens inside list_tabs).
+#[derive(Debug, Clone, Serialize)]
+pub struct TabInfo {
+    pub target_id: String,
+    pub url: String,
+    pub title: String,
+    pub active: bool,
+}
+
+/// Routing descriptor for `dispatch()`. Root = bootstrap calls (no sessionId);
+/// Active = use whatever `registry.active` points at; Explicit = caller-named
+/// targetId (must exist in registry).
+#[derive(Debug, Clone)]
+pub enum ResolvedTarget {
+    Root,
+    Active,
+    Explicit(String),
+}
+
+/// CDP JSON-RPC client with a multi-tab registry. `send()` routes to the
+/// active tab; `send_to(target_id, …)` routes to a named tab; `dispatch` is
+/// the unified internal.
 ///
-/// `close(&self)` is idempotent — drops the writer mpsc sender so background
-/// reader/writer tasks exit naturally (sink close → reader EOF). No JoinHandle
-/// tracking; tasks are expected to terminate on process exit if not before.
+/// `close(&self)` is idempotent — it best-effort detaches every attached
+/// session, then drops the writer mpsc so background tasks exit naturally.
 pub struct CdpClient {
     next_id: AtomicU64,
-    // Mutex<Option<Sender>> so close() can take + drop the sender. Subsequent
-    // dispatch attempts see None and return a clear error.
     out_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
-    session_id: String,
+    registry: Mutex<TabRegistry>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -29,16 +122,21 @@ struct InboundFrame {
     id: Option<u64>,
     result: Option<Value>,
     error: Option<Value>,
-    // method/params present on events; not used by spike but kept for forward-compat.
+    // method/params/sessionId present on events; not used yet (phase 3e will
+    // route per-session events to listeners).
     #[allow(dead_code)]
     method: Option<String>,
     #[allow(dead_code)]
     params: Option<Value>,
+    #[allow(dead_code)]
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
 }
 
 impl CdpClient {
-    /// Connect, create a new page target, flatten-attach, and enable Page + Runtime.
-    /// Returns a client ready for method calls scoped to the new session.
+    /// Connect, create the first page target, flatten-attach, enable Page/
+    /// Runtime/Network, and seat the new tab as the active one in the
+    /// registry. The returned client is ready for `send()` calls.
     pub async fn connect(ws_url: &str) -> Result<Self> {
         let (ws, _resp) = connect_async(ws_url)
             .await
@@ -78,7 +176,8 @@ impl CdpClient {
                         let _ = tx.send(value);
                     }
                 }
-                // Events (no `id`) ignored — spike scope does not need event subscription.
+                // Events (no `id`) ignored — phase 3e will dispatch per-
+                // session event handlers for console/network buffering.
             }
             // Stream closed → fail any still-pending requests so callers don't hang.
             let mut map = pending_for_reader.lock().await;
@@ -87,16 +186,20 @@ impl CdpClient {
             }
         });
 
-        let mut client = CdpClient {
+        let client = CdpClient {
             next_id: AtomicU64::new(1),
             out_tx: Mutex::new(Some(out_tx)),
             pending,
-            session_id: String::new(),
+            registry: Mutex::new(TabRegistry::default()),
         };
 
-        // 1. Fresh page target (about:blank — real URL comes via Page.navigate later).
+        // 1. Fresh page target (about:blank — callers navigate later).
         let target = client
-            .call_root("Target.createTarget", json!({ "url": "about:blank" }))
+            .dispatch(
+                "Target.createTarget",
+                json!({ "url": "about:blank" }),
+                ResolvedTarget::Root,
+            )
             .await?;
         let target_id = target
             .get("targetId")
@@ -104,22 +207,29 @@ impl CdpClient {
             .ok_or_else(|| anyhow!("Target.createTarget missing targetId: {target:?}"))?
             .to_owned();
 
-        // 2. Flatten attach (sessionId arrives in the response, not as an event).
+        // 2. Flatten attach (sessionId arrives in the response).
         let attach = client
-            .call_root(
+            .dispatch(
                 "Target.attachToTarget",
                 json!({ "targetId": target_id, "flatten": true }),
+                ResolvedTarget::Root,
             )
             .await?;
-        client.session_id = attach
+        let session_id = attach
             .get("sessionId")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("Target.attachToTarget missing sessionId: {attach:?}"))?
             .to_owned();
 
-        // 3. Enable domains on the session. Network domain is required for
-        // cookies.* actions to receive responses on some chromium builds
-        // (phase 2d found Network.setCookie hanging without it).
+        // 3. Seat the initial tab as active before enabling domains so the
+        // `Active` route resolves correctly for the enable calls below.
+        {
+            let mut reg = client.registry.lock().await;
+            reg.tabs.insert(target_id.clone(), TabState { session_id });
+            reg.active = Some(target_id);
+        }
+
+        // 4. Enable domains on this session.
         client.send("Page.enable", json!({})).await?;
         client.send("Runtime.enable", json!({})).await?;
         client.send("Network.enable", json!({})).await?;
@@ -127,30 +237,32 @@ impl CdpClient {
         Ok(client)
     }
 
-    /// Send a method call against the attached session.
+    /// Send a method call against the currently active tab.
     pub async fn send(&self, method: &str, params: Value) -> Result<Value> {
-        self.dispatch(method, params, Some(&self.session_id)).await
+        self.dispatch(method, params, ResolvedTarget::Active).await
     }
 
-    /// Root-scoped (no sessionId) call. Used for Target.* during bootstrap.
-    async fn call_root(&self, method: &str, params: Value) -> Result<Value> {
-        self.dispatch(method, params, None).await
+    /// Send a method call against an explicitly named tab.
+    pub async fn send_to(&self, target_id: &str, method: &str, params: Value) -> Result<Value> {
+        self.dispatch(method, params, ResolvedTarget::Explicit(target_id.to_owned()))
+            .await
     }
 
-    async fn dispatch(
-        &self,
-        method: &str,
-        params: Value,
-        session_id: Option<&str>,
-    ) -> Result<Value> {
+    async fn dispatch(&self, method: &str, params: Value, target: ResolvedTarget) -> Result<Value> {
+        // Resolve session at dispatch entry (not at response receive). If the
+        // active tab flips mid-call, this request still completes on the
+        // original session — matches TS chromium-cdp semantics.
+        let session_id: Option<String> = {
+            let reg = self.registry.lock().await;
+            reg.resolve(&target).map_err(|e| anyhow!("{e}"))?
+        };
+
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let text = build_frame(id, method, params, session_id)?;
+        let text = build_frame(id, method, params, session_id.as_deref())?;
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
-        // Grab the sender under lock. If close() already took it, fail fast
-        // and reclaim the pending entry.
         let send_result = {
             let guard = self.out_tx.lock().await;
             match guard.as_ref() {
@@ -167,14 +279,191 @@ impl CdpClient {
             return Err(anyhow::Error::new(err).context("cdp writer task closed"));
         }
 
-        rx.await
-            .map_err(|_| anyhow!("cdp pending reply dropped"))?
+        rx.await.map_err(|_| anyhow!("cdp pending reply dropped"))?
     }
 
-    /// Drop the writer mpsc sender. Background tasks (writer/reader) exit
-    /// naturally on sender drop → mpsc closed → sink close → reader EOF.
-    /// Idempotent — calling close twice is safe.
+    /// Create a new page target, attach (flatten), enable domains, register
+    /// the tab. Does NOT switch `active` — caller decides (3c open-tab spec
+    /// sets active=true by default but other callers may differ).
+    pub async fn create_tab(&self, url: &str) -> Result<String> {
+        let target = self
+            .dispatch(
+                "Target.createTarget",
+                json!({ "url": url }),
+                ResolvedTarget::Root,
+            )
+            .await?;
+        let target_id = target
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Target.createTarget missing targetId"))?
+            .to_owned();
+
+        let attach = self
+            .dispatch(
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+                ResolvedTarget::Root,
+            )
+            .await?;
+        let session_id = attach
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Target.attachToTarget missing sessionId"))?
+            .to_owned();
+
+        // Register before enabling domains so send_to() succeeds.
+        {
+            let mut reg = self.registry.lock().await;
+            reg.tabs.insert(target_id.clone(), TabState { session_id });
+        }
+
+        self.send_to(&target_id, "Page.enable", json!({})).await?;
+        self.send_to(&target_id, "Runtime.enable", json!({})).await?;
+        self.send_to(&target_id, "Network.enable", json!({})).await?;
+
+        Ok(target_id)
+    }
+
+    /// Close a tab. Best-effort CDP closeTarget; registry is cleaned up
+    /// regardless of CDP outcome (tab is gone either way from the daemon's
+    /// perspective once we drop it from the registry).
+    #[allow(dead_code)] // called from phase 3c handlers
+    pub async fn close_tab(&self, target_id: &str) -> Result<()> {
+        let _ = self
+            .dispatch(
+                "Target.closeTarget",
+                json!({ "targetId": target_id }),
+                ResolvedTarget::Root,
+            )
+            .await;
+
+        let mut reg = self.registry.lock().await;
+        reg.tabs.remove(target_id);
+        if reg.active.as_deref() == Some(target_id) {
+            reg.active = None;
+        }
+        Ok(())
+    }
+
+    /// Refresh from chromium's `Target.getTargets` and return page targets.
+    /// Self-heals stale state: removes registry entries no longer in chromium,
+    /// clears `active` if it pointed at one of them.
+    pub async fn list_tabs(&self) -> Result<Vec<TabInfo>> {
+        let response = self
+            .dispatch("Target.getTargets", json!({}), ResolvedTarget::Root)
+            .await?;
+        let infos = response
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Target.getTargets missing targetInfos"))?;
+
+        let mut fresh: Vec<(String, String, String)> = Vec::new();
+        let mut fresh_ids: HashSet<String> = HashSet::new();
+        for info in infos {
+            let ty = info.get("type").and_then(Value::as_str).unwrap_or("");
+            if ty != "page" {
+                continue;
+            }
+            let tid = info
+                .get("targetId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if tid.is_empty() {
+                continue;
+            }
+            let url = info
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let title = info
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            fresh_ids.insert(tid.clone());
+            fresh.push((tid, url, title));
+        }
+
+        let active = {
+            let mut reg = self.registry.lock().await;
+            reg.reconcile(&fresh_ids);
+            reg.active.clone()
+        };
+        let active_id = active.as_deref();
+
+        Ok(fresh
+            .into_iter()
+            .map(|(tid, url, title)| {
+                let is_active = active_id == Some(tid.as_str());
+                TabInfo {
+                    target_id: tid,
+                    url,
+                    title,
+                    active: is_active,
+                }
+            })
+            .collect())
+    }
+
+    /// Switch the active tab. Refreshes once via `list_tabs()` if the targetId
+    /// isn't in the registry (covers the case where chromium created the
+    /// target but we haven't observed it yet). Internal active updates
+    /// regardless of CDP `Target.activateTarget` outcome (OS focus is best-
+    /// effort for headless daemons).
+    pub async fn activate_tab(&self, target_id: &str) -> Result<()> {
+        let exists = {
+            let reg = self.registry.lock().await;
+            reg.tabs.contains_key(target_id)
+        };
+        if !exists {
+            self.list_tabs().await?;
+            let still_missing = {
+                let reg = self.registry.lock().await;
+                !reg.tabs.contains_key(target_id)
+            };
+            if still_missing {
+                return Err(anyhow!("no session for targetId {target_id:?}"));
+            }
+        }
+
+        {
+            let mut reg = self.registry.lock().await;
+            reg.active = Some(target_id.to_owned());
+        }
+
+        let _ = self
+            .dispatch(
+                "Target.activateTarget",
+                json!({ "targetId": target_id }),
+                ResolvedTarget::Root,
+            )
+            .await;
+
+        Ok(())
+    }
+
+    /// Idempotent shutdown. Best-effort detach every attached session (5s
+    /// timeout per call to keep teardown bounded if chromium hangs), then
+    /// drop the writer mpsc → background tasks exit naturally.
     pub async fn close(&self) -> Result<()> {
+        let tabs: Vec<String> = {
+            let reg = self.registry.lock().await;
+            reg.tabs.keys().cloned().collect()
+        };
+        for tid in tabs {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.dispatch(
+                    "Target.detachFromTarget",
+                    json!({ "targetId": tid }),
+                    ResolvedTarget::Root,
+                ),
+            )
+            .await;
+        }
         let _ = self.out_tx.lock().await.take();
         Ok(())
     }
@@ -191,10 +480,100 @@ fn build_frame(id: u64, method: &str, params: Value, session_id: Option<&str>) -
     serde_json::to_string(&Value::Object(frame)).context("serialize cdp frame")
 }
 
+// -- Unit tests --------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn registry_with(active: Option<&str>, entries: &[(&str, &str)]) -> TabRegistry {
+        let mut reg = TabRegistry::default();
+        for (tid, sid) in entries {
+            reg.tabs.insert(
+                (*tid).to_owned(),
+                TabState {
+                    session_id: (*sid).to_owned(),
+                },
+            );
+        }
+        reg.active = active.map(str::to_owned);
+        reg
+    }
+
+    #[test]
+    fn registry_resolve_root_returns_none() {
+        let reg = registry_with(None, &[]);
+        assert!(reg.resolve(&ResolvedTarget::Root).unwrap().is_none());
+    }
+
+    #[test]
+    fn registry_resolve_active_returns_session() {
+        let reg = registry_with(Some("t1"), &[("t1", "sess-A"), ("t2", "sess-B")]);
+        let got = reg.resolve(&ResolvedTarget::Active).unwrap();
+        assert_eq!(got.as_deref(), Some("sess-A"));
+    }
+
+    #[test]
+    fn registry_resolve_active_without_active_errors() {
+        let reg = registry_with(None, &[("t1", "sess-A")]);
+        let err = reg.resolve(&ResolvedTarget::Active).err().unwrap();
+        assert!(matches!(err, ResolveError::NoActiveTab));
+    }
+
+    #[test]
+    fn registry_resolve_active_with_stale_pointer_errors() {
+        let reg = registry_with(Some("ghost"), &[("t1", "sess-A")]);
+        let err = reg.resolve(&ResolvedTarget::Active).err().unwrap();
+        assert!(matches!(err, ResolveError::NoSessionFor(ref s) if s == "ghost"));
+    }
+
+    #[test]
+    fn registry_resolve_explicit_hit() {
+        let reg = registry_with(Some("t1"), &[("t1", "sess-A"), ("t2", "sess-B")]);
+        let got = reg
+            .resolve(&ResolvedTarget::Explicit("t2".to_owned()))
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("sess-B"));
+    }
+
+    #[test]
+    fn registry_resolve_explicit_miss_errors() {
+        let reg = registry_with(Some("t1"), &[("t1", "sess-A")]);
+        let err = reg
+            .resolve(&ResolvedTarget::Explicit("nope".to_owned()))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ResolveError::NoSessionFor(ref s) if s == "nope"));
+    }
+
+    #[test]
+    fn registry_reconcile_drops_gone_and_clears_active() {
+        let mut reg = registry_with(Some("t1"), &[("t1", "sess-A"), ("t2", "sess-B")]);
+        let fresh: HashSet<String> = ["t2".to_owned()].into_iter().collect();
+        reg.reconcile(&fresh);
+        assert!(!reg.tabs.contains_key("t1"));
+        assert!(reg.tabs.contains_key("t2"));
+        assert!(reg.active.is_none(), "active was on t1 which is gone");
+    }
+
+    #[test]
+    fn registry_reconcile_keeps_active_when_present() {
+        let mut reg = registry_with(Some("t1"), &[("t1", "sess-A"), ("t2", "sess-B")]);
+        let fresh: HashSet<String> = ["t1".to_owned(), "t2".to_owned()].into_iter().collect();
+        reg.reconcile(&fresh);
+        assert_eq!(reg.active.as_deref(), Some("t1"));
+        assert_eq!(reg.tabs.len(), 2);
+    }
+
+    #[test]
+    fn resolve_error_display() {
+        assert_eq!(format!("{}", ResolveError::NoActiveTab), "no active tab");
+        assert_eq!(
+            format!("{}", ResolveError::NoSessionFor("t9".to_owned())),
+            "no session for targetId \"t9\""
+        );
+    }
 
     #[test]
     fn frame_includes_session_id_when_present() {
@@ -253,18 +632,18 @@ mod tests {
     }
 
     #[test]
-    fn inbound_parses_event_without_id() {
-        let raw = r#"{"method":"Page.loadEventFired","params":{"timestamp":12.3}}"#;
+    fn inbound_parses_event_with_session_id() {
+        let raw = r#"{"method":"Runtime.consoleAPICalled","sessionId":"s1","params":{"type":"log"}}"#;
         let p: InboundFrame = serde_json::from_str(raw).unwrap();
         assert!(p.id.is_none());
-        assert_eq!(p.method.as_deref(), Some("Page.loadEventFired"));
+        assert_eq!(p.method.as_deref(), Some("Runtime.consoleAPICalled"));
+        assert_eq!(p.session_id.as_deref(), Some("s1"));
     }
 
-    // End-to-end smoke: spawn real chromium, connect over CDP, run an evaluate.
-    // Validates Target.createTarget → flatten attach → Page/Runtime.enable wiring.
+    // End-to-end smoke: spawn real chromium, exercise multi-tab paths.
     #[tokio::test]
-    #[ignore = "requires real chromium; covers cdp client attach + Runtime.evaluate"]
-    async fn cdp_evaluate_roundtrip() {
+    #[ignore = "requires real chromium; covers multi-tab create/activate/eval"]
+    async fn cdp_multi_tab_roundtrip() {
         let browser = crate::browser::Browser::launch()
             .await
             .expect("launch chromium");
@@ -272,16 +651,75 @@ mod tests {
             .await
             .expect("cdp connect");
 
-        let result = client
+        // The initial tab (about:blank) is already active. Open a second
+        // with a distinguishable title.
+        let t2 = client
+            .create_tab("data:text/html,<title>Two</title>")
+            .await
+            .expect("create_tab");
+
+        // First call still routes to original active (t1).
+        let r1 = client
             .send(
                 "Runtime.evaluate",
-                json!({ "expression": "1 + 1", "returnByValue": true }),
+                json!({ "expression": "document.title", "returnByValue": true }),
             )
             .await
-            .expect("evaluate");
-        assert_eq!(result["result"]["value"], json!(2), "got: {result:?}");
+            .expect("eval on t1");
+        let title1 = r1["result"]["value"].as_str().unwrap_or("").to_owned();
 
-        client.close().await.expect("cdp close");
-        browser.shutdown().await.expect("browser shutdown");
+        // Flip to t2 and eval again — should yield the new title.
+        client.activate_tab(&t2).await.expect("activate t2");
+        let r2 = client
+            .send(
+                "Runtime.evaluate",
+                json!({ "expression": "document.title", "returnByValue": true }),
+            )
+            .await
+            .expect("eval on t2");
+        let title2 = r2["result"]["value"].as_str().unwrap_or("").to_owned();
+
+        assert_ne!(title1, title2, "expected different titles per tab");
+        assert_eq!(title2, "Two");
+
+        client.close().await.expect("close");
+        browser.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real chromium; covers list_tabs reconciliation"]
+    async fn cdp_list_tabs_reconciles_external_close() {
+        let browser = crate::browser::Browser::launch()
+            .await
+            .expect("launch chromium");
+        let client = CdpClient::connect(browser.ws_endpoint())
+            .await
+            .expect("cdp connect");
+
+        let t2 = client
+            .create_tab("data:text/html,<title>Two</title>")
+            .await
+            .expect("create_tab");
+        let before = client.list_tabs().await.expect("list before");
+        assert!(before.iter().any(|t| t.target_id == t2));
+
+        // Drive Target.closeTarget from Root (no session) — simulates an
+        // external close that bypasses our `close_tab()` registry cleanup.
+        let _ = client
+            .dispatch(
+                "Target.closeTarget",
+                json!({ "targetId": t2 }),
+                ResolvedTarget::Root,
+            )
+            .await;
+
+        let after = client.list_tabs().await.expect("list after");
+        assert!(
+            !after.iter().any(|t| t.target_id == t2),
+            "expected t2 to be reconciled out: {after:?}"
+        );
+
+        client.close().await.expect("close");
+        browser.shutdown().await.expect("shutdown");
     }
 }
