@@ -143,8 +143,16 @@ bash tests/spike-daemon-compat.sh                                       # 39 cas
 
 ## Docs
 
-- [`docs/architecture.md`](docs/architecture.md) — why `tabd` is shaped this
-  way (daemon, multi-tab registry, reader task, supervisor, secrets vault).
+- [`docs/commands.md`](docs/commands.md) — per-action reference: positional
+  args, every `--flag`, return shapes, error strings. The thing you'll
+  actually keep open while writing a script.
+- [`docs/cookbook.md`](docs/cookbook.md) — full scenarios stitched
+  together: 2FA login + data extract, three patterns for capturing API
+  responses, session save/restore, infinite scroll, isolated CI daemon,
+  gotchas.
+- [`docs/architecture.md`](docs/architecture.md) — why `tabd` is shaped
+  this way (daemon, multi-tab registry, reader task, supervisor, secrets
+  vault).
 - [`docs/operations.md`](docs/operations.md) — running `tabd` as a
   long-lived service: systemd user unit, launchd LaunchAgent, shell-rc
   fallback, drain semantics, health watchdog, troubleshooting.
