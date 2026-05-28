@@ -551,6 +551,56 @@ async fn handle_wait_selector(
     Ok(Some(json!({ "found": true })))
 }
 
+/// `dom.getHtml` — TS chromium-cdp parity (src/server/runtimes/cdp.ts:823).
+/// Params: selector (default "body"), outer (default true), clean (default true).
+/// `clean=true` strips script/style/svg, comments, and data-* attrs from a
+/// deep clone before serializing.
+async fn handle_get_html(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let selector = params
+        .get("selector")
+        .and_then(Value::as_str)
+        .unwrap_or("body")
+        .to_owned();
+    let outer = params
+        .get("outer")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let clean = params
+        .get("clean")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let client = client_or_err(state).await?;
+    let sel_lit = serde_json::to_string(&selector).unwrap();
+    let outer_lit = serde_json::to_string(&outer).unwrap();
+    let clean_lit = serde_json::to_string(&clean).unwrap();
+
+    let expr = format!(
+        r#"(() => {{
+    const node = document.querySelector({sel_lit});
+    if (!node) throw new Error('Selector not found: ' + {sel_lit});
+    const clone = node.cloneNode(true);
+    if ({clean_lit}) {{
+        clone.querySelectorAll("script,style,svg").forEach((el) => el.remove());
+        const walker = document.createTreeWalker(clone, NodeFilter.SHOW_COMMENT);
+        const comments = [];
+        while (walker.nextNode()) comments.push(walker.currentNode);
+        comments.forEach((node) => node.remove());
+        clone.querySelectorAll("*").forEach((el) => {{
+            [...el.attributes]
+                .filter((attr) => attr.name.startsWith("data-"))
+                .forEach((attr) => el.removeAttribute(attr.name));
+        }});
+    }}
+    return {outer_lit} ? clone.outerHTML : clone.innerHTML;
+}})()"#
+    );
+
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map(|opt| Some(opt.unwrap_or(Value::String(String::new()))))
+        .map_err(|e| e.to_string())
+}
+
 async fn handle_wait_url(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
     let pattern = require_string(params, "pattern")?;
     let pattern_type = params
@@ -608,6 +658,7 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "tabs.navigate" => handle_navigate(state, &req.params).await,
         "execution.executeJs" => handle_eval(state, &req.params).await,
         "dom.getText" => handle_get_text(state, &req.params).await,
+        "dom.getHtml" => handle_get_html(state, &req.params).await,
         "interaction.click" => handle_click(state, &req.params).await,
         "interaction.type" => handle_type(state, &req.params).await,
         "wait.selector" => handle_wait_selector(state, &req.params).await,

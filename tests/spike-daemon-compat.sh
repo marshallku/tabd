@@ -287,6 +287,35 @@ case_type
 case_wait_selector
 case_wait_url
 
+# Phase 2d-1: dom.getHtml
+case_get_html() {
+  env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" navigate \
+    "data:text/html,<body><h1 id=t>hi</h1><script>var x=1</script></body>" \
+    >/dev/null 2>&1 || { report_fail "TS get-html navigate setup"; return; }
+  # 1) outerHTML of h1 should be exactly <h1 id="t">hi</h1>
+  local html
+  if ! html="$(env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" get-html --selector "h1" 2>&1)"; then
+    report_fail "TS get-html (outer) via spike daemon" "$html"; return
+  fi
+  local first; first="$(printf '%s' "$html" | head -1 | tr -d '\r')"
+  if [[ "$first" == '<h1 id="t">hi</h1>' ]]; then
+    report_pass "TS get-html outerHTML of h1"
+  else
+    report_fail "TS get-html outerHTML mismatch" "$first" '<h1 id="t">hi</h1>'
+  fi
+  # 2) clean=true (default) removes <script> when scoping to body
+  if ! html="$(env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" get-html --selector "body" 2>&1)"; then
+    report_fail "TS get-html body via spike daemon" "$html"; return
+  fi
+  if ! printf '%s' "$html" | grep -q "<script"; then
+    report_pass "TS get-html clean=true strips <script>"
+  else
+    report_fail "TS get-html did not strip <script>" "$html"
+  fi
+}
+
+case_get_html
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true
