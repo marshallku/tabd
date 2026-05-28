@@ -316,6 +316,40 @@ case_get_html() {
 
 case_get_html
 
+# Phase 2d-2: dom.querySelector
+case_query() {
+  env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" navigate \
+    "data:text/html,<ul><li class='a'>one</li><li class='b'>two</li></ul>" \
+    >/dev/null 2>&1 || { report_fail "TS query navigate setup"; return; }
+  local out
+  if ! out="$(env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" query "li" 2>&1)"; then
+    report_fail "TS query via spike daemon" "$out"; return
+  fi
+  local check
+  check="$(printf '%s' "$out" | node -e '
+    try {
+      const s = require("fs").readFileSync(0, "utf8");
+      const start = s.indexOf("[");
+      const end = s.lastIndexOf("]");
+      if (start < 0 || end <= start) throw 0;
+      const arr = JSON.parse(s.slice(start, end + 1));
+      if (!Array.isArray(arr) || arr.length !== 2) throw 1;
+      if (arr[0].tag !== "li" || arr[0].text !== "one") throw 2;
+      if (arr[1].tag !== "li" || arr[1].text !== "two") throw 3;
+      if (!arr[0].classes.includes("a") || !arr[1].classes.includes("b")) throw 4;
+      if (!arr[0].rect || typeof arr[0].rect.width !== "number") throw 5;
+      process.stdout.write("ok");
+    } catch (e) { process.stdout.write("ERR:" + e); }
+  ')"
+  if [[ "$check" == "ok" ]]; then
+    report_pass "TS query returned 2 li with tag/text/classes/rect"
+  else
+    report_fail "TS query result mismatch" "$check / raw=$out"
+  fi
+}
+
+case_query
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true

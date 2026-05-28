@@ -601,6 +601,59 @@ async fn handle_get_html(state: &DaemonState, params: &Value) -> Result<Option<V
         .map_err(|e| e.to_string())
 }
 
+/// `dom.querySelector` — TS chromium-cdp parity (src/server/runtimes/cdp.ts:874).
+/// Params: selector (string, required-ish — "" returns []), limit (default 20),
+/// visibleOnly (default false).
+async fn handle_query_selector(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let selector = params
+        .get("selector")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
+    let visible_only = params
+        .get("visibleOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let client = client_or_err(state).await?;
+    let sel_lit = serde_json::to_string(&selector).unwrap();
+    let visible_lit = serde_json::to_string(&visible_only).unwrap();
+
+    let expr = format!(
+        r#"(() => {{
+    return [...document.querySelectorAll({sel_lit})]
+        .filter((el) => {{
+            if (!{visible_lit}) return true;
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        }})
+        .slice(0, {limit})
+        .map((el, index) => {{
+            const rect = el.getBoundingClientRect();
+            return {{
+                index,
+                tag: el.tagName.toLowerCase(),
+                id: el.id || null,
+                classes: [...el.classList],
+                text: (el.innerText || el.textContent || "").trim().slice(0, 200),
+                attributes: Object.fromEntries([...el.attributes].map((attr) => [attr.name, attr.value])),
+                rect: {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }}
+            }};
+        }});
+}})()"#
+    );
+
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map(|opt| Some(opt.unwrap_or(Value::Array(vec![]))))
+        .map_err(|e| e.to_string())
+}
+
 async fn handle_wait_url(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
     let pattern = require_string(params, "pattern")?;
     let pattern_type = params
@@ -659,6 +712,7 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "execution.executeJs" => handle_eval(state, &req.params).await,
         "dom.getText" => handle_get_text(state, &req.params).await,
         "dom.getHtml" => handle_get_html(state, &req.params).await,
+        "dom.querySelector" => handle_query_selector(state, &req.params).await,
         "interaction.click" => handle_click(state, &req.params).await,
         "interaction.type" => handle_type(state, &req.params).await,
         "wait.selector" => handle_wait_selector(state, &req.params).await,
