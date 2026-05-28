@@ -723,6 +723,63 @@ async fn handle_cookies_delete(
     }
 }
 
+/// `storage.get` — evaluate-based wrapper over local/sessionStorage.
+/// If `key` is provided, returns the single value. Otherwise dumps the whole
+/// storage as `{ key: value }` object.
+async fn handle_storage_get(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let storage_type = if params.get("type").and_then(Value::as_str) == Some("session") {
+        "sessionStorage"
+    } else {
+        "localStorage"
+    };
+    let client = client_or_err(state).await?;
+    let expr = match params.get("key").and_then(Value::as_str) {
+        Some(key) => {
+            let key_lit = serde_json::to_string(key).unwrap();
+            format!("{storage_type}.getItem({key_lit})")
+        }
+        None => format!(
+            "Object.fromEntries(Object.keys({storage_type}).map((k) => [k, {storage_type}.getItem(k) ?? \"\"]))"
+        ),
+    };
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map(|opt| Some(opt.unwrap_or(Value::Null)))
+        .map_err(|e| e.to_string())
+}
+
+async fn handle_storage_set(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let key = require_string(params, "key")?;
+    let value = require_string(params, "value")?;
+    let storage_type = if params.get("type").and_then(Value::as_str) == Some("session") {
+        "sessionStorage"
+    } else {
+        "localStorage"
+    };
+    let client = client_or_err(state).await?;
+    let key_lit = serde_json::to_string(&key).unwrap();
+    let value_lit = serde_json::to_string(&value).unwrap();
+    let expr = format!("{storage_type}.setItem({key_lit}, {value_lit}); null;");
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map(|_| None)
+        .map_err(|e| e.to_string())
+}
+
+async fn handle_storage_clear(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let storage_type = if params.get("type").and_then(Value::as_str) == Some("session") {
+        "sessionStorage"
+    } else {
+        "localStorage"
+    };
+    let client = client_or_err(state).await?;
+    let expr = format!("{storage_type}.clear(); null;");
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map(|_| None)
+        .map_err(|e| e.to_string())
+}
+
 async fn handle_wait_url(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
     let pattern = require_string(params, "pattern")?;
     let pattern_type = params
@@ -785,6 +842,9 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "cookies.get" => handle_cookies_get(state, &req.params).await,
         "cookies.set" => handle_cookies_set(state, &req.params).await,
         "cookies.delete" => handle_cookies_delete(state, &req.params).await,
+        "storage.get" => handle_storage_get(state, &req.params).await,
+        "storage.set" => handle_storage_set(state, &req.params).await,
+        "storage.clear" => handle_storage_clear(state, &req.params).await,
         "interaction.click" => handle_click(state, &req.params).await,
         "interaction.type" => handle_type(state, &req.params).await,
         "wait.selector" => handle_wait_selector(state, &req.params).await,

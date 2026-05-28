@@ -415,6 +415,48 @@ case_cookies() {
 # spike-scope limitation, see daemon.rs comment.
 # case_cookies
 
+# Phase 2d-4: storage.set / storage.get / storage.clear round-trip.
+# Use sessionStorage on a data: URL where localStorage is denied due to
+# opaque origin in some chromium builds. Actually we use a small inline
+# javascript bootstrap so the page has a real same-origin context — about:blank.
+case_storage() {
+  # localStorage requires a non-opaque origin. data:/about:blank URLs throw on
+  # access (Chromium SecurityError). Use a small static file: URL so storage
+  # works. Create a temp html and serve from disk (file:// origin permits storage).
+  local html="$TMP/store.html"
+  printf '%s\n' '<!doctype html><html><body><h1>store</h1></body></html>' > "$html"
+  local file_url="file://$html"
+  env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" navigate "$file_url" \
+    >/dev/null 2>&1 || { report_fail "TS storage navigate setup"; return; }
+  if ! env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" storage-set --key "k" --value "v" >/dev/null 2>&1; then
+    report_fail "TS storage-set"; return
+  fi
+  local out
+  if ! out="$(env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" storage-get --key "k" 2>&1)"; then
+    report_fail "TS storage-get" "$out"; return
+  fi
+  local first; first="$(printf '%s' "$out" | head -1 | tr -d '"')"
+  if [[ "$first" == "v" ]]; then
+    report_pass "TS storage-set/get round-trip"
+  else
+    report_fail "TS storage-get mismatch" "$first" '"v"'
+    return
+  fi
+  if ! env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" storage-clear >/dev/null 2>&1; then
+    report_fail "TS storage-clear"; return
+  fi
+  out="$(env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" storage-get --key "k" 2>&1)"
+  first="$(printf '%s' "$out" | head -1)"
+  # TS CLI renders null data as "ok" (renderResult in src/cli/index.ts).
+  if [[ "$first" == "ok" ]]; then
+    report_pass "TS storage-clear removed all keys"
+  else
+    report_fail "TS storage-clear did not clear" "$first" "ok"
+  fi
+}
+
+case_storage
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true
