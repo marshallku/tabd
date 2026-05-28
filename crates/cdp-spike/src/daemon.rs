@@ -346,6 +346,194 @@ async fn handle_get_text(state: &DaemonState, params: &Value) -> Result<Option<V
         .map_err(|e| e.to_string())
 }
 
+// -- Phase 2b: interaction + wait helpers ----------------------------------
+
+fn require_string<'a>(params: &'a Value, key: &str) -> Result<String, String> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing '{key}' (string)"))
+        .map(|s| s.to_owned())
+}
+
+fn optional_u64(params: &Value, key: &str, default: u64) -> u64 {
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or(default)
+}
+
+async fn client_or_err(state: &DaemonState) -> Result<Arc<CdpClient>, String> {
+    state
+        .client
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "cdp client not initialized".to_string())
+}
+
+/// Poll until the selector matches a visible element, or fail with a clear
+/// timeout error. Visibility = non-zero rect + style.visibility != hidden
+/// + display != none.
+async fn wait_for_selector_visible(
+    client: &Arc<CdpClient>,
+    selector: &str,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let sel_lit = serde_json::to_string(selector).map_err(|e| e.to_string())?;
+    let probe = format!(
+        "(() => {{
+    const el = document.querySelector({sel_lit});
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+}})()"
+    );
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match crate::cmd::eval::evaluate_value(client, &probe).await {
+            Ok(Some(Value::Bool(true))) => return Ok(()),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "selector {selector} not visible after {timeout_ms}ms"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Compile a URL matcher from (pattern, patternType). Mirrors TS's
+/// src/shared/urlMatch.ts behavior:
+///   - exact: u == pattern
+///   - glob: pattern with `*` becoming `.*`, anchored, other special chars escaped
+///   - regex: pattern compiled directly
+fn compile_url_matcher(
+    pattern: &str,
+    pattern_type: &str,
+) -> Result<Box<dyn Fn(&str) -> bool + Send + Sync>, String> {
+    match pattern_type {
+        "exact" => {
+            let p = pattern.to_owned();
+            Ok(Box::new(move |u: &str| u == p))
+        }
+        "regex" => {
+            let re = regex::Regex::new(pattern)
+                .map_err(|e| format!("invalid regex pattern: {e}"))?;
+            Ok(Box::new(move |u: &str| re.is_match(u)))
+        }
+        "glob" => {
+            // Escape regex metacharacters, then turn `*` into `.*`. Anchor with ^…$.
+            let mut out = String::from("^");
+            for c in pattern.chars() {
+                match c {
+                    '*' => out.push_str(".*"),
+                    '.' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+                    | '\\' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    _ => out.push(c),
+                }
+            }
+            out.push('$');
+            let re = regex::Regex::new(&out)
+                .map_err(|e| format!("invalid glob → regex compile: {e}"))?;
+            Ok(Box::new(move |u: &str| re.is_match(u)))
+        }
+        other => Err(format!(
+            "unsupported patternType '{other}' (expected exact|glob|regex)"
+        )),
+    }
+}
+
+async fn handle_click(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let selector = require_string(params, "selector")?;
+    let timeout_ms = optional_u64(params, "timeout", 30_000);
+    let client = client_or_err(state).await?;
+    wait_for_selector_visible(&client, &selector, timeout_ms).await?;
+    let sel_lit = serde_json::to_string(&selector).unwrap();
+    let expr = format!(
+        "(() => {{
+    const el = document.querySelector({sel_lit});
+    if (!el) throw new Error('Selector not found: ' + {sel_lit});
+    el.click();
+    return {{ ok: true }};
+}})()"
+    );
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn handle_type(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let selector = require_string(params, "selector")?;
+    let text = require_string(params, "text")?;
+    let timeout_ms = optional_u64(params, "timeout", 30_000);
+    let client = client_or_err(state).await?;
+    wait_for_selector_visible(&client, &selector, timeout_ms).await?;
+    let sel_lit = serde_json::to_string(&selector).unwrap();
+    let text_lit = serde_json::to_string(&text).unwrap();
+    // JS-based type (spike scope) — sets .value + fires input/change events.
+    // Plain HTML forms work; some React/Vue controlled inputs may need the
+    // native setter trick, which is phase 2c (real CDP Input.dispatchKeyEvent).
+    let expr = format!(
+        "(() => {{
+    const el = document.querySelector({sel_lit});
+    if (!el) throw new Error('Selector not found: ' + {sel_lit});
+    el.focus();
+    el.value = {text_lit};
+    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    return {{ ok: true }};
+}})()"
+    );
+    crate::cmd::eval::evaluate_value(&client, &expr)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn handle_wait_selector(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let selector = require_string(params, "selector")?;
+    let timeout_ms = optional_u64(params, "timeout", 30_000);
+    let client = client_or_err(state).await?;
+    wait_for_selector_visible(&client, &selector, timeout_ms).await?;
+    Ok(Some(json!({ "found": true })))
+}
+
+async fn handle_wait_url(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+    let pattern = require_string(params, "pattern")?;
+    let pattern_type = params
+        .get("patternType")
+        .and_then(Value::as_str)
+        .unwrap_or("exact")
+        .to_owned();
+    let timeout_ms = optional_u64(params, "timeout", 30_000);
+    let client = client_or_err(state).await?;
+    let matcher = compile_url_matcher(&pattern, &pattern_type)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if let Ok(Some(Value::String(url))) =
+            crate::cmd::eval::evaluate_value(&client, "document.location.href").await
+            && matcher(&url)
+        {
+            return Ok(Some(json!({ "url": url })));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "wait-url timed out after {timeout_ms}ms (pattern={pattern} type={pattern_type})"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 // -- Connection / request loop ----------------------------------------------
 
 async fn process_request(state: &DaemonState, line: &str) -> String {
@@ -376,6 +564,10 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "tabs.navigate" => handle_navigate(state, &req.params).await,
         "execution.executeJs" => handle_eval(state, &req.params).await,
         "dom.getText" => handle_get_text(state, &req.params).await,
+        "interaction.click" => handle_click(state, &req.params).await,
+        "interaction.type" => handle_type(state, &req.params).await,
+        "wait.selector" => handle_wait_selector(state, &req.params).await,
+        "wait.url" => handle_wait_url(state, &req.params).await,
         other => Err(format!("unsupported action: {other}")),
     };
 
@@ -673,5 +865,62 @@ mod tests {
         state.accepting.store(false, Ordering::Release);
         assert!(state.try_admit().is_none());
         assert_eq!(state.inflight.load(Ordering::Acquire), 0);
+    }
+
+    // -- Phase 2b: compile_url_matcher --
+
+    #[test]
+    fn url_matcher_exact() {
+        let m = compile_url_matcher("https://example.com/x", "exact").unwrap();
+        assert!(m("https://example.com/x"));
+        assert!(!m("https://example.com/x/"));
+        assert!(!m("https://example.com/y"));
+    }
+
+    #[test]
+    fn url_matcher_glob_wildcard() {
+        let m = compile_url_matcher("https://*.example.com/*", "glob").unwrap();
+        assert!(m("https://api.example.com/foo"));
+        assert!(m("https://app.example.com/"));
+        assert!(!m("https://example.org/foo"));
+        assert!(!m("http://api.example.com/foo")); // scheme differs
+    }
+
+    #[test]
+    fn url_matcher_glob_anchored() {
+        // Implicit anchor — substring without anchors must not match.
+        let m = compile_url_matcher("https://example.com/x", "glob").unwrap();
+        assert!(m("https://example.com/x"));
+        assert!(!m("https://example.com/x/y"));
+        assert!(!m("prefix-https://example.com/x"));
+    }
+
+    #[test]
+    fn url_matcher_glob_escapes_regex_metas() {
+        // dots / + / ? must be treated as literals when in a glob pattern.
+        let m = compile_url_matcher("https://example.com/foo.bar?baz=1", "glob").unwrap();
+        assert!(m("https://example.com/foo.bar?baz=1"));
+        // dot is literal — `foo!bar` must NOT match
+        assert!(!m("https://example.com/foo!bar?baz=1"));
+    }
+
+    #[test]
+    fn url_matcher_regex() {
+        let m = compile_url_matcher(r"^https://example\.com/\d+$", "regex").unwrap();
+        assert!(m("https://example.com/42"));
+        assert!(!m("https://example.com/x"));
+    }
+
+    #[test]
+    fn url_matcher_unsupported_pattern_type() {
+        // Closure type isn't Debug, so use `.err()` instead of `.unwrap_err()`.
+        let err = compile_url_matcher("x", "weird").err().unwrap();
+        assert!(err.contains("unsupported patternType"), "got: {err}");
+    }
+
+    #[test]
+    fn url_matcher_invalid_regex() {
+        let err = compile_url_matcher("[bad", "regex").err().unwrap();
+        assert!(err.contains("invalid regex pattern"), "got: {err}");
     }
 }

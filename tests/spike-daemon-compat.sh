@@ -186,6 +186,83 @@ case_navigate
 case_eval
 case_get_text
 
+# Phase 2b: 4 driver actions for automation workflow (click/type/wait-selector/wait-url).
+# Each is a TS CLI command backed by an action newly supported in spike daemon.
+
+case_click() {
+  # navigate to a page with a button that sets window.clicked on click,
+  # then click via TS CLI, then verify window.clicked via TS eval.
+  local navout clickout evalout
+  env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" navigate \
+    "data:text/html,<button id=b onclick='window.clicked=1'>Go</button>" \
+    >/dev/null 2>&1 || { report_fail "TS click navigate setup"; return; }
+  if ! clickout="$(env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" click "#b" 2>&1)"; then
+    report_fail "TS click via spike daemon" "$clickout"; return
+  fi
+  if ! evalout="$(env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" eval "window.clicked" 2>&1)"; then
+    report_fail "TS click verify (eval after click)" "$evalout"; return
+  fi
+  # eval output is the value (1) or possibly "1" — check trimmed contains "1"
+  local first; first="$(printf '%s' "$evalout" | head -1 | tr -d '"')"
+  if [[ "$first" == "1" ]]; then
+    report_pass "TS click → window.clicked=1"
+  else
+    report_fail "TS click did not set window.clicked" "$first" "1"
+  fi
+}
+
+case_type() {
+  local navout typeout evalout
+  env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" navigate \
+    "data:text/html,<input id=i type=text>" \
+    >/dev/null 2>&1 || { report_fail "TS type navigate setup"; return; }
+  if ! typeout="$(env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" type "#i" "hello world" 2>&1)"; then
+    report_fail "TS type via spike daemon" "$typeout"; return
+  fi
+  if ! evalout="$(env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" eval "document.querySelector('#i').value" 2>&1)"; then
+    report_fail "TS type verify (read value back)" "$evalout"; return
+  fi
+  local first; first="$(printf '%s' "$evalout" | head -1)"
+  # eval likely prints "hello world" (with quotes JSON-stringified) — accept both
+  if [[ "$first" == '"hello world"' ]] || [[ "$first" == "hello world" ]]; then
+    report_pass "TS type → input value = 'hello world'"
+  else
+    report_fail "TS type did not set value" "$first" '"hello world"'
+  fi
+}
+
+case_wait_selector() {
+  # Navigate to a page that injects an element after 300ms. wait-selector
+  # should succeed within default timeout.
+  env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" navigate \
+    "data:text/html,<script>setTimeout(()=>{document.body.innerHTML+='<div id=late>here</div>'},300)</script>" \
+    >/dev/null 2>&1 || { report_fail "TS wait-selector navigate setup"; return; }
+  if env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" wait-selector "#late" >/dev/null 2>&1; then
+    report_pass "TS wait-selector found delayed #late"
+  else
+    report_fail "TS wait-selector timed out or failed"
+  fi
+}
+
+case_wait_url() {
+  # Navigate to a data: URL, then wait-url with a glob that matches it.
+  # Tests both the glob compilation and the polling/match path.
+  env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" navigate \
+    "data:text/html,<h1>here</h1>" \
+    >/dev/null 2>&1 || { report_fail "TS wait-url navigate setup"; return; }
+  # Glob "data:*" should match any data: URL — immediate match on poll.
+  if env "${ts_env[@]}" timeout 30 node "$AI_BROWSER" wait-url "data:*" --pattern-type glob >/dev/null 2>&1; then
+    report_pass "TS wait-url glob 'data:*' matched current URL"
+  else
+    report_fail "TS wait-url did not match current data: URL"
+  fi
+}
+
+case_click
+case_type
+case_wait_selector
+case_wait_url
+
 # 5. Stop via TS CLI.
 echo "stopping spike daemon via TS CLI..."
 env "${ts_env[@]}" node "$AI_BROWSER" daemon stop >/dev/null 2>&1 || true
