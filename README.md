@@ -28,6 +28,21 @@ cargo install --path crates/tabd   # from source
 gh release download v0.x.y --pattern 'tabd-linux-x64'
 ```
 
+### AI agent skill (optional)
+
+If you use Claude Code or Codex CLI, install the embedded skill so the agent
+automatically uses `tabd` for browser-automation requests:
+
+```bash
+tabd skill install            # auto-detects Claude / Codex, installs to both
+tabd skill install --target codex --force   # explicit one-target, overwrite
+tabd skill install --path .claude/skills/tabd   # project-local
+```
+
+Writes `SKILL.md` + the four `docs/*.md` references into
+`~/.claude/skills/tabd/` and/or `~/.codex/skills/tabd/`. Restart the client
+afterwards so it reloads skill metadata.
+
 ## Surface
 
 39 action subcommands + 4 daemon controls.

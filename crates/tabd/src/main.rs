@@ -4,6 +4,7 @@ mod cli;
 mod cmd;
 mod daemon;
 mod secrets;
+mod skill;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -49,6 +50,11 @@ enum Command {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// Install the Claude Code / Codex CLI skill (SKILL.md + 4 docs) onto disk.
+    Skill {
+        #[command(subcommand)]
+        cmd: SkillCmd,
+    },
     /// Catch-all for action subcommands (navigate, get-text, click, etc.).
     /// Routed through the daemon — auto-spawned if needed. See `src/cli.rs`
     /// for the dispatch table and `secret-put` for the plaintext-safe branch.
@@ -56,11 +62,47 @@ enum Command {
     Other(Vec<OsString>),
 }
 
+#[derive(Subcommand)]
+enum SkillCmd {
+    /// Copy the embedded SKILL.md + docs into ~/.claude/skills/tabd and/or
+    /// ~/.codex/skills/tabd. Auto-detects which clients are installed.
+    Install {
+        /// Comma-separated subset: `claude`, `codex`, or `claude,codex`.
+        /// Overrides auto-detection.
+        #[arg(long)]
+        target: Option<String>,
+
+        /// Skip the Claude install even if Claude is detected.
+        #[arg(long)]
+        no_claude: bool,
+
+        /// Skip the Codex install even if Codex is detected.
+        #[arg(long)]
+        no_codex: bool,
+
+        /// Install into this directory instead of the client default.
+        /// Useful for project-local skills (e.g. `.claude/skills/tabd`).
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Overwrite existing files in the destination directory.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let code: i32 = match cli.command {
         Command::Daemon { cmd } => match run_daemon_cmd(cmd).await {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                1
+            }
+        },
+        Command::Skill { cmd } => match run_skill_cmd(cmd) {
             Ok(()) => 0,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -76,6 +118,26 @@ async fn main() -> ExitCode {
         },
     };
     ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+fn run_skill_cmd(cmd: SkillCmd) -> Result<()> {
+    match cmd {
+        SkillCmd::Install {
+            target,
+            no_claude,
+            no_codex,
+            path,
+            force,
+        } => {
+            let plan =
+                skill::build_plan(target.as_deref(), no_claude, no_codex, path.as_deref())?;
+            skill::install(&plan, force)?;
+            eprintln!(
+                "Restart Claude Code or Codex CLI so the skill metadata is picked up."
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn run_daemon_cmd(cmd: DaemonCmd) -> Result<()> {
