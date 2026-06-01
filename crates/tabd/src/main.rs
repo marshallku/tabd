@@ -37,7 +37,7 @@ enum DaemonCmd {
 }
 
 #[derive(Parser)]
-#[command(name = "tabd", about = "Rust + Chromium CDP browser controller")]
+#[command(name = "tabd", version, about = "Rust + Chromium CDP browser controller")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
