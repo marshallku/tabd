@@ -20,13 +20,15 @@ dependency-free CLI surface.
 
 ## Install
 
-See [INSTALL.md](./INSTALL.md). Short version:
+See [INSTALL.md](./INSTALL.md). Short version — no build from source needed:
 
 ```bash
-cargo install --path crates/tabd   # from source
-# or
-gh release download v0.x.y --pattern 'tabd-linux-x64'
+curl -fsSL https://raw.githubusercontent.com/marshallku/tabd/master/install.sh | sh
 ```
+
+Downloads the right pre-built binary for your platform (Linux x64, macOS
+Intel/Apple Silicon), verifies its SHA256, and installs to `~/.local/bin/tabd`.
+From source instead: `cargo install --path crates/tabd`.
 
 ### AI agent skill (optional)
 

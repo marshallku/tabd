@@ -5,14 +5,44 @@ unsupported because the daemon talks over Unix domain sockets.
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024) if installing from source
 - A Chromium build available on disk
 - 64-bit Linux (x86_64) or macOS (Intel / Apple Silicon)
 - ~600 MB free for Chromium itself (we do not bundle it)
+- Rust 1.85+ (edition 2024) *only* if installing from source
 
 ## Install
 
-### From source (recommended)
+### Pre-built binary (recommended)
+
+One line — detects your platform, downloads the matching binary, verifies its
+SHA256, and installs to `~/.local/bin/tabd`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/marshallku/tabd/master/install.sh | sh
+```
+
+Environment overrides:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TABD_VERSION` | latest release | Pin a tag, e.g. `TABD_VERSION=v0.1.0` |
+| `TABD_INSTALL_DIR` | `~/.local/bin` | Where to drop the `tabd` binary |
+| `TABD_NO_VERIFY` | unset | Skip SHA256 checksum verification |
+
+Make sure the install dir is on `PATH` (the script warns if it is not). On macOS
+the script clears the quarantine flag for you, since the binaries are unsigned.
+
+Each tag push runs `.github/workflows/binary-release.yml`, which publishes
+`tabd-linux-x64`, `tabd-darwin-x64`, `tabd-darwin-arm64`, and a `SHA256SUMS`
+file to the GitHub Release. To install manually instead of the script:
+
+```bash
+gh release download v0.1.0 --pattern 'tabd-linux-x64'
+chmod +x tabd-linux-x64
+mv tabd-linux-x64 ~/.local/bin/tabd
+```
+
+### From source
 
 ```bash
 git clone https://github.com/marshallku/tabd.git
@@ -21,23 +51,6 @@ cargo install --path crates/tabd
 ```
 
 This produces `~/.cargo/bin/tabd`. Make sure `~/.cargo/bin` is on `PATH`.
-
-### Pre-built binary
-
-Each tag push runs `.github/workflows/binary-release.yml`, which uploads:
-
-- `tabd-linux-x64`
-- `tabd-darwin-x64`
-- `tabd-darwin-arm64`
-
-```bash
-gh release download v0.x.y --pattern 'tabd-linux-x64'
-chmod +x tabd-linux-x64
-mv tabd-linux-x64 ~/.local/bin/tabd
-```
-
-macOS binaries are unsigned — `xattr -dr com.apple.quarantine tabd-darwin-arm64`
-on first run.
 
 ## Chromium
 

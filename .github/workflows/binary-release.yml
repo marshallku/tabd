@@ -66,6 +66,13 @@ jobs:
           find dist -type f -exec cp {} flat/ \;
           ls -la flat/
 
+      - name: Generate checksums
+        run: |
+          set -eu
+          cd flat
+          sha256sum tabd-* > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
