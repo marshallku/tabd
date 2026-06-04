@@ -1830,11 +1830,29 @@ async fn handle_connection(stream: UnixStream, state: DaemonState) {
 
 // -- Boot / lock ------------------------------------------------------------
 
+/// chmod `path` to `mode`. Unix-only (the daemon is Unix-socket based).
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("set mode {mode:o} on {}", path.display()))
+}
+
 async fn bind_listener_with_lock(paths: &DaemonPaths) -> Result<UnixListener> {
     std::fs::create_dir_all(&paths.base_dir).context("create daemon base dir")?;
+    // 0o700 so other local users can't traverse into the runtime dir and reach
+    // the daemon socket (which would let them drive the browser, read cookies,
+    // or trigger type-secret). Critical for the ~/.cache/tabd fallback used over
+    // SSH when XDG_RUNTIME_DIR is unset. set_permissions also fixes up an
+    // already-existing dir created before this hardening.
+    set_mode(&paths.base_dir, 0o700)?;
     for attempt in 0..2 {
         match UnixListener::bind(&paths.socket_path) {
-            Ok(listener) => return Ok(listener),
+            Ok(listener) => {
+                // Defense-in-depth on top of the 0o700 dir: the socket itself is
+                // owner-only. (bind() honors umask, so make the intent explicit.)
+                set_mode(&paths.socket_path, 0o600)?;
+                return Ok(listener);
+            }
             Err(err) => {
                 if err.kind() != std::io::ErrorKind::AddrInUse || attempt == 1 {
                     return Err(err)
