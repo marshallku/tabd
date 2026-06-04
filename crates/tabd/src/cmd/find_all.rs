@@ -8,6 +8,10 @@ use super::page;
 use super::query_all::{build_els_expr, validate_target_flags_strict};
 use crate::cdp::CdpClient;
 
+// TARGET flags (selector/testid/role/name) + raw/limit/timeout are passed
+// positionally to mirror the CLI arg surface; grouping them into a shared
+// struct is tracked as a follow-up cleanup.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     url: &str,
     selector: Option<&str>,

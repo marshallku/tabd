@@ -75,11 +75,7 @@ return text.replace(/\n{{3,}}/g, "\n\n").trim();"#
 /// (src/server/runtimes/cdp.ts:854~872) byte-for-byte semantics, with an
 /// extra `--testid` branch that resolves via JS string equality on
 /// `el.dataset.testid` (avoids CSS attribute-value escape entirely).
-fn build_get_text_expr(
-    selector: Option<&str>,
-    testid: Option<&str>,
-    raw: bool,
-) -> Result<String> {
+fn build_get_text_expr(selector: Option<&str>, testid: Option<&str>, raw: bool) -> Result<String> {
     let target_expr = build_target_expr(selector, testid)?;
     let body = build_text_body(raw);
     Ok(format!(
@@ -101,9 +97,9 @@ fn build_target_expr(selector: Option<&str>, testid: Option<&str>) -> Result<Str
                 "([...document.querySelectorAll('[data-testid]')].find(el => el.dataset.testid === {testid_lit})) ?? document.body"
             ))
         }
-        (None, None) => Ok(
-            r#"document.querySelector("main, article, body") ?? document.body"#.to_string(),
-        ),
+        (None, None) => {
+            Ok(r#"document.querySelector("main, article, body") ?? document.body"#.to_string())
+        }
         (Some(_), Some(_)) => unreachable!("validated by CLI arg group and run()"),
     }
 }
@@ -210,8 +206,14 @@ mod tests {
     #[test]
     fn testid_uses_js_string_equality_not_css_attr() {
         let expr = build_get_text_expr(None, Some("my-btn"), false).unwrap();
-        assert!(expr.contains("querySelectorAll('[data-testid]')"), "got: {expr}");
-        assert!(expr.contains(r#"el.dataset.testid === "my-btn""#), "got: {expr}");
+        assert!(
+            expr.contains("querySelectorAll('[data-testid]')"),
+            "got: {expr}"
+        );
+        assert!(
+            expr.contains(r#"el.dataset.testid === "my-btn""#),
+            "got: {expr}"
+        );
         assert!(expr.contains("?? document.body"), "got: {expr}");
     }
 
@@ -231,16 +233,28 @@ mod tests {
     #[test]
     fn raw_true_uses_early_return_textcontent() {
         let body = build_text_body(true);
-        assert!(body.contains(r#"if (true) return target.textContent ?? """#), "got: {body}");
+        assert!(
+            body.contains(r#"if (true) return target.textContent ?? """#),
+            "got: {body}"
+        );
         assert!(body.contains(r#"replace(/\n{3,}/g"#), "got: {body}");
     }
 
     #[test]
     fn raw_false_uses_innertext_collapse_and_trim() {
         let body = build_text_body(false);
-        assert!(body.contains(r#"if (false) return target.textContent"#), "got: {body}");
-        assert!(body.contains("target.innerText ?? target.textContent"), "got: {body}");
-        assert!(body.contains(r#"replace(/\n{3,}/g, "\n\n")"#), "got: {body}");
+        assert!(
+            body.contains(r#"if (false) return target.textContent"#),
+            "got: {body}"
+        );
+        assert!(
+            body.contains("target.innerText ?? target.textContent"),
+            "got: {body}"
+        );
+        assert!(
+            body.contains(r#"replace(/\n{3,}/g, "\n\n")"#),
+            "got: {body}"
+        );
         assert!(body.contains(".trim()"), "got: {body}");
     }
 
@@ -250,7 +264,10 @@ mod tests {
         // the body string is byte-identical for the same raw flag.
         let b1 = build_text_body(false);
         let expr = build_get_text_expr(Some("h1"), None, false).unwrap();
-        assert!(expr.contains(&b1), "selector expr should embed body verbatim; expr: {expr}");
+        assert!(
+            expr.contains(&b1),
+            "selector expr should embed body verbatim; expr: {expr}"
+        );
     }
 
     // -- validate_target_flags coverage --
@@ -301,13 +318,19 @@ mod tests {
     #[test]
     fn name_without_role_rejected() {
         let err = validate_target_flags(None, None, None, Some("Click")).unwrap_err();
-        assert!(err.to_string().contains("--name requires --role"), "got: {err}");
+        assert!(
+            err.to_string().contains("--name requires --role"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn selector_plus_name_rejected_via_missing_role() {
         // --selector + --name (no --role) — name still requires role.
         let err = validate_target_flags(Some("h1"), None, None, Some("Click")).unwrap_err();
-        assert!(err.to_string().contains("--name requires --role"), "got: {err}");
+        assert!(
+            err.to_string().contains("--name requires --role"),
+            "got: {err}"
+        );
     }
 }

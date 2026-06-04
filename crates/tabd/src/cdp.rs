@@ -173,10 +173,10 @@ impl TabRegistry {
     /// without event subscription.
     pub fn reconcile(&mut self, fresh_ids: &HashSet<String>) {
         self.tabs.retain(|tid, _| fresh_ids.contains(tid));
-        if let Some(a) = &self.active {
-            if !fresh_ids.contains(a) {
-                self.active = None;
-            }
+        if let Some(a) = &self.active
+            && !fresh_ids.contains(a)
+        {
+            self.active = None;
         }
     }
 }
@@ -278,10 +278,7 @@ fn error_entry_from_exception(params: &Value) -> Option<ErrorEntry> {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| "Unknown error".to_string());
-    let source = detail
-        .get("url")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let source = detail.get("url").and_then(Value::as_str).map(str::to_owned);
     let line = detail.get("lineNumber").and_then(Value::as_u64);
     let column = detail.get("columnNumber").and_then(Value::as_u64);
     Some(ErrorEntry {
@@ -321,7 +318,7 @@ impl CdpClient {
 
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
-                if sink.send(Message::Text(msg.into())).await.is_err() {
+                if sink.send(Message::Text(msg)).await.is_err() {
                     break;
                 }
             }
@@ -365,9 +362,8 @@ impl CdpClient {
                             .and_then(Value::as_str)
                             .unwrap_or("log")
                             .to_owned();
-                        let text = console_text_from_args(
-                            params.get("args").unwrap_or(&Value::Null),
-                        );
+                        let text =
+                            console_text_from_args(params.get("args").unwrap_or(&Value::Null));
                         state.console_logs.push(ConsoleEntry {
                             level,
                             text,
@@ -434,8 +430,10 @@ impl CdpClient {
                         state.network_pending = state.network_pending.saturating_add(1);
                     }
                     "Network.responseReceived" => {
-                        let request_id =
-                            params.get("requestId").and_then(Value::as_str).unwrap_or("");
+                        let request_id = params
+                            .get("requestId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         if request_id.is_empty() {
                             continue;
                         }
@@ -444,7 +442,10 @@ impl CdpClient {
                             .get("type")
                             .and_then(Value::as_str)
                             .map(str::to_owned);
-                        let status = response.get("status").and_then(Value::as_u64).map(|n| n as u16);
+                        let status = response
+                            .get("status")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as u16);
                         let status_text = response
                             .get("statusText")
                             .and_then(Value::as_str)
@@ -467,8 +468,10 @@ impl CdpClient {
                         }
                     }
                     "Network.loadingFinished" => {
-                        let request_id =
-                            params.get("requestId").and_then(Value::as_str).unwrap_or("");
+                        let request_id = params
+                            .get("requestId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         if request_id.is_empty() {
                             continue;
                         }
@@ -485,8 +488,10 @@ impl CdpClient {
                         state.network_pending = state.network_pending.saturating_sub(1);
                     }
                     "Network.loadingFailed" => {
-                        let request_id =
-                            params.get("requestId").and_then(Value::as_str).unwrap_or("");
+                        let request_id = params
+                            .get("requestId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         if request_id.is_empty() {
                             continue;
                         }
@@ -554,7 +559,8 @@ impl CdpClient {
         // `Active` route resolves correctly for the enable calls below.
         {
             let mut reg = client.registry.lock().await;
-            reg.tabs.insert(target_id.clone(), TabState::new(session_id));
+            reg.tabs
+                .insert(target_id.clone(), TabState::new(session_id));
             reg.active = Some(target_id);
         }
 
@@ -573,8 +579,12 @@ impl CdpClient {
 
     /// Send a method call against an explicitly named tab.
     pub async fn send_to(&self, target_id: &str, method: &str, params: Value) -> Result<Value> {
-        self.dispatch(method, params, ResolvedTarget::Explicit(target_id.to_owned()))
-            .await
+        self.dispatch(
+            method,
+            params,
+            ResolvedTarget::Explicit(target_id.to_owned()),
+        )
+        .await
     }
 
     async fn dispatch(&self, method: &str, params: Value, target: ResolvedTarget) -> Result<Value> {
@@ -644,12 +654,15 @@ impl CdpClient {
         // Register before enabling domains so send_to() succeeds.
         {
             let mut reg = self.registry.lock().await;
-            reg.tabs.insert(target_id.clone(), TabState::new(session_id));
+            reg.tabs
+                .insert(target_id.clone(), TabState::new(session_id));
         }
 
         self.send_to(&target_id, "Page.enable", json!({})).await?;
-        self.send_to(&target_id, "Runtime.enable", json!({})).await?;
-        self.send_to(&target_id, "Network.enable", json!({})).await?;
+        self.send_to(&target_id, "Runtime.enable", json!({}))
+            .await?;
+        self.send_to(&target_id, "Network.enable", json!({}))
+            .await?;
 
         Ok(target_id)
     }
@@ -932,8 +945,13 @@ mod tests {
 
     #[test]
     fn frame_includes_session_id_when_present() {
-        let text = build_frame(7, "Page.navigate", json!({ "url": "https://x" }), Some("sess-1"))
-            .unwrap();
+        let text = build_frame(
+            7,
+            "Page.navigate",
+            json!({ "url": "https://x" }),
+            Some("sess-1"),
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["id"], json!(7));
         assert_eq!(parsed["method"], json!("Page.navigate"));
@@ -943,8 +961,13 @@ mod tests {
 
     #[test]
     fn frame_omits_session_id_when_root() {
-        let text = build_frame(1, "Target.createTarget", json!({ "url": "about:blank" }), None)
-            .unwrap();
+        let text = build_frame(
+            1,
+            "Target.createTarget",
+            json!({ "url": "about:blank" }),
+            None,
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_str(&text).unwrap();
         assert!(parsed.get("sessionId").is_none(), "got: {parsed}");
     }
@@ -988,7 +1011,8 @@ mod tests {
 
     #[test]
     fn inbound_parses_event_with_session_id() {
-        let raw = r#"{"method":"Runtime.consoleAPICalled","sessionId":"s1","params":{"type":"log"}}"#;
+        let raw =
+            r#"{"method":"Runtime.consoleAPICalled","sessionId":"s1","params":{"type":"log"}}"#;
         let p: InboundFrame = serde_json::from_str(raw).unwrap();
         assert!(p.id.is_none());
         assert_eq!(p.method.as_deref(), Some("Runtime.consoleAPICalled"));

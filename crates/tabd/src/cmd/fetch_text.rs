@@ -29,7 +29,9 @@ pub async fn run(url: &str, selector: &str, timeout_ms: u64) -> Result<()> {
 /// (spike plan codex C3).
 fn build_text_expr(selector: &str) -> Result<String> {
     let lit = serde_json::to_string(selector)?;
-    Ok(format!("(document.querySelector({lit})?.textContent) ?? ''"))
+    Ok(format!(
+        "(document.querySelector({lit})?.textContent) ?? ''"
+    ))
 }
 
 #[cfg(test)]
@@ -39,10 +41,7 @@ mod tests {
     #[test]
     fn embeds_plain_selector() {
         let expr = build_text_expr("h1").unwrap();
-        assert_eq!(
-            expr,
-            r#"(document.querySelector("h1")?.textContent) ?? ''"#
-        );
+        assert_eq!(expr, r#"(document.querySelector("h1")?.textContent) ?? ''"#);
     }
 
     #[test]

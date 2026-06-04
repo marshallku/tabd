@@ -62,10 +62,10 @@ impl Target {
             });
             p
         });
-        if let Some(p) = config_dir {
-            if p.exists() {
-                return true;
-            }
+        if let Some(p) = config_dir
+            && p.exists()
+        {
+            return true;
         }
         binary_on_path(self.name())
     }
@@ -141,7 +141,10 @@ pub fn build_plan(
 ) -> Result<InstallPlan> {
     // --path overrides everything else: install to one specific directory.
     if let Some(path) = explicit_path {
-        if explicit_target.is_some() && explicit_target != Some("claude") && explicit_target != Some("codex") {
+        if explicit_target.is_some()
+            && explicit_target != Some("claude")
+            && explicit_target != Some("codex")
+        {
             // Allow --target claude/codex with --path so the user can pick the
             // {{SKILL_DIR}} substitution explicitly, but it is informational
             // only — the destination is the --path value either way.
@@ -149,7 +152,9 @@ pub fn build_plan(
         let target = match explicit_target {
             Some("claude") => Some(Target::Claude),
             Some("codex") => Some(Target::Codex),
-            Some(other) => bail!("with --path, --target must be 'claude' or 'codex' (got '{other}')"),
+            Some(other) => {
+                bail!("with --path, --target must be 'claude' or 'codex' (got '{other}')")
+            }
             None => None,
         };
         return Ok(InstallPlan {
@@ -225,8 +230,7 @@ fn install_one(dir: &Path, target: Option<Target>, force: bool) -> Result<()> {
     for (name, content) in FILES {
         let resolved = content.replace("{{SKILL_DIR}}", &dir_str);
         let path = dir.join(name);
-        std::fs::write(&path, resolved)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(&path, resolved).with_context(|| format!("write {}", path.display()))?;
     }
 
     let label = target.map(|t| t.name()).unwrap_or("custom");
@@ -267,7 +271,10 @@ mod tests {
 
     #[test]
     fn parse_targets_dedupes() {
-        assert_eq!(parse_targets("claude,claude").unwrap(), vec![Target::Claude]);
+        assert_eq!(
+            parse_targets("claude,claude").unwrap(),
+            vec![Target::Claude]
+        );
     }
 
     #[test]
@@ -290,8 +297,18 @@ mod tests {
     fn build_plan_explicit_target_no_path_uses_defaults() {
         let plan = build_plan(Some("claude,codex"), false, false, None).unwrap();
         assert_eq!(plan.entries.len(), 2);
-        assert!(plan.entries[0].dir.to_string_lossy().contains(".claude/skills/tabd"));
-        assert!(plan.entries[1].dir.to_string_lossy().contains(".codex/skills/tabd"));
+        assert!(
+            plan.entries[0]
+                .dir
+                .to_string_lossy()
+                .contains(".claude/skills/tabd")
+        );
+        assert!(
+            plan.entries[1]
+                .dir
+                .to_string_lossy()
+                .contains(".codex/skills/tabd")
+        );
     }
 
     #[test]
@@ -350,7 +367,13 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), "user edit").unwrap();
         install_one(&dir, None, true).unwrap();
         let after = std::fs::read_to_string(dir.join("SKILL.md")).unwrap();
-        assert_ne!(after, "user edit", "force install should have rewritten SKILL.md");
-        assert!(after.contains("tabd"), "rewritten SKILL.md should contain the template");
+        assert_ne!(
+            after, "user edit",
+            "force install should have rewritten SKILL.md"
+        );
+        assert!(
+            after.contains("tabd"),
+            "rewritten SKILL.md should contain the template"
+        );
     }
 }

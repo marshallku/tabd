@@ -52,8 +52,8 @@ pub async fn evaluate_value(client: &CdpClient, expr: &str) -> Result<Option<Val
 /// CDP semantics for the inner RemoteObject:
 ///   - `type=="undefined"`               → no value field; treat as `None`
 ///   - `unserializableValue` present     → NaN / Infinity / -0 / 1n etc.;
-///                                         surface the literal as a string so
-///                                         callers see the same form DevTools shows
+///     surface the literal as a string so callers see the same form DevTools
+///     shows
 ///   - `value` present                   → the serializable value
 ///   - otherwise (object/function w/o by-value) → bail with the type
 pub fn unwrap_runtime_result(raw: &Value, op: &str) -> Result<Option<Value>> {
@@ -90,7 +90,9 @@ pub fn unwrap_runtime_result(raw: &Value, op: &str) -> Result<Option<Value>> {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("<no type>");
-    bail!("{op} returned a non-serializable {type_str}; pass returnByValue-friendly expression or serialize on the JS side");
+    bail!(
+        "{op} returned a non-serializable {type_str}; pass returnByValue-friendly expression or serialize on the JS side"
+    );
 }
 
 #[cfg(test)]
@@ -108,7 +110,11 @@ mod tests {
     #[test]
     fn unwrap_undefined_returns_none() {
         let raw = json!({ "result": { "type": "undefined" } });
-        assert!(unwrap_runtime_result(&raw, "Runtime.evaluate").unwrap().is_none());
+        assert!(
+            unwrap_runtime_result(&raw, "Runtime.evaluate")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -125,7 +131,10 @@ mod tests {
             "exceptionDetails": { "exception": { "description": "boom" } }
         });
         let err = unwrap_runtime_result(&raw, "Runtime.callFunctionOn").unwrap_err();
-        assert!(err.to_string().starts_with("Runtime.callFunctionOn:"), "got: {err}");
+        assert!(
+            err.to_string().starts_with("Runtime.callFunctionOn:"),
+            "got: {err}"
+        );
         assert!(err.to_string().contains("boom"), "got: {err}");
     }
 }

@@ -153,7 +153,8 @@ where
                 }
                 Err(err) => {
                     if let Some(s) = sender.take() {
-                        let _ = s.send(Err(anyhow::Error::new(err).context("read chromium stderr")));
+                        let _ =
+                            s.send(Err(anyhow::Error::new(err).context("read chromium stderr")));
                     }
                     return;
                 }

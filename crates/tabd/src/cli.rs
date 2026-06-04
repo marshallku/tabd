@@ -31,51 +31,279 @@ struct Spec {
 
 static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyLock::new(|| {
     let mut m = std::collections::HashMap::new();
-    m.insert("navigate", Spec { action: "tabs.navigate", positional: &["url"] });
-    m.insert("eval", Spec { action: "execution.executeJs", positional: &["code"] });
-    m.insert("get-text", Spec { action: "dom.getText", positional: &[] });
-    m.insert("get-html", Spec { action: "dom.getHtml", positional: &[] });
-    m.insert("query", Spec { action: "dom.querySelector", positional: &["selector"] });
-    m.insert("screenshot", Spec { action: "capture.screenshot", positional: &[] });
-    m.insert("click", Spec { action: "interaction.click", positional: &["selector"] });
-    m.insert("type", Spec { action: "interaction.type", positional: &["selector", "text"] });
-    m.insert("wait-selector", Spec { action: "wait.selector", positional: &["selector"] });
-    m.insert("wait-url", Spec { action: "wait.url", positional: &["pattern"] });
-    m.insert("cookies-get", Spec { action: "cookies.get", positional: &["url"] });
-    m.insert("cookies-set", Spec { action: "cookies.set", positional: &[] });
-    m.insert("cookies-delete", Spec { action: "cookies.delete", positional: &["name"] });
-    m.insert("storage-get", Spec { action: "storage.get", positional: &[] });
-    m.insert("storage-set", Spec { action: "storage.set", positional: &[] });
-    m.insert("storage-clear", Spec { action: "storage.clear", positional: &[] });
+    m.insert(
+        "navigate",
+        Spec {
+            action: "tabs.navigate",
+            positional: &["url"],
+        },
+    );
+    m.insert(
+        "eval",
+        Spec {
+            action: "execution.executeJs",
+            positional: &["code"],
+        },
+    );
+    m.insert(
+        "get-text",
+        Spec {
+            action: "dom.getText",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "get-html",
+        Spec {
+            action: "dom.getHtml",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "query",
+        Spec {
+            action: "dom.querySelector",
+            positional: &["selector"],
+        },
+    );
+    m.insert(
+        "screenshot",
+        Spec {
+            action: "capture.screenshot",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "click",
+        Spec {
+            action: "interaction.click",
+            positional: &["selector"],
+        },
+    );
+    m.insert(
+        "type",
+        Spec {
+            action: "interaction.type",
+            positional: &["selector", "text"],
+        },
+    );
+    m.insert(
+        "wait-selector",
+        Spec {
+            action: "wait.selector",
+            positional: &["selector"],
+        },
+    );
+    m.insert(
+        "wait-url",
+        Spec {
+            action: "wait.url",
+            positional: &["pattern"],
+        },
+    );
+    m.insert(
+        "cookies-get",
+        Spec {
+            action: "cookies.get",
+            positional: &["url"],
+        },
+    );
+    m.insert(
+        "cookies-set",
+        Spec {
+            action: "cookies.set",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "cookies-delete",
+        Spec {
+            action: "cookies.delete",
+            positional: &["name"],
+        },
+    );
+    m.insert(
+        "storage-get",
+        Spec {
+            action: "storage.get",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "storage-set",
+        Spec {
+            action: "storage.set",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "storage-clear",
+        Spec {
+            action: "storage.clear",
+            positional: &[],
+        },
+    );
     // Phase 3c — Tier 3 multi-tab actions.
-    m.insert("open-tab", Spec { action: "tabs.open", positional: &["url"] });
-    m.insert("close-tab", Spec { action: "tabs.close", positional: &[] });
-    m.insert("list-tabs", Spec { action: "tabs.list", positional: &[] });
-    m.insert("activate-tab", Spec { action: "tabs.activate", positional: &[] });
-    m.insert("back", Spec { action: "tabs.goBack", positional: &[] });
-    m.insert("forward", Spec { action: "tabs.goForward", positional: &[] });
-    m.insert("reload", Spec { action: "tabs.reload", positional: &[] });
+    m.insert(
+        "open-tab",
+        Spec {
+            action: "tabs.open",
+            positional: &["url"],
+        },
+    );
+    m.insert(
+        "close-tab",
+        Spec {
+            action: "tabs.close",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "list-tabs",
+        Spec {
+            action: "tabs.list",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "activate-tab",
+        Spec {
+            action: "tabs.activate",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "back",
+        Spec {
+            action: "tabs.goBack",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "forward",
+        Spec {
+            action: "tabs.goForward",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "reload",
+        Spec {
+            action: "tabs.reload",
+            positional: &[],
+        },
+    );
     // Phase 3d — Tier 4 interaction extras.
-    m.insert("hover", Spec { action: "interaction.hover", positional: &["selector"] });
-    m.insert("mouse-move", Spec { action: "interaction.mouseMove", positional: &[] });
-    m.insert("scroll", Spec { action: "interaction.scroll", positional: &[] });
-    m.insert("press-key", Spec { action: "interaction.pressKey", positional: &["key"] });
-    m.insert("select-option", Spec { action: "interaction.selectOption", positional: &["selector"] });
-    m.insert("check", Spec { action: "interaction.check", positional: &["selector"] });
+    m.insert(
+        "hover",
+        Spec {
+            action: "interaction.hover",
+            positional: &["selector"],
+        },
+    );
+    m.insert(
+        "mouse-move",
+        Spec {
+            action: "interaction.mouseMove",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "scroll",
+        Spec {
+            action: "interaction.scroll",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "press-key",
+        Spec {
+            action: "interaction.pressKey",
+            positional: &["key"],
+        },
+    );
+    m.insert(
+        "select-option",
+        Spec {
+            action: "interaction.selectOption",
+            positional: &["selector"],
+        },
+    );
+    m.insert(
+        "check",
+        Spec {
+            action: "interaction.check",
+            positional: &["selector"],
+        },
+    );
     // Phase 3e1 — Tier 5 monitor/diagnostic.
-    m.insert("console-logs", Spec { action: "monitor.consoleLogs", positional: &[] });
-    m.insert("page-errors", Spec { action: "monitor.pageErrors", positional: &[] });
-    m.insert("metrics", Spec { action: "capture.metrics", positional: &[] });
-    m.insert("summary", Spec { action: "dom.contentSummary", positional: &[] });
+    m.insert(
+        "console-logs",
+        Spec {
+            action: "monitor.consoleLogs",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "page-errors",
+        Spec {
+            action: "monitor.pageErrors",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "metrics",
+        Spec {
+            action: "capture.metrics",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "summary",
+        Spec {
+            action: "dom.contentSummary",
+            positional: &[],
+        },
+    );
     // Phase 3e2 — network-logs (event-stitching, body fetch deferred).
-    m.insert("network-logs", Spec { action: "monitor.networkLogs", positional: &[] });
+    m.insert(
+        "network-logs",
+        Spec {
+            action: "monitor.networkLogs",
+            positional: &[],
+        },
+    );
     // Phase 3f — Tier 2 (login automation). `secret-put` is handled outside
     // this table (custom branch in run()) because it must keep plaintext
     // off argv via --from-env/--from-file/--stdin.
-    m.insert("wait-network-idle", Spec { action: "wait.networkIdle", positional: &[] });
-    m.insert("secret-list", Spec { action: "secrets.list", positional: &[] });
-    m.insert("secret-delete", Spec { action: "secrets.delete", positional: &["id"] });
-    m.insert("type-secret", Spec { action: "interaction.typeSecret", positional: &["selector"] });
+    m.insert(
+        "wait-network-idle",
+        Spec {
+            action: "wait.networkIdle",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "secret-list",
+        Spec {
+            action: "secrets.list",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "secret-delete",
+        Spec {
+            action: "secrets.delete",
+            positional: &["id"],
+        },
+    );
+    m.insert(
+        "type-secret",
+        Spec {
+            action: "interaction.typeSecret",
+            positional: &["selector"],
+        },
+    );
     m
 });
 
@@ -113,20 +341,26 @@ fn camel(kebab: &str) -> String {
 /// (with a `.`) fall through to f64 (matches TS Number wire shape, since
 /// integer JSON tokens have no decimal point either).
 fn coerce(value: &str) -> Value {
-    if value == "true" { return Value::Bool(true); }
-    if value == "false" { return Value::Bool(false); }
-    if value == "null" { return Value::Null; }
+    if value == "true" {
+        return Value::Bool(true);
+    }
+    if value == "false" {
+        return Value::Bool(false);
+    }
+    if value == "null" {
+        return Value::Null;
+    }
     static NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^-?\d+(\.\d+)?$").unwrap());
     if NUM_RE.is_match(value) {
-        if !value.contains('.') {
-            if let Ok(n) = value.parse::<i64>() {
-                return Value::Number(serde_json::Number::from(n));
-            }
+        if !value.contains('.')
+            && let Ok(n) = value.parse::<i64>()
+        {
+            return Value::Number(serde_json::Number::from(n));
         }
-        if let Ok(n) = value.parse::<f64>() {
-            if let Some(num) = serde_json::Number::from_f64(n) {
-                return Value::Number(num);
-            }
+        if let Ok(n) = value.parse::<f64>()
+            && let Some(num) = serde_json::Number::from_f64(n)
+        {
+            return Value::Number(num);
         }
     }
     Value::String(value.to_string())
@@ -182,7 +416,10 @@ fn parse_args(argv: &[String]) -> ParsedArgs {
 /// Returns the exit code (0 success, 1 error). Side-effect: writes to stdout/
 /// stderr and (on `--out`) to the file path.
 async fn render_result(resp: &Value, parsed: &ParsedArgs) -> Result<i32> {
-    let success = resp.get("success").and_then(Value::as_bool).unwrap_or(false);
+    let success = resp
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let data = resp.get("data");
     let error = resp.get("error").and_then(Value::as_str);
 
@@ -212,15 +449,12 @@ async fn render_result(resp: &Value, parsed: &ParsedArgs) -> Result<i32> {
                             .ok()
                     })
             }
-            Some(Value::Object(o)) => o
-                .get("base64")
-                .and_then(Value::as_str)
-                .and_then(|b64| {
-                    general_purpose::STANDARD
-                        .decode(b64)
-                        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(b64))
-                        .ok()
-                }),
+            Some(Value::Object(o)) => o.get("base64").and_then(Value::as_str).and_then(|b64| {
+                general_purpose::STANDARD
+                    .decode(b64)
+                    .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(b64))
+                    .ok()
+            }),
             _ => None,
         };
         let Some(bytes) = bytes else {
@@ -331,7 +565,10 @@ async fn ensure_daemon(base_dir: Option<&str>) -> Result<daemon::DaemonPaths> {
 /// `args[0]` is the subcommand name (e.g. "navigate"), `args[1..]` are its
 /// arguments. Returns the process exit code.
 pub async fn run(args: Vec<OsString>) -> Result<i32> {
-    let argv: Vec<String> = args.iter().map(|os| os.to_string_lossy().into_owned()).collect();
+    let argv: Vec<String> = args
+        .iter()
+        .map(|os| os.to_string_lossy().into_owned())
+        .collect();
     let Some(name) = argv.first() else {
         bail!("missing subcommand");
     };
@@ -384,18 +621,46 @@ async fn run_secret_put(args: &[String]) -> Result<i32> {
     // the next flag as its value. Mirrors the TS `secret-put` CLI handler.
     let normalized: Vec<String> = args
         .iter()
-        .map(|a| if a == "--stdin" { "--stdin=true".to_string() } else { a.clone() })
+        .map(|a| {
+            if a == "--stdin" {
+                "--stdin=true".to_string()
+            } else {
+                a.clone()
+            }
+        })
         .collect();
     let parsed = parse_args(&normalized);
-    let label = parsed.options.get("label").and_then(Value::as_str).map(str::to_owned);
-    let from_env = parsed.options.get("fromEnv").and_then(Value::as_str).map(str::to_owned);
-    let from_file = parsed.options.get("fromFile").and_then(Value::as_str).map(str::to_owned);
-    let from_stdin = parsed.options.get("stdin").and_then(Value::as_bool).unwrap_or(false);
+    let label = parsed
+        .options
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let from_env = parsed
+        .options
+        .get("fromEnv")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let from_file = parsed
+        .options
+        .get("fromFile")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let from_stdin = parsed
+        .options
+        .get("stdin")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let mut picked = 0;
-    if from_env.is_some() { picked += 1; }
-    if from_file.is_some() { picked += 1; }
-    if from_stdin { picked += 1; }
+    if from_env.is_some() {
+        picked += 1;
+    }
+    if from_file.is_some() {
+        picked += 1;
+    }
+    if from_stdin {
+        picked += 1;
+    }
     if picked == 0 {
         eprintln!("secret-put: provide --from-env VAR, --from-file PATH, or --stdin");
         return Ok(2);
@@ -414,8 +679,7 @@ async fn run_secret_put(args: &[String]) -> Result<i32> {
             }
         }
     } else if let Some(path) = from_file {
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {path}"))?;
+        let raw = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
         raw.trim_end_matches(['\r', '\n']).to_string()
     } else {
         let mut buf = String::new();
@@ -476,7 +740,7 @@ mod tests {
         // params. Floats keep their decimal precision via f64.
         assert_eq!(coerce("42"), json!(42));
         assert_eq!(coerce("-7"), json!(-7));
-        assert_eq!(coerce("3.14"), json!(3.14));
+        assert_eq!(coerce("1.5"), json!(1.5));
         // Sanity: integer token serializes without a decimal point.
         assert_eq!(serde_json::to_string(&coerce("42")).unwrap(), "42");
     }
@@ -594,20 +858,53 @@ mod tests {
         // `secret-put` is a custom branch outside DISPATCH so the table
         // length excludes it.
         let tier_1 = [
-            "navigate", "eval", "get-text", "get-html", "query", "screenshot",
-            "click", "type", "wait-selector", "wait-url",
-            "cookies-get", "cookies-set", "cookies-delete",
-            "storage-get", "storage-set", "storage-clear",
+            "navigate",
+            "eval",
+            "get-text",
+            "get-html",
+            "query",
+            "screenshot",
+            "click",
+            "type",
+            "wait-selector",
+            "wait-url",
+            "cookies-get",
+            "cookies-set",
+            "cookies-delete",
+            "storage-get",
+            "storage-set",
+            "storage-clear",
         ];
         let tier_3 = [
-            "open-tab", "close-tab", "list-tabs", "activate-tab",
-            "back", "forward", "reload",
+            "open-tab",
+            "close-tab",
+            "list-tabs",
+            "activate-tab",
+            "back",
+            "forward",
+            "reload",
         ];
         let tier_4 = [
-            "hover", "mouse-move", "scroll", "press-key", "select-option", "check",
+            "hover",
+            "mouse-move",
+            "scroll",
+            "press-key",
+            "select-option",
+            "check",
         ];
-        let tier_5 = ["console-logs", "page-errors", "metrics", "summary", "network-logs"];
-        let tier_2 = ["wait-network-idle", "secret-list", "secret-delete", "type-secret"];
+        let tier_5 = [
+            "console-logs",
+            "page-errors",
+            "metrics",
+            "summary",
+            "network-logs",
+        ];
+        let tier_2 = [
+            "wait-network-idle",
+            "secret-list",
+            "secret-delete",
+            "type-secret",
+        ];
         for name in tier_1
             .iter()
             .chain(tier_3.iter())

@@ -6,6 +6,10 @@ use super::get_text::build_text_body;
 use super::page;
 use crate::cdp::CdpClient;
 
+// TARGET flags (selector/testid/role/name) + raw/limit/timeout are passed
+// positionally to mirror the CLI arg surface; grouping them into a shared
+// struct is tracked as a follow-up cleanup.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     url: &str,
     selector: Option<&str>,
@@ -139,10 +143,7 @@ mod tests {
         let err = validate_target_flags_strict(None, None, None, None).unwrap_err();
         // Message is neutral so both query-all and find-all use the same validator
         // without leaking the wrong command name.
-        assert_eq!(
-            err.to_string(),
-            "requires --selector, --testid, or --role"
-        );
+        assert_eq!(err.to_string(), "requires --selector, --testid, or --role");
     }
 
     #[test]
@@ -167,29 +168,25 @@ mod tests {
 
     #[test]
     fn strict_selector_plus_testid_rejected() {
-        let err =
-            validate_target_flags_strict(Some("li"), Some("x"), None, None).unwrap_err();
+        let err = validate_target_flags_strict(Some("li"), Some("x"), None, None).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
     }
 
     #[test]
     fn strict_selector_plus_role_rejected() {
-        let err =
-            validate_target_flags_strict(Some("li"), None, Some("button"), None).unwrap_err();
+        let err = validate_target_flags_strict(Some("li"), None, Some("button"), None).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
     }
 
     #[test]
     fn strict_testid_plus_role_rejected() {
-        let err =
-            validate_target_flags_strict(None, Some("x"), Some("button"), None).unwrap_err();
+        let err = validate_target_flags_strict(None, Some("x"), Some("button"), None).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
     }
 
     #[test]
     fn strict_name_without_role_rejected() {
-        let err =
-            validate_target_flags_strict(Some("li"), None, None, Some("Click")).unwrap_err();
+        let err = validate_target_flags_strict(Some("li"), None, None, Some("Click")).unwrap_err();
         assert!(
             err.to_string().contains("--name requires --role"),
             "got: {err}"
@@ -199,7 +196,7 @@ mod tests {
     // -- build_els_expr --
 
     #[test]
-    fn els_selector_uses_querySelectorAll() {
+    fn els_selector_uses_query_selector_all() {
         let e = build_els_expr(Some("li.foo"), None).unwrap();
         assert_eq!(e, r#"document.querySelectorAll("li.foo")"#);
     }

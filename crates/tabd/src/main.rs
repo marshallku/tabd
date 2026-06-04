@@ -37,7 +37,11 @@ enum DaemonCmd {
 }
 
 #[derive(Parser)]
-#[command(name = "tabd", version, about = "Rust + Chromium CDP browser controller")]
+#[command(
+    name = "tabd",
+    version,
+    about = "Rust + Chromium CDP browser controller"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -129,12 +133,9 @@ fn run_skill_cmd(cmd: SkillCmd) -> Result<()> {
             path,
             force,
         } => {
-            let plan =
-                skill::build_plan(target.as_deref(), no_claude, no_codex, path.as_deref())?;
+            let plan = skill::build_plan(target.as_deref(), no_claude, no_codex, path.as_deref())?;
             skill::install(&plan, force)?;
-            eprintln!(
-                "Restart Claude Code or Codex CLI so the skill metadata is picked up."
-            );
+            eprintln!("Restart Claude Code or Codex CLI so the skill metadata is picked up.");
             Ok(())
         }
     }
@@ -155,7 +156,10 @@ async fn print_control(base_dir: Option<&str>, action: &str) -> Result<()> {
     // Unwrap the bridge envelope: emit only the `data` payload (or the error
     // text on failure) so the CLI output looks like a plain JSON response,
     // not an `{id, success, data}` wrapper.
-    let success = resp.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let success = resp
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     if !success {
         let err = resp
             .get("error")

@@ -349,8 +349,7 @@ async fn handle_get_text(state: &DaemonState, params: &Value) -> Result<Option<V
         .ok_or_else(|| "cdp client not initialized".to_string())?;
 
     let body = crate::cmd::get_text::build_text_body(raw);
-    let sel_lit =
-        serde_json::to_string(&selector).map_err(|e| format!("selector encode: {e}"))?;
+    let sel_lit = serde_json::to_string(&selector).map_err(|e| format!("selector encode: {e}"))?;
     let expr = format!(
         "(() => {{ const target = document.querySelector({sel_lit}) ?? document.body; {body} }})()"
     );
@@ -399,7 +398,7 @@ fn read_process_rss_bytes(pid: u32) -> u64 {
 
 // -- Phase 2b: interaction + wait helpers ----------------------------------
 
-fn require_string<'a>(params: &'a Value, key: &str) -> Result<String, String> {
+fn require_string(params: &Value, key: &str) -> Result<String, String> {
     params
         .get(key)
         .and_then(Value::as_str)
@@ -408,10 +407,7 @@ fn require_string<'a>(params: &'a Value, key: &str) -> Result<String, String> {
 }
 
 fn optional_u64(params: &Value, key: &str, default: u64) -> u64 {
-    params
-        .get(key)
-        .and_then(Value::as_u64)
-        .unwrap_or(default)
+    params.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
 async fn client_or_err(state: &DaemonState) -> Result<Arc<CdpClient>, String> {
@@ -444,9 +440,9 @@ async fn wait_for_selector_visible(
     );
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        match crate::cmd::eval::evaluate_value(client, &probe).await {
-            Ok(Some(Value::Bool(true))) => return Ok(()),
-            _ => {}
+        if let Ok(Some(Value::Bool(true))) = crate::cmd::eval::evaluate_value(client, &probe).await
+        {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -457,23 +453,23 @@ async fn wait_for_selector_visible(
     }
 }
 
+/// Predicate that tests whether a URL string matches a compiled pattern.
+type UrlMatcher = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Compile a URL matcher from (pattern, patternType). Mirrors TS's
 /// src/shared/urlMatch.ts behavior:
 ///   - exact: u == pattern
 ///   - glob: pattern with `*` becoming `.*`, anchored, other special chars escaped
 ///   - regex: pattern compiled directly
-fn compile_url_matcher(
-    pattern: &str,
-    pattern_type: &str,
-) -> Result<Box<dyn Fn(&str) -> bool + Send + Sync>, String> {
+fn compile_url_matcher(pattern: &str, pattern_type: &str) -> Result<UrlMatcher, String> {
     match pattern_type {
         "exact" => {
             let p = pattern.to_owned();
             Ok(Box::new(move |u: &str| u == p))
         }
         "regex" => {
-            let re = regex::Regex::new(pattern)
-                .map_err(|e| format!("invalid regex pattern: {e}"))?;
+            let re =
+                regex::Regex::new(pattern).map_err(|e| format!("invalid regex pattern: {e}"))?;
             Ok(Box::new(move |u: &str| re.is_match(u)))
         }
         "glob" => {
@@ -568,14 +564,8 @@ async fn handle_get_html(state: &DaemonState, params: &Value) -> Result<Option<V
         .and_then(Value::as_str)
         .unwrap_or("body")
         .to_owned();
-    let outer = params
-        .get("outer")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let clean = params
-        .get("clean")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let outer = params.get("outer").and_then(Value::as_bool).unwrap_or(true);
+    let clean = params.get("clean").and_then(Value::as_bool).unwrap_or(true);
     let client = client_or_err(state).await?;
     let sel_lit = serde_json::to_string(&selector).unwrap();
     let outer_lit = serde_json::to_string(&outer).unwrap();
@@ -707,7 +697,10 @@ async fn handle_cookies_set(state: &DaemonState, params: &Value) -> Result<Optio
         Ok(Err(e)) => return Err(e.to_string()),
         Err(_) => return Err("Network.setCookie timed out after 5s".to_string()),
     };
-    let success = resp.get("success").and_then(Value::as_bool).unwrap_or(false);
+    let success = resp
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if !success {
         return Err(format!("CDP rejected the cookie: {resp}"));
     }
@@ -791,7 +784,10 @@ async fn handle_storage_set(state: &DaemonState, params: &Value) -> Result<Optio
         .map_err(|e| e.to_string())
 }
 
-async fn handle_storage_clear(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+async fn handle_storage_clear(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
     let storage_type = if params.get("type").and_then(Value::as_str) == Some("session") {
         "sessionStorage"
     } else {
@@ -838,10 +834,7 @@ async fn handle_wait_url(state: &DaemonState, params: &Value) -> Result<Option<V
 /// `resolveTargetId` in `src/server/runtimes/cdp.ts:1948` — when no tabId is
 /// passed, prefer the active tab; otherwise fall back to the first listed.
 /// Error strings are byte-exact with TS so `spike-daemon-compat` checks pass.
-async fn resolve_target_id(
-    client: &Arc<CdpClient>,
-    tab_id: Option<u32>,
-) -> Result<String, String> {
+async fn resolve_target_id(client: &Arc<CdpClient>, tab_id: Option<u32>) -> Result<String, String> {
     let tabs = client.list_tabs().await.map_err(|e| e.to_string())?;
     match tab_id {
         Some(n) => {
@@ -923,7 +916,10 @@ async fn handle_tabs_close(state: &DaemonState, params: &Value) -> Result<Option
     Ok(Some(Value::Null))
 }
 
-async fn handle_tabs_activate(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+async fn handle_tabs_activate(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
     let tab_id = require_tab_id(params)?;
     let client = client_or_err(state).await?;
     let tid = resolve_target_id(&client, Some(tab_id)).await?;
@@ -1189,7 +1185,10 @@ async fn handle_press_key(state: &DaemonState, params: &Value) -> Result<Option<
     Ok(Some(Value::Null))
 }
 
-async fn handle_select_option(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
+async fn handle_select_option(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
     let selector = require_string(params, "selector")?;
     let client = client_or_err(state).await?;
     wait_for_selector_visible(&client, &selector, 30_000).await?;
@@ -1275,10 +1274,7 @@ async fn handle_console_logs(state: &DaemonState, params: &Value) -> Result<Opti
         .get("level")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let limit = params
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(100) as usize;
+    let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
     let client = client_or_err(state).await?;
     let tid = resolve_target_id(&client, tab_id).await?;
 
@@ -1309,10 +1305,7 @@ async fn handle_page_errors(state: &DaemonState, params: &Value) -> Result<Optio
         .get("tabId")
         .and_then(Value::as_u64)
         .map(|n| n as u32);
-    let limit = params
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(50) as usize;
+    let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
     let client = client_or_err(state).await?;
     let tid = resolve_target_id(&client, tab_id).await?;
 
@@ -1388,10 +1381,7 @@ async fn handle_content_summary(
         .get("maxHeadings")
         .and_then(Value::as_u64)
         .unwrap_or(20);
-    let max_links = params
-        .get("maxLinks")
-        .and_then(Value::as_u64)
-        .unwrap_or(20);
+    let max_links = params.get("maxLinks").and_then(Value::as_u64).unwrap_or(20);
     let max_text_length = params
         .get("maxTextLength")
         .and_then(Value::as_u64)
@@ -1553,7 +1543,9 @@ async fn handle_secrets_put(state: &DaemonState, params: &Value) -> Result<Optio
         .and_then(Value::as_str)
         .map(str::to_owned);
     let mut guard = vault_or_err(state).await?;
-    let store = guard.as_mut().ok_or_else(|| "vault not initialized".to_string())?;
+    let store = guard
+        .as_mut()
+        .ok_or_else(|| "vault not initialized".to_string())?;
     let resp = store
         .put(&value, label.as_deref())
         .map_err(|e| e.to_string())?;
@@ -1561,9 +1553,14 @@ async fn handle_secrets_put(state: &DaemonState, params: &Value) -> Result<Optio
     Ok(Some(json))
 }
 
-async fn handle_secrets_list(state: &DaemonState, _params: &Value) -> Result<Option<Value>, String> {
+async fn handle_secrets_list(
+    state: &DaemonState,
+    _params: &Value,
+) -> Result<Option<Value>, String> {
     let guard = vault_or_err(state).await?;
-    let store = guard.as_ref().ok_or_else(|| "vault not initialized".to_string())?;
+    let store = guard
+        .as_ref()
+        .ok_or_else(|| "vault not initialized".to_string())?;
     let list = store.list();
     let json = serde_json::to_value(list).map_err(|e| e.to_string())?;
     Ok(Some(json))
@@ -1580,7 +1577,9 @@ async fn handle_secrets_delete(
         .ok_or_else(|| "id is required".to_string())?
         .to_owned();
     let mut guard = vault_or_err(state).await?;
-    let store = guard.as_mut().ok_or_else(|| "vault not initialized".to_string())?;
+    let store = guard
+        .as_mut()
+        .ok_or_else(|| "vault not initialized".to_string())?;
     store.delete(&id).map_err(|e| e.to_string())?;
     Ok(Some(Value::Null))
 }
@@ -1596,14 +1595,13 @@ async fn handle_type_secret(state: &DaemonState, params: &Value) -> Result<Optio
         .and_then(Value::as_str)
         .ok_or_else(|| "secretId is required".to_string())?
         .to_owned();
-    let clear = params
-        .get("clear")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let clear = params.get("clear").and_then(Value::as_bool).unwrap_or(true);
 
     let plaintext = {
         let guard = vault_or_err(state).await?;
-        let store = guard.as_ref().ok_or_else(|| "vault not initialized".to_string())?;
+        let store = guard
+            .as_ref()
+            .ok_or_else(|| "vault not initialized".to_string())?;
         store.get(&secret_id).map_err(|e| e.to_string())?
     };
 
@@ -1651,26 +1649,18 @@ async fn handle_type_secret(state: &DaemonState, params: &Value) -> Result<Optio
 
 // -- Phase 3e2: monitor.networkLogs (Network.* event stitching)
 
-async fn handle_network_logs(
-    state: &DaemonState,
-    params: &Value,
-) -> Result<Option<Value>, String> {
+async fn handle_network_logs(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
     let tab_id = params
         .get("tabId")
         .and_then(Value::as_u64)
         .map(|n| n as u32);
-    let limit = params
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(100) as usize;
+    let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
     let method_filter = params
         .get("method")
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase);
     let status_filter: Option<(Option<u16>, Option<u16>)> = match params.get("status") {
-        Some(Value::Number(n)) => {
-            n.as_u64().map(|v| (Some(v as u16), Some(v as u16)))
-        }
+        Some(Value::Number(n)) => n.as_u64().map(|v| (Some(v as u16), Some(v as u16))),
         Some(Value::String(s)) => {
             // "2xx" → (200, 299); fall through to None (no filter) on parse failure.
             if let Some(first) = s.chars().next().and_then(|c| c.to_digit(10)) {
@@ -1705,10 +1695,7 @@ async fn handle_network_logs(
             None => true,
         })
         .filter(|e| match status_filter {
-            Some((Some(lo), Some(hi))) => e
-                .status
-                .map(|s| s >= lo && s <= hi)
-                .unwrap_or(false),
+            Some((Some(lo), Some(hi))) => e.status.map(|s| s >= lo && s <= hi).unwrap_or(false),
             _ => true,
         })
         .filter(|e| match &url_pattern_re {
@@ -1780,7 +1767,9 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "tabs.close" => handle_tabs_close(state, &req.params).await,
         "tabs.activate" => handle_tabs_activate(state, &req.params).await,
         "tabs.goBack" => handle_tabs_history(state, &req.params, "history.back(); null;").await,
-        "tabs.goForward" => handle_tabs_history(state, &req.params, "history.forward(); null;").await,
+        "tabs.goForward" => {
+            handle_tabs_history(state, &req.params, "history.forward(); null;").await
+        }
         "tabs.reload" => handle_tabs_reload(state, &req.params).await,
         "interaction.hover" => handle_hover(state, &req.params).await,
         "interaction.mouseMove" => handle_mouse_move(state, &req.params).await,
@@ -1884,9 +1873,7 @@ fn pid_alive(pid_path: &Path) -> bool {
         if r == 0 {
             return true;
         }
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(0);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         errno == libc::EPERM
     }
     #[cfg(not(unix))]
@@ -1897,7 +1884,11 @@ fn pid_alive(pid_path: &Path) -> bool {
 }
 
 async fn probe_socket_alive(socket_path: &Path) -> bool {
-    match tokio::time::timeout(Duration::from_millis(1500), UnixStream::connect(socket_path)).await
+    match tokio::time::timeout(
+        Duration::from_millis(1500),
+        UnixStream::connect(socket_path),
+    )
+    .await
     {
         Ok(Ok(_)) => true,
         Ok(Err(_)) => false,
@@ -2040,7 +2031,9 @@ async fn supervise(state: DaemonState, paths: DaemonPaths) {
             let guard = state.browser.lock().await;
             guard.as_ref().and_then(|b| b.pid())
         };
-        let Some(pid) = pid else { continue; };
+        let Some(pid) = pid else {
+            continue;
+        };
         if chromium_alive(pid) {
             continue;
         }
@@ -2105,8 +2098,7 @@ mod tests {
 
     #[test]
     fn parse_request_basic() {
-        let req: Request =
-            serde_json::from_str(r#"{"id":"x","action":"daemon.ping"}"#).unwrap();
+        let req: Request = serde_json::from_str(r#"{"id":"x","action":"daemon.ping"}"#).unwrap();
         assert_eq!(req.id, "x");
         assert_eq!(req.action, "daemon.ping");
         assert!(req.params.is_null());

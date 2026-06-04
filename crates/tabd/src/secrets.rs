@@ -157,7 +157,9 @@ impl VaultStore {
             auth_tag: general_purpose::STANDARD.encode(auth_tag),
             ciphertext: general_purpose::STANDARD.encode(ciphertext),
         };
-        self.envelope.records.insert(secret_id.clone(), record.clone());
+        self.envelope
+            .records
+            .insert(secret_id.clone(), record.clone());
         self.persist()?;
 
         Ok(PutResponse {
@@ -332,10 +334,7 @@ mod tests {
         store.put("v", None).unwrap();
         drop(store);
         let err = VaultStore::open_or_create_at(path, "wrong").err().unwrap();
-        assert!(
-            err.to_string().contains("invalid passphrase"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("invalid passphrase"), "got: {err}");
     }
 
     #[test]

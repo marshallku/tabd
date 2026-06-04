@@ -24,7 +24,9 @@ pub(super) async fn traverse_visible_nodes(
 ) -> Result<Vec<Value>> {
     client.send("Accessibility.enable", json!({})).await?;
 
-    let doc = client.send("DOM.getDocument", json!({ "depth": 0 })).await?;
+    let doc = client
+        .send("DOM.getDocument", json!({ "depth": 0 }))
+        .await?;
     let root_node_id = doc
         .get("root")
         .and_then(|r| r.get("nodeId"))

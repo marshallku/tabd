@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Newer pushes to the same ref cancel in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  MANIFEST: crates/tabd/Cargo.toml
+
+jobs:
+  lint-test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/tabd
+
+      - name: rustfmt
+        run: cargo fmt --manifest-path "$MANIFEST" --all --check
+
+      - name: clippy
+        run: cargo clippy --manifest-path "$MANIFEST" --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --manifest-path "$MANIFEST"
+
+  smoke:
+    name: e2e smoke (chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/tabd
+
+      - name: Install Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Build release binary
+        run: cargo build --release --manifest-path "$MANIFEST"
+
+      - name: Run CLI direct smoke
+        env:
+          BROWSER_EXECUTABLE: ${{ steps.chrome.outputs.chrome-path }}
+        run: bash tests/cli-direct-smoke.sh
