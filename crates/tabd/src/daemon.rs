@@ -410,6 +410,17 @@ fn optional_u64(params: &Value, key: &str, default: u64) -> u64 {
     params.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
+/// Upper bound on a user-supplied `timeout` for any polling wait. Driver actions
+/// hold a global action lock for their whole duration, so an unclamped wait lets
+/// one request pin the daemon against every other client. 5 minutes is generous
+/// for legitimate waits while bounding the worst case.
+const MAX_WAIT_MS: u64 = 300_000;
+
+/// Read a user-supplied `timeout` (ms) for a wait, clamped to [`MAX_WAIT_MS`].
+fn clamped_wait_ms(params: &Value, default: u64) -> u64 {
+    optional_u64(params, "timeout", default).min(MAX_WAIT_MS)
+}
+
 async fn client_or_err(state: &DaemonState) -> Result<Arc<CdpClient>, String> {
     state
         .client
@@ -499,7 +510,7 @@ fn compile_url_matcher(pattern: &str, pattern_type: &str) -> Result<UrlMatcher, 
 
 async fn handle_click(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
     let selector = require_string(params, "selector")?;
-    let timeout_ms = optional_u64(params, "timeout", 30_000);
+    let timeout_ms = clamped_wait_ms(params, 30_000);
     let client = client_or_err(state).await?;
     wait_for_selector_visible(&client, &selector, timeout_ms).await?;
     let sel_lit = serde_json::to_string(&selector).unwrap();
@@ -519,7 +530,7 @@ async fn handle_click(state: &DaemonState, params: &Value) -> Result<Option<Valu
 async fn handle_type(state: &DaemonState, params: &Value) -> Result<Option<Value>, String> {
     let selector = require_string(params, "selector")?;
     let text = require_string(params, "text")?;
-    let timeout_ms = optional_u64(params, "timeout", 30_000);
+    let timeout_ms = clamped_wait_ms(params, 30_000);
     let client = client_or_err(state).await?;
     wait_for_selector_visible(&client, &selector, timeout_ms).await?;
     let sel_lit = serde_json::to_string(&selector).unwrap();
@@ -548,7 +559,7 @@ async fn handle_wait_selector(
     params: &Value,
 ) -> Result<Option<Value>, String> {
     let selector = require_string(params, "selector")?;
-    let timeout_ms = optional_u64(params, "timeout", 30_000);
+    let timeout_ms = clamped_wait_ms(params, 30_000);
     let client = client_or_err(state).await?;
     wait_for_selector_visible(&client, &selector, timeout_ms).await?;
     Ok(Some(json!({ "found": true })))
@@ -808,7 +819,7 @@ async fn handle_wait_url(state: &DaemonState, params: &Value) -> Result<Option<V
         .and_then(Value::as_str)
         .unwrap_or("exact")
         .to_owned();
-    let timeout_ms = optional_u64(params, "timeout", 30_000);
+    let timeout_ms = clamped_wait_ms(params, 30_000);
     let client = client_or_err(state).await?;
     let matcher = compile_url_matcher(&pattern, &pattern_type)?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -1486,10 +1497,7 @@ async fn handle_wait_network_idle(
         .get("tabId")
         .and_then(Value::as_u64)
         .map(|n| n as u32);
-    let timeout_ms = params
-        .get("timeout")
-        .and_then(Value::as_u64)
-        .unwrap_or(10_000);
+    let timeout_ms = clamped_wait_ms(params, 10_000);
     let idle_ms = params
         .get("idleTime")
         .and_then(Value::as_u64)

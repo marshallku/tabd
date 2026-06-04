@@ -207,10 +207,39 @@ pub enum ResolvedTarget {
 ///
 /// `close(&self)` is idempotent — it best-effort detaches every attached
 /// session, then drops the writer mpsc so background tasks exit naturally.
+/// Backstop timeout for a single CDP RPC. Every method call funnels through
+/// `dispatch`, so this bounds how long a wedged Chromium (crash mid-flight,
+/// an infinite-loop `Runtime.evaluate`, a hung renderer) can stall the caller.
+/// The daemon holds a global action lock per request, so an unbounded RPC would
+/// otherwise block every other client forever. 30s is generous for any real
+/// single round-trip; it does cap a deliberately long `awaitPromise` evaluate.
+const RPC_TIMEOUT_MS: u64 = 30_000;
+
+/// In-flight CDP requests, keyed by frame id. A `std::sync::Mutex` (not tokio)
+/// so a `PendingGuard` can clean up synchronously from `Drop` — the lock is
+/// never held across an `.await`.
+type PendingMap = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+
+/// Removes a pending entry on drop, so a `dispatch` future that is cancelled
+/// (e.g. an outer `tokio::time::timeout` fires before the reply) or times out
+/// internally never leaks its slot in the pending map.
+struct PendingGuard {
+    pending: PendingMap,
+    id: u64,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.pending.lock() {
+            map.remove(&self.id);
+        }
+    }
+}
+
 pub struct CdpClient {
     next_id: AtomicU64,
     out_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    pending: PendingMap,
     // Arc so the reader task can clone-and-move it for event routing.
     registry: Arc<Mutex<TabRegistry>>,
 }
@@ -308,8 +337,7 @@ impl CdpClient {
             .with_context(|| format!("ws connect: {ws_url}"))?;
         let (mut sink, mut stream) = ws.split();
 
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let pending_for_reader = pending.clone();
         let registry: Arc<Mutex<TabRegistry>> = Arc::new(Mutex::new(TabRegistry::default()));
         let registry_for_reader = registry.clone();
@@ -334,7 +362,7 @@ impl CdpClient {
                     continue;
                 };
                 if let Some(id) = parsed.id {
-                    let mut map = pending_for_reader.lock().await;
+                    let mut map = pending_for_reader.lock().unwrap();
                     if let Some(tx) = map.remove(&id) {
                         let value = match parsed.error {
                             Some(err) => Err(anyhow!("cdp error: {err}")),
@@ -514,7 +542,7 @@ impl CdpClient {
                 }
             }
             // Stream closed → fail any still-pending requests so callers don't hang.
-            let mut map = pending_for_reader.lock().await;
+            let mut map = pending_for_reader.lock().unwrap();
             for (_, tx) in map.drain() {
                 let _ = tx.send(Err(anyhow!("cdp websocket closed")));
             }
@@ -600,25 +628,34 @@ impl CdpClient {
         let text = build_frame(id, method, params, session_id.as_deref())?;
 
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        self.pending.lock().unwrap().insert(id, tx);
+        // From here, `_pending` removes the entry on every exit path — early
+        // return, internal timeout, or the future being dropped by an outer
+        // `tokio::time::timeout`. The reader removes it first on a normal reply;
+        // a second remove is a harmless no-op.
+        let _pending = PendingGuard {
+            pending: self.pending.clone(),
+            id,
+        };
 
         let send_result = {
             let guard = self.out_tx.lock().await;
             match guard.as_ref() {
                 Some(sender) => sender.send(text),
-                None => {
-                    drop(guard);
-                    self.pending.lock().await.remove(&id);
-                    return Err(anyhow!("cdp writer task closed"));
-                }
+                None => return Err(anyhow!("cdp writer task closed")),
             }
         };
         if let Err(err) = send_result {
-            self.pending.lock().await.remove(&id);
             return Err(anyhow::Error::new(err).context("cdp writer task closed"));
         }
 
-        rx.await.map_err(|_| anyhow!("cdp pending reply dropped"))?
+        match tokio::time::timeout(Duration::from_millis(RPC_TIMEOUT_MS), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow!("cdp pending reply dropped")),
+            Err(_) => Err(anyhow!(
+                "cdp rpc '{method}' timed out after {RPC_TIMEOUT_MS}ms"
+            )),
+        }
     }
 
     /// Create a new page target, attach (flatten), enable domains, register
@@ -858,6 +895,24 @@ fn build_frame(id: u64, method: &str, params: Value, session_id: Option<&str>) -
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pending_guard_removes_entry_on_drop() {
+        let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel::<Result<Value>>();
+        pending.lock().unwrap().insert(7, tx);
+        {
+            let _guard = PendingGuard {
+                pending: pending.clone(),
+                id: 7,
+            };
+            assert!(pending.lock().unwrap().contains_key(&7));
+        }
+        // Guard dropped → entry gone, so a cancelled/timed-out dispatch can't leak.
+        assert!(!pending.lock().unwrap().contains_key(&7));
+        // A second remove (e.g. reader already handled the reply) is a no-op.
+        assert!(pending.lock().unwrap().remove(&7).is_none());
+    }
 
     fn registry_with(active: Option<&str>, entries: &[(&str, &str)]) -> TabRegistry {
         let mut reg = TabRegistry::default();
