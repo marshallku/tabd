@@ -583,6 +583,12 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         }
     };
     state.wait_ready().await;
+    // Held for the entire handler, including polling sleeps inside waits. This is
+    // a deliberate choice for linear, predictable action semantics (no action
+    // interleaving into a tab another is mid-wait on); the long-wait worst case
+    // is bounded by MAX_WAIT_MS + the per-RPC timeout, and the daemon is
+    // single-user behind a 0700 dir / 0600 socket. See docs/architecture.md
+    // "Concurrency model" for the rejected per-tab-lock alternative.
     let _action_lock = state.action_mutex.lock().await;
 
     let result = match req.action.as_str() {

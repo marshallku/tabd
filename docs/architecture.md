@@ -40,11 +40,12 @@ shell → tabd CLI ──┘                                 │
 |---|---|
 | `crates/tabd/src/main.rs` | `clap` router. `daemon ...` subcommand + external-subcommand catch-all → `cli::run`. |
 | `crates/tabd/src/cli.rs` | argv parser, dispatch table (38 actions + `secret-put` custom branch), daemon auto-spawn, render. |
-| `crates/tabd/src/daemon.rs` | UDS server, all action handlers, supervisor, vault state. |
+| `crates/tabd/src/daemon.rs` | UDS server, shared state/helpers, request dispatch, supervisor, vault state. |
+| `crates/tabd/src/daemon/` | Action handlers grouped by domain (`dom`, `interaction`, `tabs`, `storage`, `capture`, `monitor`, `waits`, `secrets`). |
 | `crates/tabd/src/cdp.rs` | JSON-RPC over WS, multi-tab `TabRegistry`, reader task with event routing. |
 | `crates/tabd/src/browser.rs` | Chromium discovery + launch with random debug port. |
 | `crates/tabd/src/secrets.rs` | AES-256-GCM + PBKDF2-SHA256 file vault. |
-| `crates/tabd/src/cmd/` | Helper expressions injected into the page (text extraction, AX traversal, find-all, get-text, etc.). |
+| `crates/tabd/src/cmd/` | Page-injected helper expressions reused by the daemon (`eval`, `page` navigate, `get_text` body). |
 
 ## Key design decisions
 
@@ -129,6 +130,19 @@ daemon doesn't sit forever holding a corpse. On crash:
   not concurrent on the same Chromium because most CDP calls modify shared
   state (active tab, network log, console buffers). The mutex is fine-grained
   enough that `daemon.health` / `daemon.ping` skip it.
+  - **Held for the whole action, including the polling sleeps inside waits**
+    (`wait.selector` / `wait.url` / `wait.networkIdle`, and the implicit
+    visible-wait before `interaction.click` / `type`). This is deliberate: it
+    gives linear, predictable semantics — a `navigate`/`close` can't interleave
+    into a tab another action is mid-wait on. The cost is that a long wait
+    blocks every other client; that worst case is bounded by `MAX_WAIT_MS`
+    (5 min) and the per-RPC timeout, and the daemon is single-user behind a
+    `0700` dir / `0600` socket, so there is no untrusted client to starve.
+  - Releasing the lock during waits, or moving to per-tab locks for cross-tab
+    concurrency, was considered and rejected: it trades predictable
+    serialization for interleaving-correctness risk that isn't worth it for
+    this overwhelmingly-sequential single-user usage. Revisit if real
+    concurrent-multi-tab demand shows up.
 - **Registry mutex** is held only across the registry read/write itself,
   never across a CDP RPC. Long-held mutex would block the reader task from
   routing events into `TabState`.
