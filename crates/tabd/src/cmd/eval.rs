@@ -1,29 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::page;
 use crate::cdp::CdpClient;
-
-pub async fn run(url: &str, expr: &str, as_json: bool, timeout_ms: u64) -> Result<()> {
-    let (browser, client) = page::open(url, timeout_ms).await?;
-    let result = evaluate_value(&client, expr).await;
-    let _ = page::teardown(browser, client).await;
-    let value = result?;
-
-    if as_json {
-        let serialized = serde_json::to_string(&value.unwrap_or(Value::Null))?;
-        println!("{serialized}");
-    } else {
-        match value {
-            Some(Value::String(s)) => println!("{s}"),
-            Some(other) => println!("{}", serde_json::to_string(&other)?),
-            // Runtime.evaluate of `undefined` returns no `.result.value` —
-            // emit an empty line to keep CLI piping behaviour predictable.
-            None => println!(),
-        }
-    }
-    Ok(())
-}
 
 /// Run `Runtime.evaluate(expr, returnByValue: true)` on the attached session
 /// and return the inner `result.value` (or `None` when the expression evaluates

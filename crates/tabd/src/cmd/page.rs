@@ -3,40 +3,9 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-use crate::browser::Browser;
 use crate::cdp::CdpClient;
 
 const READY_POLL: Duration = Duration::from_millis(200);
-
-/// Launch chromium, attach CDP, navigate, and block until `document.readyState`
-/// is `interactive` or `complete`. Mirrors `waitForReadyState` in the TS
-/// `chromium-cdp` runtime (src/server/runtimes/cdp.ts:1914).
-///
-/// The brief race between Page.navigate's ack and the first readyState query
-/// is shared with the TS implementation and is acceptable in spike scope.
-pub async fn open(url: &str, timeout_ms: u64) -> Result<(Browser, CdpClient)> {
-    let browser = Browser::launch().await?;
-    let client = match CdpClient::connect(browser.ws_endpoint()).await {
-        Ok(c) => c,
-        Err(err) => {
-            // Browser launched but CDP attach failed → run the documented
-            // teardown explicitly rather than leaning on Drop+kill_on_drop.
-            let _ = browser.shutdown().await;
-            return Err(err);
-        }
-    };
-
-    match navigate_and_wait(&client, url, timeout_ms).await {
-        Ok(()) => Ok((browser, client)),
-        Err(err) => {
-            // Same here: teardown the well-formed handles so callers get a
-            // clean state even when navigation itself fails or times out.
-            let _ = client.close().await;
-            let _ = browser.shutdown().await;
-            Err(err)
-        }
-    }
-}
 
 /// Navigate using an already-connected CdpClient (no browser launch) and wait
 /// for readyState. Used by the daemon (one Chromium reused across requests).
@@ -80,9 +49,4 @@ async fn navigate_and_wait(client: &CdpClient, url: &str, timeout_ms: u64) -> Re
         }
         sleep(READY_POLL).await;
     }
-}
-
-pub async fn teardown(browser: Browser, client: CdpClient) -> Result<()> {
-    client.close().await?;
-    browser.shutdown().await
 }
