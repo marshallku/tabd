@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 description = "Rust + Chromium CDP browser controller (CLI + daemon)"
+license = "MIT"
+repository = "https://github.com/marshallku/tabd"
+homepage = "https://github.com/marshallku/tabd"
+keywords = ["browser", "chromium", "cdp", "automation", "cli"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
 
 [[bin]]
 name = "tabd"
