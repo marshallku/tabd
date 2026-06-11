@@ -65,7 +65,17 @@ HTML="$TMP/page.html"
 cat > "$HTML" <<'EOF'
 <!doctype html>
 <html><head><title>Direct</title></head>
-<body><h1>Direct Smoke</h1></body></html>
+<body>
+<h1>Direct Smoke</h1>
+<button id="alert-btn" onclick="alert('hello from dialog')">Alert</button>
+<script>
+  setTimeout(() => {
+    const div = document.createElement("div");
+    div.textContent = "Deferred Text";
+    document.body.appendChild(div);
+  }, 300);
+</script>
+</body></html>
 EOF
 
 # Case 1: navigate with no daemon running → dispatcher auto-spawns one.
@@ -148,6 +158,52 @@ if [[ "$DEAD_RC" == "3" && "$DEAD_OUT" == *'"errorCode":"daemon_unreachable"'* ]
   pass "daemon_unreachable → JSON envelope + exit 3"
 else
   fail "daemon_unreachable error contract" "rc=$DEAD_RC out=$DEAD_OUT"
+fi
+
+# Case 8: dialog auto-handling — a click that fires alert() must not wedge
+# (the reader auto-dismisses per the default policy) and must be recorded.
+set +e
+"$BIN" click '#alert-btn' --timeout 5000 >/dev/null 2>&1
+ALERT_RC=$?
+DIALOGS_OUT="$("$BIN" dialogs --json 2>/dev/null)"
+set -e
+if [[ "$ALERT_RC" == "0" && "$DIALOGS_OUT" == *'"dialogType":"alert"'* && "$DIALOGS_OUT" == *'"action":"dismiss"'* ]]; then
+  pass "alert() auto-dismissed without wedging click + recorded in dialogs"
+else
+  fail "dialog auto-handling" "rc=$ALERT_RC dialogs=$DIALOGS_OUT"
+fi
+
+# Case 9: wait-text — finds delayed text; absent text expires with exit 4.
+set +e
+WT_OUT="$("$BIN" wait-text 'Deferred Text' --timeout 5000 --json 2>/dev/null)"
+WT_RC=$?
+"$BIN" wait-text 'definitely-absent-string-xyz' --timeout 1200 >/dev/null 2>&1
+WT_MISS_RC=$?
+set -e
+if [[ "$WT_RC" == "0" && "$WT_OUT" == *'"found":true'* && "$WT_MISS_RC" == "4" ]]; then
+  pass "wait-text found + expiry exit 4"
+else
+  fail "wait-text contract" "hit rc=$WT_RC out=$WT_OUT; miss rc=$WT_MISS_RC"
+fi
+
+# Case 10: --max-chars clamp on get-html appends a visible truncation marker.
+CLAMP_OUT="$("$BIN" get-html --max-chars 50 --json 2>/dev/null || true)"
+if [[ "$CLAMP_OUT" == *'truncated: 50 of '* ]]; then
+  pass "get-html --max-chars truncation marker"
+else
+  fail "get-html clamp" "got: $CLAMP_OUT"
+fi
+
+# Case 11: oversized non-string eval result errors instead of emitting
+# truncated (corrupt) JSON.
+set +e
+BIG_OUT="$("$BIN" eval 'Array.from({length: 100000}, (_, i) => i)' --max-chars 1000 --json 2>/dev/null)"
+BIG_RC=$?
+set -e
+if [[ "$BIG_RC" == "1" && "$BIG_OUT" == *'"errorCode":"output_too_large"'* ]]; then
+  pass "oversized eval → exit 1 + output_too_large"
+else
+  fail "eval output clamp" "rc=$BIG_RC out=$BIG_OUT"
 fi
 
 echo "== summary =="

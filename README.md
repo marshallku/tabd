@@ -47,7 +47,7 @@ afterwards so it reloads skill metadata.
 
 ## Surface
 
-39 action subcommands + 4 daemon controls.
+42 action subcommands + 4 daemon controls.
 
 | Category | Commands |
 |---|---|
@@ -56,10 +56,11 @@ afterwards so it reloads skill metadata.
 | **Interaction** | `click`, `type`, `hover`, `mouse-move`, `scroll`, `press-key`, `select-option`, `check` |
 | **Capture** | `screenshot`, `metrics` |
 | **Execution** | `eval` |
-| **Wait** | `wait-selector`, `wait-url`, `wait-network-idle` |
+| **Wait** | `wait-selector`, `wait-url`, `wait-text`, `wait-network-idle` |
 | **Cookies** | `cookies-get`, `cookies-set`, `cookies-delete` |
 | **Storage** | `storage-get`, `storage-set`, `storage-clear` |
-| **Monitor** | `console-logs`, `page-errors`, `network-logs` |
+| **Monitor** | `console-logs`, `page-errors`, `network-logs`, `dialogs` |
+| **Dialogs** | `dialog-policy` (JS dialogs auto-handled by the daemon — never wedge automation) |
 | **Secrets** | `secret-put`, `secret-list`, `secret-delete`, `type-secret` |
 | **Daemon** | `daemon start`, `daemon stop`, `daemon ping`, `daemon health` |
 

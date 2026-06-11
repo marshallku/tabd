@@ -56,7 +56,7 @@ tabd eval 'await fetch("/api/data").then(r => r.json())' --json
 | 스크린샷 | `tabd screenshot --out file.png` |
 | 클릭 / 타이핑 | `tabd click <sel>` / `tabd type <sel> <text>` |
 | 비밀번호 입력 | `tabd type-secret <sel> --secret-id <id>` |
-| 로딩 대기 | `tabd wait-selector <sel>` / `tabd wait-url <pat> --pattern-type glob` |
+| 로딩 대기 | `tabd wait-selector <sel>` / `tabd wait-url <pat> --pattern-type glob` / `tabd wait-text "문구"` |
 | 네트워크 idle | `tabd wait-network-idle --idle-time 1500` |
 | 쿠키 / 네트워크 로그 | `tabd cookies-get <url> --json` / `tabd network-logs --url-contains /api/ --json` |
 | 새 탭 / 활성 전환 | `tabd open-tab <url>` / `tabd activate-tab --tab N` |
@@ -94,6 +94,10 @@ tabd eval 'await fetch("/api/data").then(r => r.json())' --json
 7. **`network-logs --include-body`는 deferred** — 응답 본문 안 들어옴. 본문 필요하면 같은 URL을 `tabd eval` + `fetch`로 재호출.
 
 8. **daemon 재시작 = 세션 소실** (cookies / localStorage / 열린 탭 모두 chromium TempDir). 영속화 필요하면 cookbook §3 (cookies-get + storage-get 후 재주입).
+
+9. **JS dialog (alert/confirm/prompt)는 daemon이 자동 처리** — 기본 dismiss, `beforeunload`는 자동 accept (navigation 막힘 방지). confirm을 수락해야 하는 플로우면 클릭 **전에** `tabd dialog-policy accept` (필요시 `--prompt-text`). 무슨 dialog가 떴고 어떻게 처리됐는지는 `tabd dialogs --json`으로 감사. 이미 열린 dialog를 나중에 응답하는 건 구조적으로 불가능 (action lock) — policy는 사전 설정.
+
+10. **`get-html`/`get-text`/`eval` 출력은 기본 500k chars에서 잘림** (`…[truncated: …]` 마커 부착). 전체가 필요하면 `--max-chars 0`, 더 줄이려면 `--max-chars 5000` 등. 객체를 반환하는 `eval`이 한도를 넘으면 `output_too_large` 에러 — 표현식에서 덜 가져오게 좁힐 것.
 
 ## 시크릿 (vault) 사용
 

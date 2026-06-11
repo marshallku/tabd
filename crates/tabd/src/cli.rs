@@ -102,6 +102,27 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
         },
     );
     m.insert(
+        "wait-text",
+        Spec {
+            action: "wait.text",
+            positional: &["text"],
+        },
+    );
+    m.insert(
+        "dialogs",
+        Spec {
+            action: "monitor.dialogs",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "dialog-policy",
+        Spec {
+            action: "browser.setDialogPolicy",
+            positional: &["action"],
+        },
+    );
+    m.insert(
         "cookies-get",
         Spec {
             action: "cookies.get",
@@ -961,18 +982,21 @@ mod tests {
             "secret-delete",
             "type-secret",
         ];
+        // Audit unit 3: dialog auto-handling + wait-text.
+        let tier_6 = ["wait-text", "dialogs", "dialog-policy"];
         for name in tier_1
             .iter()
             .chain(tier_3.iter())
             .chain(tier_4.iter())
             .chain(tier_5.iter())
             .chain(tier_2.iter())
+            .chain(tier_6.iter())
         {
             assert!(DISPATCH.contains_key(name), "missing: {name}");
         }
         assert_eq!(
             DISPATCH.len(),
-            tier_1.len() + tier_3.len() + tier_4.len() + tier_5.len() + tier_2.len()
+            tier_1.len() + tier_3.len() + tier_4.len() + tier_5.len() + tier_2.len() + tier_6.len()
         );
         // Ensure secret-put is NOT in the table (custom branch only).
         assert!(!DISPATCH.contains_key("secret-put"));

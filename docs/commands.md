@@ -9,11 +9,11 @@ the daemon see [operations.md](operations.md).
 
 - [Conventions](#conventions) — global flags, argv parsing, tab semantics
 - [Daemon control](#daemon-control) — `daemon start/stop/ping/health`
-- Actions (39 total, grouped):
+- Actions (42 total, grouped):
   - [Tabs](#tabs) (8) · [DOM](#dom) (4) · [Interaction](#interaction) (8)
-  - [Capture](#capture) (2) · [Execution](#execution) (1) · [Wait](#wait) (3)
-  - [Cookies](#cookies) (3) · [Storage](#storage) (3) · [Monitor](#monitor) (3)
-  - [Secrets](#secrets) (4)
+  - [Capture](#capture) (2) · [Execution](#execution) (1) · [Wait](#wait) (4)
+  - [Cookies](#cookies) (3) · [Storage](#storage) (3) · [Monitor](#monitor) (4)
+  - [Dialogs](#dialogs-1) (1) · [Secrets](#secrets) (4)
 
 ---
 
@@ -80,6 +80,7 @@ can branch without regex-matching the error prose. The exit code maps from it:
 | `eval_error` | 1 | JS threw inside `eval` or an injected expression → inspect the message |
 | `vault_error` | 1 | Secrets vault locked / `TABD_VAULT_KEY` unset / unknown secret id |
 | `invalid_request` | 1 | Unknown action, malformed JSON, missing/invalid params → fix the call |
+| `output_too_large` | 1 | Non-string `eval` result exceeded `--max-chars` → narrow the expression or pass `--max-chars 0` |
 | `internal` | 1 | Anything else |
 
 Exit `0` is success; exit `2` is reserved for client-side usage errors
@@ -225,7 +226,7 @@ if there is nothing to go back to.
 ### get-html
 
 ```bash
-tabd get-html [--selector SELECTOR] [--no-outer] [--no-clean] [--tab N]
+tabd get-html [--selector SELECTOR] [--no-outer] [--no-clean] [--max-chars N] [--tab N]
 ```
 
 | Option | Type | Default | Meaning |
@@ -233,6 +234,7 @@ tabd get-html [--selector SELECTOR] [--no-outer] [--no-clean] [--tab N]
 | `--selector` | string | `body` | CSS selector to extract |
 | `--outer` | bool | `true` | Include outer HTML (use `--no-outer` for innerHTML) |
 | `--clean` | bool | `true` | Strip `<script>`, `<style>`, `<svg>`, comments, `data-*` attrs |
+| `--max-chars` | number | `500000` | Truncate beyond N chars with a visible `…[truncated: N of M chars…]` marker; `0` = unlimited |
 
 **Returns**: `string` — the HTML.
 
@@ -241,13 +243,14 @@ tabd get-html [--selector SELECTOR] [--no-outer] [--no-clean] [--tab N]
 ### get-text
 
 ```bash
-tabd get-text [--selector SELECTOR] [--raw] [--tab N]
+tabd get-text [--selector SELECTOR] [--raw] [--max-chars N] [--tab N]
 ```
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
 | `--selector` | string | `main, article, body` (first hit) | CSS selector |
 | `--raw` | bool | `false` | Return raw `textContent` instead of whitespace-normalized text |
+| `--max-chars` | number | `500000` | Truncate beyond N chars with a visible marker; `0` = unlimited |
 
 **Returns**: `string` — the text. Cleaned form strips repeated whitespace and
 empty lines.
@@ -460,7 +463,7 @@ empty (e.g. very fresh tab).
 ### eval
 
 ```bash
-tabd eval <code>
+tabd eval <code> [--max-chars N]
 ```
 
 Run JavaScript in the active tab's main world. The expression's value is
@@ -485,7 +488,13 @@ tabd eval '(() => { const xs = [...document.querySelectorAll("li")]; return xs.l
 
 **Returns**: the evaluated value (any JSON type).
 
-**Errors**: `"Runtime.evaluate failed"` (wrapped with the JS exception text).
+Output is clamped to `--max-chars` (default `500000`, `0` = unlimited): string
+results truncate with a visible marker; non-string results whose JSON exceeds
+the limit fail with `errorCode: "output_too_large"` instead of emitting
+corrupt truncated JSON — narrow the expression or raise/disable the clamp.
+
+**Errors**: `"Runtime.evaluate failed"` (wrapped with the JS exception text),
+`"eval result too large (N chars > M); …"`.
 
 ---
 
@@ -524,6 +533,22 @@ Default timeout 30000ms.
 **Errors**: `"wait-url timed out after N ms (pattern=... type=...)"`,
 `"invalid regex pattern: ..."`, `"invalid glob → regex compile: ..."`,
 `"unsupported patternType 'X' (expected exact|glob|regex)"`.
+
+### wait-text
+
+```bash
+tabd wait-text <text> [--selector SCOPE] [--timeout MS] [--tab N]
+```
+
+Polls every 200ms until `text` appears in the scope's `innerText`
+(`document.body` when `--selector` is omitted). A missing scope element keeps
+polling — it may mount later — so an invalid selector is indistinguishable
+from slow content and also ends in `timeout` (exit 4). Default timeout
+30000ms.
+
+**Returns**: `{ "found": true }`.
+
+**Errors**: `"wait-text timed out after N ms (text=...)"`.
 
 ### wait-network-idle
 
@@ -710,6 +735,57 @@ tabd network-logs [--method M] [--status S] [--url-pattern REGEX] \
 ```
 
 Failed/cancelled requests have `failed: true` and a `failureText` field.
+
+### dialogs
+
+```bash
+tabd dialogs [--limit N] [--tab N]
+```
+
+Recent JS dialogs the daemon auto-handled on this tab (ring of 50, newest
+last). Audit trail for the auto-handling described under [Dialogs](#dialogs-1)
+— check it when a page behaved unexpectedly (e.g. an auto-accepted
+`beforeunload` discarded unsaved state).
+
+**Returns**:
+```json
+[
+  {"dialogType": "confirm", "message": "Are you sure?", "action": "dismiss", "timestamp": 1701337200000},
+  {"dialogType": "prompt", "message": "Name?", "action": "accept", "promptText": "tabd", "timestamp": 1701337201000}
+]
+```
+
+---
+
+## Dialogs
+
+JS dialogs (`alert` / `confirm` / `prompt` / `beforeunload`) are **auto-handled
+by the daemon the moment they open**. A pending dialog blocks the page's JS
+while the triggering action holds the daemon's global action lock, so a
+"respond to the open dialog" command is structurally impossible — the policy
+below is pre-configuration for future dialogs, not live rescue.
+
+Defaults: `alert`/`confirm`/`prompt` are **dismissed**; `beforeunload` is
+**always accepted** (a dismissed beforeunload silently blocks navigation,
+which is worse for automation than the unsaved-state loss — every handled
+dialog is recorded in [`dialogs`](#dialogs) so the tradeoff stays auditable).
+
+### dialog-policy
+
+```bash
+tabd dialog-policy <accept|dismiss> [--prompt-text TEXT]
+```
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `action` (positional) | string | — | `accept` or `dismiss` future alert/confirm/prompt dialogs |
+| `--prompt-text` | string | (none) | Text typed into `prompt()` when accepting |
+
+Global (all tabs), in-memory — resets to `dismiss` on daemon restart.
+
+**Returns**: `{ "action": "...", "promptText": "..."|null }`.
+
+**Errors**: `"invalid 'action' (expected accept|dismiss, got '...')"`.
 
 ---
 

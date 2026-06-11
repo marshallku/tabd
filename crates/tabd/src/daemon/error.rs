@@ -23,6 +23,9 @@ pub(crate) enum ErrorCode {
     VaultError,
     /// Malformed request JSON, unknown action, or missing/invalid params.
     InvalidRequest,
+    /// Result exceeded the `--max-chars` clamp and cannot be truncated
+    /// safely (non-string eval results — truncated JSON would be corrupt).
+    OutputTooLarge,
     /// Daemon socket unreachable, spawn failed, or drain in progress.
     DaemonUnreachable,
     /// Anything not classified above.
@@ -39,6 +42,7 @@ impl ErrorCode {
             ErrorCode::CdpNotReady => "cdp_not_ready",
             ErrorCode::VaultError => "vault_error",
             ErrorCode::InvalidRequest => "invalid_request",
+            ErrorCode::OutputTooLarge => "output_too_large",
             ErrorCode::DaemonUnreachable => "daemon_unreachable",
             ErrorCode::Internal => "internal",
         }
@@ -74,10 +78,13 @@ pub(crate) fn classify_error_code(message: &str) -> ErrorCode {
     } else if m.contains("invalid json in request")
         || m.contains("unsupported action:")
         || m.contains("missing '")
+        || m.contains("invalid '")
         || m.contains("is required")
         || m.contains("unsupported patterntype")
     {
         ErrorCode::InvalidRequest
+    } else if m.contains("result too large") {
+        ErrorCode::OutputTooLarge
     } else if m.contains("shutting down (drain in progress)") {
         ErrorCode::DaemonUnreachable
     } else {
@@ -191,6 +198,20 @@ mod tests {
         assert_eq!(
             classify_error_code("unsupported patternType 'fuzzy' (expected exact|glob|regex)"),
             ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            classify_error_code("invalid 'action' (expected accept|dismiss, got 'maybe')"),
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn oversized_results_classify_as_output_too_large() {
+        assert_eq!(
+            classify_error_code(
+                "eval result too large (600000 chars > 500000); narrow the expression or pass --max-chars 0"
+            ),
+            ErrorCode::OutputTooLarge
         );
     }
 

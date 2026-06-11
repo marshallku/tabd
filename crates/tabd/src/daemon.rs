@@ -367,6 +367,39 @@ fn optional_u64(params: &Value, key: &str, default: u64) -> u64 {
 /// for legitimate waits while bounding the worst case.
 const MAX_WAIT_MS: u64 = 300_000;
 
+/// Default `--max-chars` for get-html / get-text / eval payloads. Generous for
+/// any legitimate page read, but stops a single call from dumping tens of MB
+/// into an AI agent's context window. `--max-chars 0` disables the clamp.
+const DEFAULT_MAX_CHARS: u64 = 500_000;
+
+/// Read the user-supplied `maxChars` clamp (0 = unlimited).
+fn max_chars(params: &Value) -> u64 {
+    optional_u64(params, "maxChars", DEFAULT_MAX_CHARS)
+}
+
+/// Truncate `s` to `max` chars with a visible marker so the agent knows the
+/// payload is partial (a silent clamp would read as "that's the whole page").
+fn clamp_chars(s: String, max: u64) -> String {
+    if max == 0 {
+        return s;
+    }
+    let max = max as usize;
+    let total = s.chars().count();
+    if total <= max {
+        return s;
+    }
+    let truncated: String = s.chars().take(max).collect();
+    format!("{truncated}…[truncated: {max} of {total} chars; pass --max-chars 0 for full output]")
+}
+
+/// Apply [`clamp_chars`] to a string payload, passing other shapes through.
+fn clamp_value_chars(v: Value, max: u64) -> Value {
+    match v {
+        Value::String(s) => Value::String(clamp_chars(s, max)),
+        other => other,
+    }
+}
+
 /// Read a user-supplied `timeout` (ms) for a wait, clamped to [`MAX_WAIT_MS`].
 fn clamped_wait_ms(params: &Value, default: u64) -> u64 {
     optional_u64(params, "timeout", default).min(MAX_WAIT_MS)
@@ -616,6 +649,7 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "interaction.type" => interaction::handle_type(state, &req.params).await,
         "wait.selector" => waits::handle_wait_selector(state, &req.params).await,
         "wait.url" => waits::handle_wait_url(state, &req.params).await,
+        "wait.text" => waits::handle_wait_text(state, &req.params).await,
         "tabs.list" => tabs::handle_tabs_list(state, &req.params).await,
         "tabs.open" => tabs::handle_tabs_open(state, &req.params).await,
         "tabs.close" => tabs::handle_tabs_close(state, &req.params).await,
@@ -638,6 +672,8 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "capture.metrics" => capture::handle_metrics(state, &req.params).await,
         "dom.contentSummary" => dom::handle_content_summary(state, &req.params).await,
         "monitor.networkLogs" => monitor::handle_network_logs(state, &req.params).await,
+        "monitor.dialogs" => monitor::handle_dialogs(state, &req.params).await,
+        "browser.setDialogPolicy" => monitor::handle_set_dialog_policy(state, &req.params).await,
         "wait.networkIdle" => waits::handle_wait_network_idle(state, &req.params).await,
         "secrets.put" => secrets::handle_secrets_put(state, &req.params).await,
         "secrets.list" => secrets::handle_secrets_list(state, &req.params).await,
@@ -1030,6 +1066,36 @@ mod tests {
         let s = error_response("b", "selector .x not visible after 30000ms");
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["errorCode"], json!("selector_not_found"));
+    }
+
+    #[test]
+    fn clamp_chars_boundaries() {
+        // Under and exactly-at the limit pass through untouched.
+        assert_eq!(clamp_chars("abc".into(), 4), "abc");
+        assert_eq!(clamp_chars("abcd".into(), 4), "abcd");
+        // Over the limit truncates with a visible marker.
+        let out = clamp_chars("abcde".into(), 4);
+        assert!(
+            out.starts_with("abcd…[truncated: 4 of 5 chars"),
+            "got: {out}"
+        );
+        // 0 disables the clamp entirely.
+        assert_eq!(clamp_chars("abcde".into(), 0), "abcde");
+    }
+
+    #[test]
+    fn clamp_value_chars_only_touches_strings() {
+        assert_eq!(clamp_value_chars(json!({"a": 1}), 1), json!({"a": 1}));
+        let clamped = clamp_value_chars(json!("xy"), 1);
+        let s = clamped.as_str().unwrap();
+        assert!(s.starts_with("x…[truncated: 1 of 2 chars"), "got: {s}");
+    }
+
+    #[test]
+    fn max_chars_default_and_override() {
+        assert_eq!(max_chars(&json!({})), DEFAULT_MAX_CHARS);
+        assert_eq!(max_chars(&json!({"maxChars": 100})), 100);
+        assert_eq!(max_chars(&json!({"maxChars": 0})), 0);
     }
 
     #[test]

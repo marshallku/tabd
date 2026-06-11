@@ -66,6 +66,61 @@ pub(super) async fn handle_page_errors(
     Ok(Some(json))
 }
 
+pub(super) async fn handle_dialogs(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+
+    let entries = client
+        .read_tab_state(&tid, |state| {
+            let mut copy = state.dialogs.clone();
+            if copy.len() > limit {
+                let excess = copy.len() - limit;
+                copy.drain(0..excess);
+            }
+            copy
+        })
+        .await?;
+    let json = serde_json::to_value(entries).map_err(|e| e.to_string())?;
+    Ok(Some(json))
+}
+
+/// Parse the `action` param into the policy's accept flag.
+fn parse_dialog_action(action: &str) -> Result<bool, String> {
+    match action {
+        "accept" => Ok(true),
+        "dismiss" => Ok(false),
+        other => Err(format!(
+            "invalid 'action' (expected accept|dismiss, got '{other}')"
+        )),
+    }
+}
+
+/// Pre-configures how FUTURE dialogs are auto-answered. It cannot rescue an
+/// already-open dialog — that action holds the global action mutex, which is
+/// exactly why the event reader auto-handles dialogs in the first place.
+pub(super) async fn handle_set_dialog_policy(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let action = require_string(params, "action")?;
+    let accept = parse_dialog_action(&action)?;
+    let prompt_text = params
+        .get("promptText")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let client = client_or_err(state).await?;
+    client.set_dialog_policy(accept, prompt_text.clone()).await;
+    Ok(Some(json!({ "action": action, "promptText": prompt_text })))
+}
+
 pub(super) async fn handle_network_logs(
     state: &DaemonState,
     params: &Value,
@@ -137,4 +192,26 @@ pub(super) async fn handle_network_logs(
 
     let json = serde_json::to_value(filtered).map_err(|e| e.to_string())?;
     Ok(Some(json))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_dialog_action;
+
+    #[test]
+    fn parse_dialog_action_accept_dismiss() {
+        assert_eq!(parse_dialog_action("accept"), Ok(true));
+        assert_eq!(parse_dialog_action("dismiss"), Ok(false));
+    }
+
+    #[test]
+    fn parse_dialog_action_rejects_unknown_as_invalid_request() {
+        let err = parse_dialog_action("maybe").unwrap_err();
+        assert!(err.contains("expected accept|dismiss"), "got: {err}");
+        // Wording is load-bearing: the classifier maps it to invalid_request.
+        assert_eq!(
+            crate::daemon::error::classify_error_code(&err),
+            crate::daemon::error::ErrorCode::InvalidRequest
+        );
+    }
 }

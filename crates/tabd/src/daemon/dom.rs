@@ -39,11 +39,32 @@ pub(super) async fn handle_eval(
         .as_ref()
         .cloned()
         .ok_or_else(|| "cdp client not initialized".to_string())?;
+    let max = max_chars(params);
     // None (CDP `undefined`) propagates as None → wire response omits `data`,
-    // matching TS chromium-cdp byte-exact (codex round 1 C1).
-    crate::cmd::eval::evaluate_value(&client, code)
+    // matching TS chromium-cdp byte-exact (codex round 1 C1). The clamp must
+    // never coerce that into null/"" — only Some values are touched.
+    let result = crate::cmd::eval::evaluate_value(&client, code)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    match result {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(Value::String(clamp_chars(s, max)))),
+        Some(v) => {
+            // Truncated JSON would be syntactically corrupt — error instead.
+            if max > 0 {
+                let n = serde_json::to_string(&v)
+                    .map_err(|e| e.to_string())?
+                    .chars()
+                    .count() as u64;
+                if n > max {
+                    return Err(format!(
+                        "eval result too large ({n} chars > {max}); narrow the expression or pass --max-chars 0"
+                    ));
+                }
+            }
+            Ok(Some(v))
+        }
+    }
 }
 
 pub(super) async fn handle_get_text(
@@ -72,9 +93,15 @@ pub(super) async fn handle_get_text(
 
     // dom.getText always returns a string (TS wraps with String(...)). Map
     // None → "" so the wire shape stays consistent.
+    let max = max_chars(params);
     crate::cmd::eval::evaluate_value(&client, &expr)
         .await
-        .map(|opt| Some(opt.unwrap_or(Value::String(String::new()))))
+        .map(|opt| {
+            Some(clamp_value_chars(
+                opt.unwrap_or(Value::String(String::new())),
+                max,
+            ))
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -115,9 +142,15 @@ pub(super) async fn handle_get_html(
 }})()"#
     );
 
+    let max = max_chars(params);
     crate::cmd::eval::evaluate_value(&client, &expr)
         .await
-        .map(|opt| Some(opt.unwrap_or(Value::String(String::new()))))
+        .map(|opt| {
+            Some(clamp_value_chars(
+                opt.unwrap_or(Value::String(String::new())),
+                max,
+            ))
+        })
         .map_err(|e| e.to_string())
 }
 

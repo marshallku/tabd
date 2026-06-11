@@ -21,6 +21,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const MAX_CONSOLE: usize = 100;
 const MAX_PAGE_ERRORS: usize = 100;
 const MAX_NETWORK: usize = 500;
+const MAX_DIALOGS: usize = 50;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsoleEntry {
@@ -105,6 +106,9 @@ pub struct TabState {
     /// loadingFinished/loadingFailed dec (saturating). Reader task writes,
     /// handler reads.
     pub network_pending: u32,
+    /// Auto-handled JS dialogs (newest last). Reader task writes on
+    /// Page.javascriptDialogOpening; `monitor.dialogs` reads.
+    pub dialogs: Vec<DialogEntry>,
 }
 
 impl TabState {
@@ -115,8 +119,37 @@ impl TabState {
             page_errors: Vec::new(),
             network_log: Vec::new(),
             network_pending: 0,
+            dialogs: Vec::new(),
         }
     }
+}
+
+/// A JS dialog the daemon auto-handled. `action` records what was done
+/// ("accept" / "dismiss") so agents can audit what happened to e.g. an
+/// auto-accepted beforeunload (potential unsaved-state loss).
+#[derive(Debug, Clone, Serialize)]
+pub struct DialogEntry {
+    #[serde(rename = "dialogType")]
+    pub dialog_type: String,
+    pub message: String,
+    pub action: String,
+    #[serde(rename = "promptText", skip_serializing_if = "Option::is_none")]
+    pub prompt_text: Option<String>,
+    pub timestamp: u64,
+}
+
+/// Global auto-response policy for JS dialogs, applied by the event reader the
+/// moment a dialog opens. A pending dialog blocks the page's JS — and the
+/// action that triggered it holds the daemon's global action mutex — so
+/// responding later via a command is structurally impossible; this policy is
+/// pre-configuration, not live rescue. `beforeunload` always accepts
+/// regardless (a dismissed beforeunload silently blocks navigation).
+#[derive(Debug, Clone, Default)]
+pub struct DialogPolicy {
+    /// false (default) = dismiss alert/confirm/prompt; true = accept.
+    pub accept: bool,
+    /// Text typed into `prompt()` when accepting.
+    pub prompt_text: Option<String>,
 }
 
 /// Multi-tab registry. Single Mutex guards both fields so split-brain races
@@ -125,6 +158,7 @@ impl TabState {
 pub struct TabRegistry {
     pub tabs: HashMap<String, TabState>, // targetId → state
     pub active: Option<String>,          // currently focused targetId
+    pub dialog_policy: DialogPolicy,
 }
 
 #[derive(Debug)]
@@ -237,7 +271,9 @@ impl Drop for PendingGuard {
 }
 
 pub struct CdpClient {
-    next_id: AtomicU64,
+    // Arc so the reader task shares the id space for its fire-and-forget
+    // dialog responses (no collisions with dispatch()-issued ids).
+    next_id: Arc<AtomicU64>,
     out_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
     pending: PendingMap,
     // Arc so the reader task can clone-and-move it for event routing.
@@ -343,6 +379,11 @@ impl CdpClient {
         let registry_for_reader = registry.clone();
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        // Shared with the reader task: id allocation for fire-and-forget
+        // frames + the outbound channel itself (cloned before the spawn).
+        let next_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
+        let next_id_for_reader = next_id.clone();
+        let out_tx_for_reader = out_tx.clone();
 
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
@@ -380,10 +421,65 @@ impl CdpClient {
                 };
                 let params = parsed.params.unwrap_or(Value::Null);
                 let mut reg = registry_for_reader.lock().await;
+                // Cloned before `state` mutably borrows reg.tabs below.
+                let dialog_policy = if method == "Page.javascriptDialogOpening" {
+                    Some(reg.dialog_policy.clone())
+                } else {
+                    None
+                };
                 let Some(state) = reg.tabs.values_mut().find(|t| t.session_id == sid) else {
                     continue;
                 };
                 match method.as_str() {
+                    "Page.javascriptDialogOpening" => {
+                        // A pending dialog blocks the page's JS while the
+                        // triggering action holds the global action mutex, so
+                        // this is the only point where it can be answered.
+                        // Fire-and-forget enqueue — awaiting an RPC here would
+                        // deadlock (see comment above); the reply carries no
+                        // payload and is dropped by the no-pending-entry path.
+                        let dialog_type = params
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("alert")
+                            .to_owned();
+                        let message = params
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let policy = dialog_policy.unwrap_or_default();
+                        // beforeunload always accepts: dismissing it silently
+                        // blocks navigation, which is worse for automation
+                        // than the (recorded) unsaved-state loss.
+                        let accept = dialog_type == "beforeunload" || policy.accept;
+                        let prompt_text = if accept && dialog_type == "prompt" {
+                            policy.prompt_text.clone()
+                        } else {
+                            None
+                        };
+                        state.dialogs.push(DialogEntry {
+                            dialog_type,
+                            message,
+                            action: if accept { "accept" } else { "dismiss" }.to_owned(),
+                            prompt_text: prompt_text.clone(),
+                            timestamp: now_ms(),
+                        });
+                        trim_ring(&mut state.dialogs, MAX_DIALOGS);
+                        let id = next_id_for_reader.fetch_add(1, Ordering::SeqCst);
+                        let mut reply_params = json!({ "accept": accept });
+                        if let Some(text) = prompt_text {
+                            reply_params["promptText"] = json!(text);
+                        }
+                        let frame = json!({
+                            "id": id,
+                            "sessionId": sid,
+                            "method": "Page.handleJavaScriptDialog",
+                            "params": reply_params,
+                        })
+                        .to_string();
+                        let _ = out_tx_for_reader.send(frame);
+                    }
                     "Runtime.consoleAPICalled" => {
                         let level = params
                             .get("type")
@@ -549,7 +645,7 @@ impl CdpClient {
         });
 
         let client = CdpClient {
-            next_id: AtomicU64::new(1),
+            next_id,
             out_tx: Mutex::new(Some(out_tx)),
             pending,
             registry,
@@ -801,6 +897,16 @@ impl CdpClient {
             .get(target_id)
             .ok_or_else(|| format!("no session for targetId {target_id:?}"))?;
         Ok(f(state))
+    }
+
+    /// Set the global dialog auto-response policy (applies to dialogs that
+    /// open AFTER this call — see `DialogPolicy` for why it can't be live).
+    pub async fn set_dialog_policy(&self, accept: bool, prompt_text: Option<String>) {
+        let mut reg = self.registry.lock().await;
+        reg.dialog_policy = DialogPolicy {
+            accept,
+            prompt_text,
+        };
     }
 
     /// Registry-only active flip. Does NOT call CDP `Target.activateTarget`,
