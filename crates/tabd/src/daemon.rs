@@ -25,6 +25,7 @@ use crate::cmd::page;
 // super::*` and exposes its handlers as `pub(super)` for process_request.
 mod capture;
 mod dom;
+pub(crate) mod error;
 mod interaction;
 mod monitor;
 mod secrets;
@@ -78,6 +79,10 @@ struct Response<'a> {
     data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Stable machine-parseable code (see `daemon/error.rs`). Additive field —
+    /// absent on success and on responses from older daemons.
+    #[serde(rename = "errorCode", skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
 }
 
 fn success_response(id: &str, data: Value) -> String {
@@ -86,6 +91,7 @@ fn success_response(id: &str, data: Value) -> String {
         success: true,
         data: Some(data),
         error: None,
+        error_code: None,
     })
     .unwrap_or_else(|_| r#"{"id":"","success":false,"error":"serialization failed"}"#.into())
 }
@@ -99,6 +105,7 @@ fn success_response_no_data(id: &str) -> String {
         success: true,
         data: None,
         error: None,
+        error_code: None,
     })
     .unwrap_or_else(|_| r#"{"id":"","success":false,"error":"serialization failed"}"#.into())
 }
@@ -109,6 +116,7 @@ fn error_response(id: &str, message: &str) -> String {
         success: false,
         data: None,
         error: Some(message.to_owned()),
+        error_code: Some(error::classify_error_code(message).as_str()),
     })
     .unwrap_or_else(|_| r#"{"id":"","success":false,"error":"serialization failed"}"#.into())
 }
@@ -1009,7 +1017,29 @@ mod tests {
         assert_eq!(v["id"], json!("b"));
         assert_eq!(v["success"], json!(false));
         assert_eq!(v["error"], json!("boom"));
+        assert_eq!(v["errorCode"], json!("internal"));
         assert!(v.get("data").is_none());
+    }
+
+    #[test]
+    fn error_response_classifies_known_messages() {
+        let s = error_response("b", "Tab not found: 9");
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["errorCode"], json!("tab_not_found"));
+
+        let s = error_response("b", "selector .x not visible after 30000ms");
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["errorCode"], json!("selector_not_found"));
+    }
+
+    #[test]
+    fn success_response_has_no_error_code() {
+        let s = success_response("a", json!(null));
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert!(v.get("errorCode").is_none());
+        let s = success_response_no_data("a");
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert!(v.get("errorCode").is_none());
     }
 
     #[test]

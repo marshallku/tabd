@@ -413,8 +413,20 @@ fn parse_args(argv: &[String]) -> ParsedArgs {
 // Render result — TS renderResult port
 // ---------------------------------------------------------------------------
 
-/// Returns the exit code (0 success, 1 error). Side-effect: writes to stdout/
-/// stderr and (on `--out`) to the file path.
+/// Map a wire `errorCode` to a process exit code so scripts can branch without
+/// parsing stderr: 3 daemon unreachable, 4 timeout, 5 selector/tab not found,
+/// 1 anything else. 0 (success) and 2 (usage error) are assigned elsewhere.
+fn exit_code_for_error(code: Option<&str>) -> i32 {
+    match code {
+        Some("daemon_unreachable") => 3,
+        Some("timeout") => 4,
+        Some("selector_not_found") | Some("tab_not_found") => 5,
+        _ => 1,
+    }
+}
+
+/// Returns the exit code (0 success, nonzero error — see `exit_code_for_error`).
+/// Side-effect: writes to stdout/stderr and (on `--out`) to the file path.
 async fn render_result(resp: &Value, parsed: &ParsedArgs) -> Result<i32> {
     let success = resp
         .get("success")
@@ -424,12 +436,16 @@ async fn render_result(resp: &Value, parsed: &ParsedArgs) -> Result<i32> {
     let error = resp.get("error").and_then(Value::as_str);
 
     if !success {
+        let code = resp.get("errorCode").and_then(Value::as_str);
         if parsed.json {
             println!("{}", serde_json::to_string(resp)?);
         } else {
-            eprintln!("error: {}", error.unwrap_or("unknown"));
+            match code {
+                Some(c) => eprintln!("error: {} [{c}]", error.unwrap_or("unknown")),
+                None => eprintln!("error: {}", error.unwrap_or("unknown")),
+            }
         }
-        return Ok(1);
+        return Ok(exit_code_for_error(code));
     }
 
     // --out: extract bytes from data URL or { base64 } payload.
@@ -487,6 +503,26 @@ async fn render_result(resp: &Value, parsed: &ParsedArgs) -> Result<i32> {
 // ---------------------------------------------------------------------------
 // Daemon RPC + auto-spawn
 // ---------------------------------------------------------------------------
+
+/// ensure_daemon + send_action, with connection-level failures folded into a
+/// synthesized error envelope so `render_result` stays the single rendering
+/// path (`--json` keeps emitting JSON even when the daemon is unreachable, and
+/// the exit code maps from `errorCode: "daemon_unreachable"`).
+async fn dispatch_action(base_dir: Option<&str>, action: &str, params: Value) -> Value {
+    let result = async {
+        let paths = ensure_daemon(base_dir).await?;
+        send_action(&paths.socket_path, action, params).await
+    }
+    .await;
+    result.unwrap_or_else(|err| {
+        json!({
+            "id": "cli",
+            "success": false,
+            "error": format!("{err:#}"),
+            "errorCode": "daemon_unreachable",
+        })
+    })
+}
 
 /// Connect to an already-running daemon and send one action. Newline-delimited
 /// JSON over UDS, matching the protocol that `daemon.rs` implements.
@@ -607,10 +643,8 @@ pub async fn run(args: Vec<OsString>) -> Result<i32> {
         .remove("baseDir")
         .and_then(|v| v.as_str().map(str::to_string));
 
-    let paths = ensure_daemon(base_dir.as_deref()).await?;
-
     let params = Value::Object(parsed.options.clone());
-    let resp = send_action(&paths.socket_path, spec.action, params).await?;
+    let resp = dispatch_action(base_dir.as_deref(), spec.action, params).await;
     render_result(&resp, &parsed).await
 }
 
@@ -697,13 +731,12 @@ async fn run_secret_put(args: &[String]) -> Result<i32> {
         .options
         .get("baseDir")
         .and_then(|v| v.as_str().map(str::to_string));
-    let paths = ensure_daemon(base_dir.as_deref()).await?;
     let mut params = serde_json::Map::new();
     params.insert("value".to_string(), Value::String(value));
     if let Some(lbl) = label {
         params.insert("label".to_string(), Value::String(lbl));
     }
-    let resp = send_action(&paths.socket_path, "secrets.put", Value::Object(params)).await?;
+    let resp = dispatch_action(base_dir.as_deref(), "secrets.put", Value::Object(params)).await;
     render_result(&resp, &parsed).await
 }
 
@@ -829,6 +862,29 @@ mod tests {
         let parsed = ParsedArgs::default();
         let code = render_result(&resp, &parsed).await.unwrap();
         assert_eq!(code, 1);
+    }
+
+    #[tokio::test]
+    async fn render_error_maps_error_code_to_exit_code() {
+        let parsed = ParsedArgs::default();
+        for (code_str, expected) in [
+            ("daemon_unreachable", 3),
+            ("timeout", 4),
+            ("selector_not_found", 5),
+            ("tab_not_found", 5),
+            ("eval_error", 1),
+            ("internal", 1),
+        ] {
+            let resp = json!({"id":"x","success":false,"error":"boom","errorCode":code_str});
+            let code = render_result(&resp, &parsed).await.unwrap();
+            assert_eq!(code, expected, "errorCode {code_str}");
+        }
+    }
+
+    #[test]
+    fn exit_code_unknown_or_missing_code_is_one() {
+        assert_eq!(exit_code_for_error(None), 1);
+        assert_eq!(exit_code_for_error(Some("not_a_real_code")), 1);
     }
 
     #[tokio::test]

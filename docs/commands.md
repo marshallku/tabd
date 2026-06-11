@@ -58,9 +58,41 @@ all `secret-*`.
 
 All daemon responses come back as `{ id, success, data }`. The CLI unwraps:
 - on `success: true` → prints `data` (string raw, object/array via `--json`)
-- on `success: false` → prints the error to stderr and exits 1
+- on `success: false` → prints `error: <message> [<errorCode>]` to stderr and
+  exits nonzero (see [Errors & exit codes](#errors--exit-codes)); with `--json`
+  the full failure envelope `{ id, success, error, errorCode }` is printed to
+  stdout instead
 
 In the action tables below, "Returns" is the `data` payload only.
+
+### Errors & exit codes
+
+Failures carry a stable machine-parseable `errorCode` so scripts and AI agents
+can branch without regex-matching the error prose. The exit code maps from it:
+
+| `errorCode` | Exit | Meaning / typical reaction |
+|---|---|---|
+| `selector_not_found` | 5 | Selector never matched **or never became visible** before the deadline → fix the selector, or wait/retry if content loads late |
+| `tab_not_found` | 5 | 1-based tab index out of range, or no tabs open → `list-tabs` and re-resolve |
+| `timeout` | 4 | `wait-url` / `wait-network-idle` / a CDP RPC hit its deadline → retry or raise `--timeout` |
+| `daemon_unreachable` | 3 | Socket unreachable, auto-spawn failed, or daemon draining → check `daemon health`, restart |
+| `cdp_not_ready` | 1 | Chromium is (re)starting → brief wait, then retry |
+| `eval_error` | 1 | JS threw inside `eval` or an injected expression → inspect the message |
+| `vault_error` | 1 | Secrets vault locked / `TABD_VAULT_KEY` unset / unknown secret id |
+| `invalid_request` | 1 | Unknown action, malformed JSON, missing/invalid params → fix the call |
+| `internal` | 1 | Anything else |
+
+Exit `0` is success; exit `2` is reserved for client-side usage errors
+(`secret-put` source-flag validation). Scripts that only check "nonzero =
+failure" are unaffected by the 3/4/5 split.
+
+```bash
+tabd click '#login' --json || case $? in
+  5) echo "selector/tab gone — re-query the page" ;;
+  4) echo "still loading — retry" ;;
+  3) echo "daemon down — tabd daemon start" ;;
+esac
+```
 
 ### `secret-put` is special
 

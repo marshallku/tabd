@@ -123,7 +123,8 @@ trap 'tabd daemon stop --base-dir "$BASE" 2>/dev/null; rm -rf "$BASE"' EXIT
 ## 출력 다루기
 
 - `--json` 없이 호출하면 stdout이 사람-친화 (큰 객체는 pretty-print). 파이프로 jq 등에 넘길 거면 `--json` 필수.
-- 에러는 stderr + exit code 1. `set -e` 환경에서 자연스럽게 트랩됨.
+- 에러는 stderr `error: <message> [<errorCode>]` + nonzero exit. `--json`이면 실패 envelope `{success:false, error, errorCode}`가 stdout으로 나옴. `set -e` 환경에서 자연스럽게 트랩됨.
+- **에러 분기는 errorCode/exit code로** (메시지 텍스트 파싱 금지): exit `5` = `selector_not_found`/`tab_not_found` (셀렉터 재탐색), `4` = `timeout` (재시도 또는 `--timeout` 증가), `3` = `daemon_unreachable` (daemon 재시작), `1` = 그 외 (`eval_error`, `vault_error`, `invalid_request`, `cdp_not_ready`, `internal`). 전체 표는 commands.md "Errors & exit codes".
 - 큰 응답 (HTML, 스크린샷 base64) 은 그대로 stdout으로 쏟지 말고 `--out FILE` 또는 파일로 redirect.
 
 ## 더 알아야 할 때

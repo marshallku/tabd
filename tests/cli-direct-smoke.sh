@@ -114,6 +114,42 @@ else
   fail "--out PNG" "screenshot exit nonzero"
 fi
 
+# Case 5: structured error — missing selector → errorCode + exit 5.
+set +e
+CLICK_OUT="$("$BIN" click '#definitely-not-there' --timeout 1200 --json 2>/dev/null)"
+CLICK_RC=$?
+set -e
+if [[ "$CLICK_RC" == "5" && "$CLICK_OUT" == *'"errorCode":"selector_not_found"'* ]]; then
+  pass "selector_not_found → errorCode + exit 5"
+else
+  fail "selector_not_found error contract" "rc=$CLICK_RC out=$CLICK_OUT"
+fi
+
+# Case 6: structured error — bad tab index → tab_not_found + exit 5.
+set +e
+TAB_OUT="$("$BIN" console-logs --tab 99 --json 2>/dev/null)"
+TAB_RC=$?
+set -e
+if [[ "$TAB_RC" == "5" && "$TAB_OUT" == *'"errorCode":"tab_not_found"'* ]]; then
+  pass "tab_not_found → errorCode + exit 5"
+else
+  fail "tab_not_found error contract" "rc=$TAB_RC out=$TAB_OUT"
+fi
+
+# Case 7: structured error — dead socket + no auto-spawn → daemon_unreachable
+# + exit 3, and --json still emits a JSON envelope (not bare prose).
+DEAD_DIR="$(mktemp -d -t tabd-dead.XXXX)"
+set +e
+DEAD_OUT="$(TABD_NO_AUTO_SPAWN=1 TABD_BASE_DIR="$DEAD_DIR" "$BIN" get-text --json 2>/dev/null)"
+DEAD_RC=$?
+set -e
+rm -rf "$DEAD_DIR"
+if [[ "$DEAD_RC" == "3" && "$DEAD_OUT" == *'"errorCode":"daemon_unreachable"'* ]]; then
+  pass "daemon_unreachable → JSON envelope + exit 3"
+else
+  fail "daemon_unreachable error contract" "rc=$DEAD_RC out=$DEAD_OUT"
+fi
+
 echo "== summary =="
 echo "passed: $PASS_COUNT"
 echo "failed: $FAIL_COUNT"
