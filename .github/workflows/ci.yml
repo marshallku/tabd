@@ -41,6 +41,33 @@ jobs:
       - name: test
         run: cargo test --manifest-path "$MANIFEST"
 
+  # Release builds ship darwin binaries (macos-15 runners); this job catches
+  # macOS-specific build/test breaks at PR time instead of at release time.
+  lint-test-macos:
+    name: fmt + clippy + test (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/tabd
+
+      - name: rustfmt
+        run: cargo fmt --manifest-path "$MANIFEST" --all --check
+
+      - name: clippy
+        run: cargo clippy --manifest-path "$MANIFEST" --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --manifest-path "$MANIFEST"
+
   smoke:
     name: e2e smoke (chromium)
     runs-on: ubuntu-latest

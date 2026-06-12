@@ -18,7 +18,7 @@ remote dependency.
 shell → tabd CLI ──┐
                    ├── /tmp/…/daemon.sock ──> tabd daemon ──> chromium (CDP/WS)
 shell → tabd CLI ──┘                                 │
-                                                     ├── supervise task (Linux: /proc poll)
+                                                     ├── supervise task (try_wait poll)
                                                      └── secrets vault (lazy-init)
 ```
 
@@ -39,7 +39,7 @@ shell → tabd CLI ──┘                                 │
 | File | Role |
 |---|---|
 | `crates/tabd/src/main.rs` | `clap` router. `daemon ...` subcommand + external-subcommand catch-all → `cli::run`. |
-| `crates/tabd/src/cli.rs` | argv parser, dispatch table (38 actions + `secret-put` custom branch), daemon auto-spawn, render. |
+| `crates/tabd/src/cli.rs` | argv parser, dispatch table (41 actions + `secret-put` custom branch), daemon auto-spawn, render. |
 | `crates/tabd/src/daemon.rs` | UDS server, shared state/helpers, request dispatch, supervisor, vault state. |
 | `crates/tabd/src/daemon/` | Action handlers grouped by domain (`dom`, `interaction`, `tabs`, `storage`, `capture`, `monitor`, `waits`, `secrets`). |
 | `crates/tabd/src/cdp.rs` | JSON-RPC over WS, multi-tab `TabRegistry`, reader task with event routing. |
@@ -107,11 +107,14 @@ random salt). Each record has its own 12-byte IV and 16-byte auth tag.
 Plaintext secret values never appear on argv. `secret-put` reads the value
 from `--from-env VAR`, `--from-file PATH`, or `--stdin`.
 
-### Daemon ↔ chromium supervisor (Linux)
+### Daemon ↔ chromium supervisor
 
-A `tokio::spawn`'d task polls `/proc/{chromium_pid}/status` every 2 seconds.
-It treats `State: Z` (zombie) and `State: X` (dead) as "not alive" so the
-daemon doesn't sit forever holding a corpse. On crash:
+A `tokio::spawn`'d task checks chromium liveness every 2 seconds via
+`Browser::is_alive()` — a non-blocking `try_wait()` on the owned child
+process. Tying liveness to the owned `Child` (instead of the earlier
+Linux-only `/proc/{pid}/status` State parse) works on macOS too, reaps the
+zombie the State parse existed to detect, and is immune to PID reuse. On
+crash:
 
 1. Drop the dead `CdpClient` and `Browser`.
 2. Bump `restart_attempts`.

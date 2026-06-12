@@ -100,6 +100,23 @@ impl Browser {
         self.child.id()
     }
 
+    /// Liveness check for the supervisor, tied to the owned `Child` (works on
+    /// every platform, immune to PID reuse, and reaps the zombie that the old
+    /// Linux-only /proc State parse existed to detect). Non-blocking.
+    /// tokio caches the exit status, so once this returns false it stays false.
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => false,
+            Ok(None) => true,
+            Err(err) => {
+                // Conservative: don't trigger restart storms on a wait error,
+                // but leave a trace so persistent failures are diagnosable.
+                eprintln!("[tabd daemon] warn: chromium try_wait failed: {err}");
+                true
+            }
+        }
+    }
+
     /// Graceful shutdown: SIGTERM → wait up to `GRACEFUL_WAIT` → SIGKILL fallback.
     /// `kill_on_drop(true)` covers panic / early-drop paths separately.
     /// Once cdp.rs lands (task #16) this can additionally send CDP `Browser.close`
@@ -307,6 +324,39 @@ mod tests {
         // for the actual DevTools endpoint announcement (codex I1).
         let line = "[1234:567:0123/abc:ERROR:foo.cc(99)] connected via ws://10.0.0.1:9999/api";
         assert_eq!(parse_devtools_port(line), None);
+    }
+
+    /// Wrap an arbitrary spawned child in a Browser so is_alive() can be
+    /// exercised without a real chromium.
+    fn browser_for_child(child: tokio::process::Child) -> super::Browser {
+        super::Browser {
+            child,
+            ws_endpoint: String::new(),
+            _user_data_dir: tempfile::TempDir::new().expect("tempdir"),
+        }
+    }
+
+    #[tokio::test]
+    async fn is_alive_true_for_running_child() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("5")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let mut browser = browser_for_child(child);
+        assert!(browser.is_alive());
+    }
+
+    #[tokio::test]
+    async fn is_alive_false_after_exit_and_stays_false() {
+        let mut child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let _ = child.wait().await; // ensure it has exited (also reaps)
+        let mut browser = browser_for_child(child);
+        assert!(!browser.is_alive());
+        // tokio caches the exit status — repeated checks stay false.
+        assert!(!browser.is_alive());
     }
 
     // Real-chromium smoke. Skipped by default; run with:

@@ -898,36 +898,12 @@ async fn boot_browser_and_cdp(state: &DaemonState, paths: &DaemonPaths) -> Resul
 }
 
 /// Phase 3g supervisor: polls chromium liveness every 2s and rebuilds the
-/// browser + cdp client if it died. Lock-free check via `/proc/{pid}/status`
-/// so it doesn't fight handlers for the state.browser mutex (Linux only —
-/// on other platforms supervision is effectively disabled).
-///
-/// We can't just check `/proc/{pid}` existence: if chromium dies before the
-/// daemon `wait()`s on the child, the kernel keeps a zombie entry around
-/// with `/proc/{pid}/` still present. Read State: from /proc/{pid}/status
-/// and treat Z (zombie) or X (dead) as not alive.
-fn chromium_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let path = format!("/proc/{pid}/status");
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return false;
-        };
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("State:") {
-                let state = rest.trim().chars().next();
-                return !matches!(state, Some('Z') | Some('X'));
-            }
-        }
-        true
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        true
-    }
-}
-
+/// browser + cdp client if it died. Liveness is `Browser::is_alive()` —
+/// `try_wait()` on the owned child — which works on every platform (the
+/// earlier `/proc/{pid}/status` State parse was Linux-only and silently
+/// disabled supervision on macOS), reaps the zombie the State parse existed
+/// to detect, and can't be fooled by PID reuse. The browser mutex is held
+/// only for the non-blocking check, same as the previous pid read.
 async fn supervise(state: DaemonState, paths: DaemonPaths) {
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -937,16 +913,17 @@ async fn supervise(state: DaemonState, paths: DaemonPaths) {
         if !state.ready.load(Ordering::Acquire) {
             continue;
         }
-        let pid = {
-            let guard = state.browser.lock().await;
-            guard.as_ref().and_then(|b| b.pid())
+        let checked = {
+            let mut guard = state.browser.lock().await;
+            guard.as_mut().map(|b| (b.pid(), b.is_alive()))
         };
-        let Some(pid) = pid else {
+        let Some((pid, alive)) = checked else {
             continue;
         };
-        if chromium_alive(pid) {
+        if alive {
             continue;
         }
+        let pid = pid.unwrap_or(0);
         // Crash detected — flip ready off and rebuild.
         eprintln!("[tabd daemon] chromium pid={pid} disappeared; restarting");
         state.ready.store(false, Ordering::Release);
@@ -1253,21 +1230,7 @@ mod tests {
     }
 
     // -- Phase 3g: supervisor --
-
-    #[test]
-    fn chromium_alive_true_for_self() {
-        // self process must always exist; on non-linux the helper returns
-        // true unconditionally which still satisfies this assertion.
-        assert!(chromium_alive(std::process::id()));
-    }
-
-    #[test]
-    fn chromium_alive_false_for_bogus_pid_on_linux() {
-        #[cfg(target_os = "linux")]
-        assert!(!chromium_alive(99_999_999));
-        #[cfg(not(target_os = "linux"))]
-        assert!(chromium_alive(99_999_999));
-    }
+    // Liveness tests live in browser.rs (Browser::is_alive on the owned Child).
 
     #[test]
     fn resolve_key_f5() {

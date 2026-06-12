@@ -12,7 +12,7 @@ dependency-free CLI surface.
   Chromium and its cookies, storage, console history, and tabs.
 - **Auto-spawn** — the first CLI call boots the daemon if none is running.
 - **Crash-restart supervisor** — if Chromium dies the daemon brings up a fresh
-  one within seconds (Linux).
+  one within seconds.
 - **AES-256-GCM secrets vault** — `secret-put` / `type-secret` for login
   automation; plaintext never goes on argv.
 - **`--json` everywhere** — every action accepts `--json` for scriptable output;
@@ -109,7 +109,7 @@ tabd daemon stop
 tabd CLI ──┐
            ├── /tmp/…/daemon.sock ──> tabd daemon ──> chromium (CDP/WS)
 tabd CLI ──┘                              │
-                                          ├── supervise task (Linux)
+                                          ├── supervise task
                                           └── secrets vault (AES-256-GCM)
 ```
 
@@ -117,8 +117,9 @@ tabd CLI ──┘                              │
   ring buffers for console/page-errors/network).
 - **Reader task** routes CDP events into the matching `TabState` — no RPC calls
   from inside the reader (would self-deadlock the registry mutex).
-- **Supervise task** polls `/proc/{pid}/status` every 2 s; on crash it rebuilds
-  the Chromium + CDP client with exponential backoff (5 attempts).
+- **Supervise task** checks Chromium liveness every 2 s (`try_wait()` on the
+  owned child — cross-platform); on crash it rebuilds the Chromium + CDP
+  client with exponential backoff (5 attempts).
 - **CLI dispatcher** auto-spawns the daemon if no socket exists, then routes the
   subcommand to the matching daemon action over UDS.
 - **Secrets vault** is a single AES-256-GCM file at
