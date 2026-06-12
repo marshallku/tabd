@@ -34,7 +34,9 @@ Mirrors the original TS CLI for tooling compatibility:
 
 - `--flag VALUE` and `--flag=VALUE` both accepted
 - `--no-flag` ⇒ `flag: false`
-- Bare `--flag` (no value, no `=`) ⇒ `flag: true`
+- Bare `--flag` (followed by another `--token` or end of argv) ⇒ `flag: true`
+- A value that itself starts with `--` must use the `--flag=VALUE` form
+  (e.g. `--text=--weird-label`); `--flag --weird-label` reads as two bare flags
 - Positionals: action-specific (see each entry's signature)
 - Coercion: `true`/`false`/`null` → typed; integer literals → `i64`; decimal literals → `f64`; anything else → `string`
 - kebab-case flag names get camelCased before reaching the daemon:
@@ -258,11 +260,13 @@ empty lines.
 ### query
 
 ```bash
-tabd query <selector> [--limit N] [--visible-only] [--tab N]
+tabd query <selector> [--text SUBSTR] [--limit N] [--visible-only] [--tab N]
+tabd query --text SUBSTR [--limit N] [--visible-only] [--tab N]   # selector optional with --text
 ```
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
+| `--text` | string | (none) | Keep only elements whose `innerText` contains SUBSTR (case-insensitive; includes descendant text). Without a selector, scope is `*` and only the **deepest** matching elements are returned (ancestors of a match are dropped); an explicit selector disables the deepest-only filter. |
 | `--limit` | number | `20` | Max matched elements to return |
 | `--visible-only` | bool | `false` | Filter to elements with non-zero bounding rect and visible computed style |
 
@@ -322,11 +326,26 @@ All interaction actions auto-wait for the selector to become visible (default
 
 ```bash
 tabd click <selector> [--timeout MS] [--tab N]
+tabd click --text TEXT [--selector SCOPE] [--timeout MS] [--tab N]
 ```
 
-**Returns**: result of `element.click()` evaluation, typically `null` or `undefined`.
+With `--text`, finds and clicks the element whose visible label matches TEXT —
+the agent-friendly path when a CSS selector is unknown:
 
-**Errors**: `"selector SELECTOR not visible after N ms"`.
+- Candidate scope: `--selector` if given, else clickable elements
+  (`a, button, [role=button], input[type=button|submit], label, summary, [onclick]`)
+- Label = `innerText` → `value` (submit/button inputs) → `aria-label` (icon buttons)
+- Visible candidates only; case-insensitive contains; an exact (trimmed) match
+  wins over a contains match; the first match is clicked
+- Polls every 200ms until `--timeout` (default 30000ms)
+
+One of `<selector>` / `--text` is required.
+
+**Returns**: `{ "ok": true }`.
+
+**Errors**: `"selector SELECTOR not visible after N ms"`,
+`"no element with text \"TEXT\" found after N ms"` (both `selector_not_found`,
+exit 5), `"'selector' or 'text' is required"`.
 
 ### type
 

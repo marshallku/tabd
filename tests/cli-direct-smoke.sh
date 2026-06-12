@@ -68,6 +68,7 @@ cat > "$HTML" <<'EOF'
 <body>
 <h1>Direct Smoke</h1>
 <button id="alert-btn" onclick="alert('hello from dialog')">Alert</button>
+<button id="do-btn" onclick="document.title='Clicked'">Do Thing</button>
 <script>
   setTimeout(() => {
     const div = document.createElement("div");
@@ -204,6 +205,37 @@ if [[ "$BIG_RC" == "1" && "$BIG_OUT" == *'"errorCode":"output_too_large"'* ]]; t
   pass "oversized eval → exit 1 + output_too_large"
 else
   fail "eval output clamp" "rc=$BIG_RC out=$BIG_OUT"
+fi
+
+# Case 12: click --text finds and clicks by visible label.
+set +e
+"$BIN" click --text 'do thing' --timeout 5000 >/dev/null 2>&1
+CT_RC=$?
+TITLE_OUT="$("$BIN" eval 'document.title' --json 2>/dev/null)"
+set -e
+if [[ "$CT_RC" == "0" && "$TITLE_OUT" == '"Clicked"' ]]; then
+  pass "click --text by visible label"
+else
+  fail "click --text" "rc=$CT_RC title=$TITLE_OUT"
+fi
+
+# Case 13: query --text (unscoped) returns the deepest matching element only.
+QT_OUT="$("$BIN" query --text 'Deferred Text' --json 2>/dev/null || true)"
+if [[ "$QT_OUT" == *'"tag":"div"'* && "$QT_OUT" != *'"tag":"body"'* ]]; then
+  pass "query --text deepest-match filter"
+else
+  fail "query --text" "got: $QT_OUT"
+fi
+
+# Case 14: click --text for an absent label → selector_not_found / exit 5.
+set +e
+"$BIN" click --text 'absent-label-xyz' --timeout 1200 >/dev/null 2>&1
+CT_MISS_RC=$?
+set -e
+if [[ "$CT_MISS_RC" == "5" ]]; then
+  pass "click --text absent label → exit 5"
+else
+  fail "click --text absent label" "rc=$CT_MISS_RC"
 fi
 
 echo "== summary =="

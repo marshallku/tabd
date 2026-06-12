@@ -158,11 +158,26 @@ pub(super) async fn handle_query_selector(
     state: &DaemonState,
     params: &Value,
 ) -> Result<Option<Value>, String> {
-    let selector = params
+    let text_filter = params
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned);
+    let explicit_selector = params
         .get("selector")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    // With --text and no selector the scope is `*`, but every ancestor of a
+    // match would also match (innerText includes descendants) — so the
+    // unscoped form keeps only the DEEPEST matching elements. An explicit
+    // selector disables that (the caller named the element kind they want).
+    let deepest_only = text_filter.is_some() && explicit_selector.is_none();
+    let selector = match explicit_selector {
+        Some(sel) => sel,
+        None if text_filter.is_some() => "*".to_owned(),
+        None => String::new(),
+    };
     let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
     let visible_only = params
         .get("visibleOnly")
@@ -172,10 +187,25 @@ pub(super) async fn handle_query_selector(
     let client = client_or_err(state).await?;
     let sel_lit = serde_json::to_string(&selector).unwrap();
     let visible_lit = serde_json::to_string(&visible_only).unwrap();
+    // null → no text filtering (JS side short-circuits).
+    let text_lit = match &text_filter {
+        Some(t) => serde_json::to_string(&t.to_lowercase()).map_err(|e| e.to_string())?,
+        None => "null".to_owned(),
+    };
+    let deepest_lit = if deepest_only { "true" } else { "false" };
 
     let expr = format!(
         r#"(() => {{
+    const textFilter = {text_lit};
+    const deepestOnly = {deepest_lit};
+    const matches = (el) => (el.innerText || "").trim().toLowerCase().includes(textFilter);
     return [...document.querySelectorAll({sel_lit})]
+        .filter((el) => {{
+            if (textFilter === null) return true;
+            if (!matches(el)) return false;
+            if (!deepestOnly) return true;
+            return ![...el.children].some(matches);
+        }})
         .filter((el) => {{
             if (!{visible_lit}) return true;
             const rect = el.getBoundingClientRect();

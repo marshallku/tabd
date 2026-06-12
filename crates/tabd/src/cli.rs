@@ -418,9 +418,22 @@ fn parse_args(argv: &[String]) -> ParsedArgs {
             } else {
                 let key = camel(rest);
                 i += 1;
-                let raw = argv.get(i).cloned().unwrap_or_default();
-                p.options.insert(key, coerce(&raw));
-                i += 1;
+                match argv.get(i) {
+                    // Bare flag (end of argv, or the next token is another
+                    // flag) ⇒ true — the behavior commands.md always
+                    // documented. Values that genuinely start with `--` go
+                    // through the `--flag=VALUE` form.
+                    None => {
+                        p.options.insert(key, Value::Bool(true));
+                    }
+                    Some(next) if next.starts_with("--") => {
+                        p.options.insert(key, Value::Bool(true));
+                    }
+                    Some(next) => {
+                        p.options.insert(key, coerce(next));
+                        i += 1;
+                    }
+                }
             }
             continue;
         }
@@ -818,6 +831,28 @@ mod tests {
     fn parse_out_consumes_next() {
         let p = parse_args(&args(&["--out", "shot.png"]));
         assert_eq!(p.output.as_deref(), Some("shot.png"));
+    }
+
+    #[test]
+    fn parse_bare_flag_at_end_is_true() {
+        let p = parse_args(&args(&["--mobile"]));
+        assert_eq!(p.options.get("mobile"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn parse_bare_flag_before_another_flag_is_true() {
+        // The documented `--flag` ⇒ true contract: a bare flag must not
+        // swallow the following flag as its value.
+        let p = parse_args(&args(&["--visible-only", "--limit", "5"]));
+        assert_eq!(p.options.get("visibleOnly"), Some(&Value::Bool(true)));
+        assert_eq!(p.options.get("limit"), Some(&json!(5)));
+    }
+
+    #[test]
+    fn parse_flag_still_consumes_plain_value() {
+        let p = parse_args(&args(&["--text", "Sign in", "--timeout", "1000"]));
+        assert_eq!(p.options.get("text"), Some(&json!("Sign in")));
+        assert_eq!(p.options.get("timeout"), Some(&json!(1000)));
     }
 
     #[test]

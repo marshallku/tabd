@@ -2,26 +2,87 @@
 
 use super::*;
 
+/// Default candidate set for `click --text` when no selector narrows the scope.
+const CLICKABLE_SELECTOR: &str = "a,button,[role=\"button\"],input[type=\"button\"],input[type=\"submit\"],label,summary,[onclick]";
+
 pub(super) async fn handle_click(
     state: &DaemonState,
     params: &Value,
 ) -> Result<Option<Value>, String> {
-    let selector = require_string(params, "selector")?;
+    // Path split happens before any require_* so `click --text` works without
+    // a selector (codex unit-5 plan C4).
+    let text = params
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned);
+    let selector = params
+        .get("selector")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let timeout_ms = clamped_wait_ms(params, 30_000);
     let client = client_or_err(state).await?;
-    wait_for_selector_visible(&client, &selector, timeout_ms).await?;
-    let sel_lit = serde_json::to_string(&selector).unwrap();
-    let expr = format!(
-        "(() => {{
+
+    let Some(text) = text else {
+        let Some(selector) = selector else {
+            return Err("'selector' or 'text' is required".to_owned());
+        };
+        wait_for_selector_visible(&client, &selector, timeout_ms).await?;
+        let sel_lit = serde_json::to_string(&selector).unwrap();
+        let expr = format!(
+            "(() => {{
     const el = document.querySelector({sel_lit});
     if (!el) throw new Error('Selector not found: ' + {sel_lit});
     el.click();
     return {{ ok: true }};
 }})()"
+        );
+        return crate::cmd::eval::evaluate_value(&client, &expr)
+            .await
+            .map_err(|e| e.to_string());
+    };
+
+    // Text path: find-and-click in one evaluation (no TOCTOU between probe
+    // and click), polled until the deadline like the selector wait.
+    let scope = selector.as_deref().unwrap_or(CLICKABLE_SELECTOR);
+    let scope_lit = serde_json::to_string(scope).map_err(|e| e.to_string())?;
+    let text_lit = serde_json::to_string(&text.to_lowercase()).map_err(|e| e.to_string())?;
+    let probe = format!(
+        r#"(() => {{
+    const wanted = {text_lit};
+    const labelOf = (el) =>
+        ((el.innerText || "").trim()
+            || el.value
+            || el.getAttribute("aria-label")
+            || "").trim();
+    const candidates = [...document.querySelectorAll({scope_lit})]
+        .filter((el) => {{
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+        }})
+        .map((el) => ({{ el, label: labelOf(el).toLowerCase() }}))
+        .filter((c) => c.label.includes(wanted));
+    if (!candidates.length) return false;
+    const exact = candidates.find((c) => c.label === wanted);
+    (exact || candidates[0]).el.click();
+    return true;
+}})()"#
     );
-    crate::cmd::eval::evaluate_value(&client, &expr)
-        .await
-        .map_err(|e| e.to_string())
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if let Ok(Some(Value::Bool(true))) = crate::cmd::eval::evaluate_value(&client, &probe).await
+        {
+            return Ok(Some(json!({ "ok": true })));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no element with text {text:?} found after {timeout_ms}ms"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 pub(super) async fn handle_type(

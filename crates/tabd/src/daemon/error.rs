@@ -63,6 +63,7 @@ pub(crate) fn classify_error_code(message: &str) -> ErrorCode {
     if m.contains("selector not found:")
         || m.contains("selector miss")
         || m.contains("not visible after")
+        || m.contains("no element with text")
     {
         ErrorCode::SelectorNotFound
     } else if m.contains("tab not found:") || m.contains("no browser tabs are open") {
@@ -111,6 +112,16 @@ mod tests {
         // wait_for_selector_visible deadline expiry.
         assert_eq!(
             classify_error_code("selector .login not visible after 30000ms"),
+            ErrorCode::SelectorNotFound
+        );
+        // click --text expiry — both bare (Rust-generated) and wrapped in an
+        // eval prefix must beat the eval_error branch.
+        assert_eq!(
+            classify_error_code("no element with text \"Sign in\" found after 30000ms"),
+            ErrorCode::SelectorNotFound
+        );
+        assert_eq!(
+            classify_error_code("Runtime.evaluate: Error: no element with text \"x\" found"),
             ErrorCode::SelectorNotFound
         );
     }

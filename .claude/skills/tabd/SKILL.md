@@ -54,7 +54,7 @@ tabd eval 'await fetch("/api/data").then(r => r.json())' --json
 | 페이지 요약 (LLM-friendly) | `tabd summary --json` |
 | JS 실행 / fetch | `tabd eval '<js>' --json` |
 | 스크린샷 | `tabd screenshot --out file.png` |
-| 클릭 / 타이핑 | `tabd click <sel>` / `tabd type <sel> <text>` |
+| 클릭 / 타이핑 | `tabd click <sel>` / `tabd click --text "로그인"` (셀렉터 모를 때) / `tabd type <sel> <text>` |
 | 비밀번호 입력 | `tabd type-secret <sel> --secret-id <id>` |
 | 로딩 대기 | `tabd wait-selector <sel>` / `tabd wait-url <pat> --pattern-type glob` / `tabd wait-text "문구"` |
 | 네트워크 idle | `tabd wait-network-idle --idle-time 1500` |
