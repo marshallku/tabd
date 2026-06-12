@@ -400,6 +400,35 @@ fn clamp_value_chars(v: Value, max: u64) -> Value {
     }
 }
 
+/// JS prelude binding `__doc` — the document every selector lookup scopes to.
+/// No frame → the main document. With a frame selector → the same-origin
+/// frame's contentDocument; a missing frame throws the regular selector error
+/// (exit 5) and a cross-origin / non-frame element throws a distinct,
+/// invalid_request-classified error so agents know it's a capability limit,
+/// not a flaky selector. Single level only — no nested frame chaining.
+fn doc_prelude(frame_selector: Option<&str>) -> Result<String, String> {
+    let Some(frame) = frame_selector.filter(|f| !f.is_empty()) else {
+        return Ok("const __doc = document;".to_string());
+    };
+    let frame_lit = serde_json::to_string(frame).map_err(|e| e.to_string())?;
+    Ok(format!(
+        r#"const __frameEl = document.querySelector({frame_lit});
+    if (!__frameEl) throw new Error('Selector not found: ' + {frame_lit});
+    let __doc = null;
+    try {{ __doc = __frameEl.contentDocument; }} catch (e) {{ __doc = null; }}
+    if (!__doc) throw new Error('frame is cross-origin or not a frame: ' + {frame_lit});"#
+    ))
+}
+
+/// Read the optional `frame` param shared by the --frame-capable handlers.
+fn frame_param(params: &Value) -> Option<String> {
+    params
+        .get("frame")
+        .and_then(Value::as_str)
+        .filter(|f| !f.is_empty())
+        .map(str::to_owned)
+}
+
 /// Lenient u64 param read: CLI positionals cross the wire as strings, so
 /// accept a JSON number or a numeric string.
 fn loose_u64(params: &Value, key: &str) -> Option<u64> {
@@ -441,11 +470,14 @@ async fn wait_for_selector_visible(
     client: &Arc<CdpClient>,
     selector: &str,
     timeout_ms: u64,
+    frame_selector: Option<&str>,
 ) -> Result<(), String> {
     let sel_lit = serde_json::to_string(selector).map_err(|e| e.to_string())?;
+    let prelude = doc_prelude(frame_selector)?;
     let probe = format!(
         "(() => {{
-    const el = document.querySelector({sel_lit});
+    {prelude}
+    const el = __doc.querySelector({sel_lit});
     if (!el) return false;
     const rect = el.getBoundingClientRect();
     const style = getComputedStyle(el);
@@ -454,9 +486,20 @@ async fn wait_for_selector_visible(
     );
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        if let Ok(Some(Value::Bool(true))) = crate::cmd::eval::evaluate_value(client, &probe).await
-        {
-            return Ok(());
+        match crate::cmd::eval::evaluate_value(client, &probe).await {
+            Ok(Some(Value::Bool(true))) => return Ok(()),
+            // Frame failures fail fast: the inner selector never throws in
+            // this probe (it returns false), so any "Selector not found:" /
+            // cross-origin throw can only be the frame prelude — and waiting
+            // won't conjure the frame's document. To wait for a frame to
+            // mount, wait-selector the frame element itself first.
+            Err(e)
+                if e.to_string().contains("cross-origin or not a frame")
+                    || e.to_string().contains("Selector not found:") =>
+            {
+                return Err(e.to_string());
+            }
+            _ => {}
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -1087,6 +1130,19 @@ mod tests {
         let clamped = clamp_value_chars(json!("xy"), 1);
         let s = clamped.as_str().unwrap();
         assert!(s.starts_with("x…[truncated: 1 of 2 chars"), "got: {s}");
+    }
+
+    #[test]
+    fn doc_prelude_shapes() {
+        // No frame / empty frame → plain main-document binding.
+        assert_eq!(doc_prelude(None).unwrap(), "const __doc = document;");
+        assert_eq!(doc_prelude(Some("")).unwrap(), "const __doc = document;");
+        // Frame form carries both failure modes with their exact, classified
+        // wordings (selector_not_found / invalid_request).
+        let p = doc_prelude(Some("#fr")).unwrap();
+        assert!(p.contains("contentDocument"), "got: {p}");
+        assert!(p.contains("Selector not found:"), "got: {p}");
+        assert!(p.contains("cross-origin or not a frame"), "got: {p}");
     }
 
     #[test]

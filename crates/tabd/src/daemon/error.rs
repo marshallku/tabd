@@ -68,6 +68,10 @@ pub(crate) fn classify_error_code(message: &str) -> ErrorCode {
         ErrorCode::SelectorNotFound
     } else if m.contains("tab not found:") || m.contains("no browser tabs are open") {
         ErrorCode::TabNotFound
+    } else if m.contains("cross-origin or not a frame") {
+        // --frame capability limit; checked before the eval prefix because
+        // the message surfaces as a JS throw wrapped in "Runtime.evaluate:".
+        ErrorCode::InvalidRequest
     } else if m.starts_with("runtime.evaluate:") || m.starts_with("runtime.callfunctionon:") {
         ErrorCode::EvalError
     } else if m.contains("timed out") {
@@ -217,6 +221,14 @@ mod tests {
         );
         assert_eq!(
             classify_error_code("file not found: /tmp/missing.csv"),
+            ErrorCode::InvalidRequest
+        );
+        // --frame on a cross-origin iframe — capability limit, not a flaky
+        // selector; must hold even wrapped in the eval prefix.
+        assert_eq!(
+            classify_error_code(
+                "Runtime.evaluate: Error: frame is cross-origin or not a frame: #xfr"
+            ),
             ErrorCode::InvalidRequest
         );
     }

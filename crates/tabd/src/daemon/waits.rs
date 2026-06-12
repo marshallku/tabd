@@ -8,8 +8,9 @@ pub(super) async fn handle_wait_selector(
 ) -> Result<Option<Value>, String> {
     let selector = require_string(params, "selector")?;
     let timeout_ms = clamped_wait_ms(params, 30_000);
+    let frame = frame_param(params);
     let client = client_or_err(state).await?;
-    wait_for_selector_visible(&client, &selector, timeout_ms).await?;
+    wait_for_selector_visible(&client, &selector, timeout_ms, frame.as_deref()).await?;
     Ok(Some(json!({ "found": true })))
 }
 
@@ -26,18 +27,20 @@ pub(super) async fn handle_wait_text(
     let client = client_or_err(state).await?;
 
     let text_lit = serde_json::to_string(&text).map_err(|e| e.to_string())?;
+    let prelude = doc_prelude(frame_param(params).as_deref())?;
     // Missing scope keeps polling (it may mount later) — expiry then lands on
     // the same `timeout` classification as a never-appearing text. Conscious
     // tradeoff: an invalid selector is indistinguishable from slow content.
     let scope_expr = match &selector {
         Some(sel) => {
             let sel_lit = serde_json::to_string(sel).map_err(|e| e.to_string())?;
-            format!("document.querySelector({sel_lit})")
+            format!("__doc.querySelector({sel_lit})")
         }
-        None => "document.body".to_string(),
+        None => "__doc.body".to_string(),
     };
     let probe = format!(
         "(() => {{
+    {prelude}
     const el = {scope_expr};
     if (!el) return false;
     return (el.innerText || el.textContent || \"\").includes({text_lit});
@@ -45,9 +48,17 @@ pub(super) async fn handle_wait_text(
     );
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        if let Ok(Some(Value::Bool(true))) = crate::cmd::eval::evaluate_value(&client, &probe).await
-        {
-            return Ok(Some(json!({ "found": true })));
+        match crate::cmd::eval::evaluate_value(&client, &probe).await {
+            Ok(Some(Value::Bool(true))) => return Ok(Some(json!({ "found": true }))),
+            // Frame failures (missing frame / cross-origin) fail fast —
+            // the probe's inner lookup returns false rather than throwing.
+            Err(e)
+                if e.to_string().contains("cross-origin or not a frame")
+                    || e.to_string().contains("Selector not found:") =>
+            {
+                return Err(e.to_string());
+            }
+            _ => {}
         }
         if Instant::now() >= deadline {
             return Err(format!(

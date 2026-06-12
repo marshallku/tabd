@@ -93,7 +93,7 @@ pub(super) async fn handle_type_secret(
 
     let client = client_or_err(state).await?;
     let tid = resolve_target_id(&client, tab_id).await?;
-    wait_for_selector_visible(&client, &selector, 30_000).await?;
+    wait_for_selector_visible(&client, &selector, 30_000, None).await?;
 
     let sel_lit = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
     let value_lit = serde_json::to_string(&plaintext).map_err(|e| e.to_string())?;

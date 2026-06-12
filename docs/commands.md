@@ -56,6 +56,25 @@ Mirrors the original TS CLI for tooling compatibility:
 `screenshot`, `eval`, `list-tabs`, `open-tab`, all `cookies-*`, all `storage-*`,
 all `secret-*`.
 
+### `--frame` (iframe targeting)
+
+`get-text`, `get-html`, `query` (incl. `--text`), `click` (both paths, incl.
+the implicit visibility wait), `type`, `wait-selector`, and `wait-text` accept
+`--frame FRAME_SELECTOR`: every selector/text lookup then scopes to that
+iframe's document instead of the main document.
+
+- **Same-origin frames only** (`contentDocument` access). A cross-origin or
+  OOPIF frame fails immediately with
+  `"frame is cross-origin or not a frame: …"` → `invalid_request` — it will
+  not become accessible by waiting, so waits fail fast on it.
+- A **missing** frame element fails fast with `Selector not found: FRAME`
+  (exit 5) — including inside waits, where the inner lookup polls but the
+  frame lookup doesn't. To wait for a frame to mount, `wait-selector` the
+  frame element itself first, then target into it.
+- Single level only — no nested `--frame` chaining.
+- Not available on coordinate/CDP-node based actions
+  (`hover`, `scroll`, `press-key`, `select-option`, `check`, `upload`).
+
 ### Return shape
 
 All daemon responses come back as `{ id, success, data }`. The CLI unwraps:
@@ -228,7 +247,7 @@ if there is nothing to go back to.
 ### get-html
 
 ```bash
-tabd get-html [--selector SELECTOR] [--no-outer] [--no-clean] [--max-chars N] [--tab N]
+tabd get-html [--selector SELECTOR] [--no-outer] [--no-clean] [--max-chars N] [--frame SEL] [--tab N]
 ```
 
 | Option | Type | Default | Meaning |
@@ -245,7 +264,7 @@ tabd get-html [--selector SELECTOR] [--no-outer] [--no-clean] [--max-chars N] [-
 ### get-text
 
 ```bash
-tabd get-text [--selector SELECTOR] [--raw] [--max-chars N] [--tab N]
+tabd get-text [--selector SELECTOR] [--raw] [--max-chars N] [--frame SEL] [--tab N]
 ```
 
 | Option | Type | Default | Meaning |
@@ -260,8 +279,8 @@ empty lines.
 ### query
 
 ```bash
-tabd query <selector> [--text SUBSTR] [--limit N] [--visible-only] [--tab N]
-tabd query --text SUBSTR [--limit N] [--visible-only] [--tab N]   # selector optional with --text
+tabd query <selector> [--text SUBSTR] [--limit N] [--visible-only] [--frame SEL] [--tab N]
+tabd query --text SUBSTR [--limit N] [--visible-only] [--frame SEL] [--tab N]   # selector optional with --text
 ```
 
 | Option | Type | Default | Meaning |
@@ -325,8 +344,8 @@ All interaction actions auto-wait for the selector to become visible (default
 ### click
 
 ```bash
-tabd click <selector> [--timeout MS] [--tab N]
-tabd click --text TEXT [--selector SCOPE] [--timeout MS] [--tab N]
+tabd click <selector> [--timeout MS] [--frame SEL] [--tab N]
+tabd click --text TEXT [--selector SCOPE] [--timeout MS] [--frame SEL] [--tab N]
 ```
 
 With `--text`, finds and clicks the element whose visible label matches TEXT —
@@ -369,7 +388,7 @@ Sets a local file on an `<input type=file>` via CDP `DOM.setFileInputFiles`
 ### type
 
 ```bash
-tabd type <selector> <text> [--timeout MS] [--tab N]
+tabd type <selector> <text> [--timeout MS] [--frame SEL] [--tab N]
 ```
 
 Types `text` into an `<input>` / `<textarea>` / `contentEditable` element.
@@ -566,7 +585,7 @@ corrupt truncated JSON — narrow the expression or raise/disable the clamp.
 ### wait-selector
 
 ```bash
-tabd wait-selector <selector> [--timeout MS] [--tab N]
+tabd wait-selector <selector> [--timeout MS] [--frame SEL] [--tab N]
 ```
 
 Polls until the selector resolves to a visible element. Default timeout 30000ms.
@@ -600,7 +619,7 @@ Default timeout 30000ms.
 ### wait-text
 
 ```bash
-tabd wait-text <text> [--selector SCOPE] [--timeout MS] [--tab N]
+tabd wait-text <text> [--selector SCOPE] [--timeout MS] [--frame SEL] [--tab N]
 ```
 
 Polls every 200ms until `text` appears in the scope's `innerText`

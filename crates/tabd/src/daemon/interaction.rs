@@ -22,17 +22,20 @@ pub(super) async fn handle_click(
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
     let timeout_ms = clamped_wait_ms(params, 30_000);
+    let frame = frame_param(params);
     let client = client_or_err(state).await?;
 
     let Some(text) = text else {
         let Some(selector) = selector else {
             return Err("'selector' or 'text' is required".to_owned());
         };
-        wait_for_selector_visible(&client, &selector, timeout_ms).await?;
+        wait_for_selector_visible(&client, &selector, timeout_ms, frame.as_deref()).await?;
         let sel_lit = serde_json::to_string(&selector).unwrap();
+        let prelude = doc_prelude(frame.as_deref())?;
         let expr = format!(
             "(() => {{
-    const el = document.querySelector({sel_lit});
+    {prelude}
+    const el = __doc.querySelector({sel_lit});
     if (!el) throw new Error('Selector not found: ' + {sel_lit});
     el.click();
     return {{ ok: true }};
@@ -48,15 +51,17 @@ pub(super) async fn handle_click(
     let scope = selector.as_deref().unwrap_or(CLICKABLE_SELECTOR);
     let scope_lit = serde_json::to_string(scope).map_err(|e| e.to_string())?;
     let text_lit = serde_json::to_string(&text.to_lowercase()).map_err(|e| e.to_string())?;
+    let prelude = doc_prelude(frame.as_deref())?;
     let probe = format!(
         r#"(() => {{
+    {prelude}
     const wanted = {text_lit};
     const labelOf = (el) =>
         ((el.innerText || "").trim()
             || el.value
             || el.getAttribute("aria-label")
             || "").trim();
-    const candidates = [...document.querySelectorAll({scope_lit})]
+    const candidates = [...__doc.querySelectorAll({scope_lit})]
         .filter((el) => {{
             const rect = el.getBoundingClientRect();
             const style = getComputedStyle(el);
@@ -72,9 +77,17 @@ pub(super) async fn handle_click(
     );
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        if let Ok(Some(Value::Bool(true))) = crate::cmd::eval::evaluate_value(&client, &probe).await
-        {
-            return Ok(Some(json!({ "ok": true })));
+        match crate::cmd::eval::evaluate_value(&client, &probe).await {
+            Ok(Some(Value::Bool(true))) => return Ok(Some(json!({ "ok": true }))),
+            // Frame failures (missing frame / cross-origin) fail fast —
+            // the probe's inner lookup returns false rather than throwing.
+            Err(e)
+                if e.to_string().contains("cross-origin or not a frame")
+                    || e.to_string().contains("Selector not found:") =>
+            {
+                return Err(e.to_string());
+            }
+            _ => {}
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -146,16 +159,19 @@ pub(super) async fn handle_type(
     let selector = require_string(params, "selector")?;
     let text = require_string(params, "text")?;
     let timeout_ms = clamped_wait_ms(params, 30_000);
+    let frame = frame_param(params);
     let client = client_or_err(state).await?;
-    wait_for_selector_visible(&client, &selector, timeout_ms).await?;
+    wait_for_selector_visible(&client, &selector, timeout_ms, frame.as_deref()).await?;
     let sel_lit = serde_json::to_string(&selector).unwrap();
     let text_lit = serde_json::to_string(&text).unwrap();
+    let prelude = doc_prelude(frame.as_deref())?;
     // JS-based type (spike scope) — sets .value + fires input/change events.
     // Plain HTML forms work; some React/Vue controlled inputs may need the
     // native setter trick, which is phase 2c (real CDP Input.dispatchKeyEvent).
     let expr = format!(
         "(() => {{
-    const el = document.querySelector({sel_lit});
+    {prelude}
+    const el = __doc.querySelector({sel_lit});
     if (!el) throw new Error('Selector not found: ' + {sel_lit});
     el.focus();
     el.value = {text_lit};
@@ -177,7 +193,7 @@ pub(super) async fn handle_hover(
     let offset_x = params.get("x").and_then(Value::as_f64);
     let offset_y = params.get("y").and_then(Value::as_f64);
     let client = client_or_err(state).await?;
-    wait_for_selector_visible(&client, &selector, 30_000).await?;
+    wait_for_selector_visible(&client, &selector, 30_000, None).await?;
 
     let sel_lit = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
     let ox = offset_x
@@ -336,7 +352,7 @@ pub(super) async fn handle_select_option(
 ) -> Result<Option<Value>, String> {
     let selector = require_string(params, "selector")?;
     let client = client_or_err(state).await?;
-    wait_for_selector_visible(&client, &selector, 30_000).await?;
+    wait_for_selector_visible(&client, &selector, 30_000, None).await?;
 
     let value_lit = params
         .get("value")
@@ -391,7 +407,7 @@ pub(super) async fn handle_check(
         .and_then(Value::as_bool)
         .unwrap_or(true); // TS: checked !== false
     let client = client_or_err(state).await?;
-    wait_for_selector_visible(&client, &selector, 30_000).await?;
+    wait_for_selector_visible(&client, &selector, 30_000, None).await?;
     let sel_lit = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
     let expr = format!(
         r#"

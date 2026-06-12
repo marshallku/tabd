@@ -72,6 +72,8 @@ cat > "$HTML" <<'EOF'
 <button id="do-btn" onclick="document.title='Clicked'">Do Thing</button>
 <input type="file" id="file-in" style="display:none">
 <label for="file-in">Attach file</label>
+<iframe id="fr" srcdoc="<button id='fbtn' onclick=&quot;document.title='FrameClicked'&quot;>Frame Btn</button><p id='ftext'>Frame Text</p>"></iframe>
+<iframe id="xfr" src="data:text/html,<p>opaque</p>"></iframe>
 <script>
   setTimeout(() => {
     const div = document.createElement("div");
@@ -279,6 +281,32 @@ if [[ "$VP_RC" == "0" && "$VP_W" == "390" ]]; then
   pass "set-viewport 390x844 --mobile (innerWidth=390)"
 else
   fail "set-viewport" "rc=$VP_RC innerWidth=$VP_W"
+fi
+
+# Case 18: --frame on a same-origin (srcdoc) iframe — wait, read, click.
+set +e
+"$BIN" wait-selector '#ftext' --frame '#fr' --timeout 5000 >/dev/null 2>&1
+FR_WAIT_RC=$?
+FR_TEXT="$("$BIN" get-text --selector '#ftext' --frame '#fr' --json 2>/dev/null)"
+"$BIN" click --text 'frame btn' --frame '#fr' --timeout 5000 >/dev/null 2>&1
+FR_CLICK_RC=$?
+FR_TITLE="$("$BIN" eval 'document.querySelector("#fr").contentDocument.title' --json 2>/dev/null)"
+set -e
+if [[ "$FR_WAIT_RC" == "0" && "$FR_TEXT" == '"Frame Text"' && "$FR_CLICK_RC" == "0" && "$FR_TITLE" == '"FrameClicked"' ]]; then
+  pass "--frame same-origin iframe (wait + get-text + click --text)"
+else
+  fail "--frame same-origin" "wait=$FR_WAIT_RC text=$FR_TEXT click=$FR_CLICK_RC title=$FR_TITLE"
+fi
+
+# Case 19: --frame on an opaque-origin (data:) iframe → invalid_request, fast.
+set +e
+XFR_OUT="$("$BIN" get-text --frame '#xfr' --timeout 5000 --json 2>/dev/null)"
+XFR_RC=$?
+set -e
+if [[ "$XFR_RC" == "1" && "$XFR_OUT" == *'"errorCode":"invalid_request"'* ]]; then
+  pass "--frame cross-origin iframe → invalid_request"
+else
+  fail "--frame cross-origin" "rc=$XFR_RC out=$XFR_OUT"
 fi
 
 echo "== summary =="

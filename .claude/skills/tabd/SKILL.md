@@ -99,7 +99,9 @@ tabd eval 'await fetch("/api/data").then(r => r.json())' --json
 
 9. **JS dialog (alert/confirm/prompt)는 daemon이 자동 처리** — 기본 dismiss, `beforeunload`는 자동 accept (navigation 막힘 방지). confirm을 수락해야 하는 플로우면 클릭 **전에** `tabd dialog-policy accept` (필요시 `--prompt-text`). 무슨 dialog가 떴고 어떻게 처리됐는지는 `tabd dialogs --json`으로 감사. 이미 열린 dialog를 나중에 응답하는 건 구조적으로 불가능 (action lock) — policy는 사전 설정.
 
-10. **`get-html`/`get-text`/`eval` 출력은 기본 500k chars에서 잘림** (`…[truncated: …]` 마커 부착). 전체가 필요하면 `--max-chars 0`, 더 줄이려면 `--max-chars 5000` 등. 객체를 반환하는 `eval`이 한도를 넘으면 `output_too_large` 에러 — 표현식에서 덜 가져오게 좁힐 것.
+10. **iframe 안 요소는 `--frame '<iframe selector>'`로 접근** — `get-text`/`get-html`/`query`/`click`/`type`/`wait-selector`/`wait-text`에서 지원. same-origin 프레임만 가능하고 cross-origin이면 `invalid_request`로 즉시 실패 (결제 위젯 등 cross-origin iframe은 자동화 불가 — 사용자에게 한계 안내).
+
+11. **`get-html`/`get-text`/`eval` 출력은 기본 500k chars에서 잘림** (`…[truncated: …]` 마커 부착). 전체가 필요하면 `--max-chars 0`, 더 줄이려면 `--max-chars 5000` 등. 객체를 반환하는 `eval`이 한도를 넘으면 `output_too_large` 에러 — 표현식에서 덜 가져오게 좁힐 것.
 
 ## 시크릿 (vault) 사용
 

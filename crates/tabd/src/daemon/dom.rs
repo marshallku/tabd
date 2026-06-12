@@ -87,8 +87,9 @@ pub(super) async fn handle_get_text(
 
     let body = crate::cmd::get_text::build_text_body(raw);
     let sel_lit = serde_json::to_string(&selector).map_err(|e| format!("selector encode: {e}"))?;
+    let prelude = doc_prelude(frame_param(params).as_deref())?;
     let expr = format!(
-        "(() => {{ const target = document.querySelector({sel_lit}) ?? document.body; {body} }})()"
+        "(() => {{ {prelude} const target = __doc.querySelector({sel_lit}) ?? __doc.body; {body} }})()"
     );
 
     // dom.getText always returns a string (TS wraps with String(...)). Map
@@ -120,15 +121,17 @@ pub(super) async fn handle_get_html(
     let sel_lit = serde_json::to_string(&selector).unwrap();
     let outer_lit = serde_json::to_string(&outer).unwrap();
     let clean_lit = serde_json::to_string(&clean).unwrap();
+    let prelude = doc_prelude(frame_param(params).as_deref())?;
 
     let expr = format!(
         r#"(() => {{
-    const node = document.querySelector({sel_lit});
+    {prelude}
+    const node = __doc.querySelector({sel_lit});
     if (!node) throw new Error('Selector not found: ' + {sel_lit});
     const clone = node.cloneNode(true);
     if ({clean_lit}) {{
         clone.querySelectorAll("script,style,svg").forEach((el) => el.remove());
-        const walker = document.createTreeWalker(clone, NodeFilter.SHOW_COMMENT);
+        const walker = __doc.createTreeWalker(clone, NodeFilter.SHOW_COMMENT);
         const comments = [];
         while (walker.nextNode()) comments.push(walker.currentNode);
         comments.forEach((node) => node.remove());
@@ -193,13 +196,15 @@ pub(super) async fn handle_query_selector(
         None => "null".to_owned(),
     };
     let deepest_lit = if deepest_only { "true" } else { "false" };
+    let prelude = doc_prelude(frame_param(params).as_deref())?;
 
     let expr = format!(
         r#"(() => {{
+    {prelude}
     const textFilter = {text_lit};
     const deepestOnly = {deepest_lit};
     const matches = (el) => (el.innerText || "").trim().toLowerCase().includes(textFilter);
-    return [...document.querySelectorAll({sel_lit})]
+    return [...__doc.querySelectorAll({sel_lit})]
         .filter((el) => {{
             if (textFilter === null) return true;
             if (!matches(el)) return false;
