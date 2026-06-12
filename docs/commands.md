@@ -9,9 +9,9 @@ the daemon see [operations.md](operations.md).
 
 - [Conventions](#conventions) — global flags, argv parsing, tab semantics
 - [Daemon control](#daemon-control) — `daemon start/stop/ping/health`
-- Actions (43 total, grouped):
+- Actions (44 total, grouped):
   - [Tabs](#tabs) (8) · [DOM](#dom) (4) · [Interaction](#interaction) (9)
-  - [Capture](#capture) (2) · [Execution](#execution) (1) · [Wait](#wait) (4)
+  - [Capture](#capture) (2) · [Emulation](#emulation) (1) · [Execution](#execution) (1) · [Wait](#wait) (4)
   - [Cookies](#cookies) (3) · [Storage](#storage) (3) · [Monitor](#monitor) (4)
   - [Dialogs](#dialogs-1) (1) · [Secrets](#secrets) (4)
 
@@ -493,6 +493,31 @@ tabd metrics [--tab N]
 
 `navigation` may be `null` if `performance.getEntriesByType("navigation")` is
 empty (e.g. very fresh tab).
+
+---
+
+## Emulation
+
+### set-viewport
+
+```bash
+tabd set-viewport <width> <height> [--scale N] [--mobile] [--tab N]
+```
+
+Applies CDP `Emulation.setDeviceMetricsOverride` to the tab. Layout updates
+immediately (no reload); `screenshot` captures the emulated viewport.
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `--scale` | number | `1` | deviceScaleFactor |
+| `--mobile` | bool | `false` | Mobile layout mode (meta-viewport handling, scrollbars). Note: on pages **without** a `<meta name=viewport>` tag, mobile mode lays out at the classic 980px viewport (like a real phone), so `innerWidth` won't equal the device width. |
+
+Persists for the tab until the daemon (or Chromium) restarts. To "reset", set
+the desired size again. User-agent override is intentionally not included.
+
+**Returns**: `{ "width": N, "height": N, "scale": N, "mobile": bool }`.
+
+**Errors**: `"missing 'width' (number)"`, `"invalid 'width'/'height' (must be >= 1)"`.
 
 ---
 

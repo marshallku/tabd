@@ -64,7 +64,8 @@ echo "== cli-direct-smoke (auto-spawn + render) =="
 HTML="$TMP/page.html"
 cat > "$HTML" <<'EOF'
 <!doctype html>
-<html><head><title>Direct</title></head>
+<html><head><title>Direct</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"></head>
 <body>
 <h1>Direct Smoke</h1>
 <button id="alert-btn" onclick="alert('hello from dialog')">Alert</button>
@@ -263,6 +264,21 @@ if [[ "$UP_MISS_RC" == "2" ]]; then
   pass "upload missing file → exit 2 (client-side)"
 else
   fail "upload missing file" "rc=$UP_MISS_RC"
+fi
+
+# Case 17: set-viewport --mobile applies the emulation override. The test
+# page carries a `<meta name=viewport>` tag — without one, mobile mode lays
+# out at the classic 980px viewport (real-device behavior) and innerWidth
+# would read 980 instead of the device width.
+set +e
+"$BIN" set-viewport 390 844 --mobile >/dev/null 2>&1
+VP_RC=$?
+VP_W="$("$BIN" eval 'window.innerWidth' --json 2>/dev/null)"
+set -e
+if [[ "$VP_RC" == "0" && "$VP_W" == "390" ]]; then
+  pass "set-viewport 390x844 --mobile (innerWidth=390)"
+else
+  fail "set-viewport" "rc=$VP_RC innerWidth=$VP_W"
 fi
 
 echo "== summary =="

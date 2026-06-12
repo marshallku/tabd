@@ -400,6 +400,25 @@ fn clamp_value_chars(v: Value, max: u64) -> Value {
     }
 }
 
+/// Lenient u64 param read: CLI positionals cross the wire as strings, so
+/// accept a JSON number or a numeric string.
+fn loose_u64(params: &Value, key: &str) -> Option<u64> {
+    match params.get(key) {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Lenient f64 param read — same string-positional rationale as [`loose_u64`].
+fn loose_f64(params: &Value, key: &str) -> Option<f64> {
+    match params.get(key) {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// Read a user-supplied `timeout` (ms) for a wait, clamped to [`MAX_WAIT_MS`].
 fn clamped_wait_ms(params: &Value, default: u64) -> u64 {
     optional_u64(params, "timeout", default).min(MAX_WAIT_MS)
@@ -671,6 +690,7 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "monitor.consoleLogs" => monitor::handle_console_logs(state, &req.params).await,
         "monitor.pageErrors" => monitor::handle_page_errors(state, &req.params).await,
         "capture.metrics" => capture::handle_metrics(state, &req.params).await,
+        "emulation.setViewport" => capture::handle_set_viewport(state, &req.params).await,
         "dom.contentSummary" => dom::handle_content_summary(state, &req.params).await,
         "monitor.networkLogs" => monitor::handle_network_logs(state, &req.params).await,
         "monitor.dialogs" => monitor::handle_dialogs(state, &req.params).await,
@@ -1067,6 +1087,19 @@ mod tests {
         let clamped = clamp_value_chars(json!("xy"), 1);
         let s = clamped.as_str().unwrap();
         assert!(s.starts_with("x…[truncated: 1 of 2 chars"), "got: {s}");
+    }
+
+    #[test]
+    fn loose_numeric_params_accept_numbers_and_strings() {
+        // CLI positionals arrive as strings; flags arrive coerced to numbers.
+        assert_eq!(loose_u64(&json!({"width": 390}), "width"), Some(390));
+        assert_eq!(loose_u64(&json!({"width": "390"}), "width"), Some(390));
+        assert_eq!(loose_u64(&json!({"width": " 390 "}), "width"), Some(390));
+        assert_eq!(loose_u64(&json!({"width": "x"}), "width"), None);
+        assert_eq!(loose_u64(&json!({}), "width"), None);
+        assert_eq!(loose_f64(&json!({"scale": 2.5}), "scale"), Some(2.5));
+        assert_eq!(loose_f64(&json!({"scale": "2.5"}), "scale"), Some(2.5));
+        assert_eq!(loose_f64(&json!({"scale": "x"}), "scale"), None);
     }
 
     #[test]

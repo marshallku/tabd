@@ -47,7 +47,7 @@ afterwards so it reloads skill metadata.
 
 ## Surface
 
-43 action subcommands + 4 daemon controls.
+44 action subcommands + 4 daemon controls.
 
 | Category | Commands |
 |---|---|
@@ -55,6 +55,7 @@ afterwards so it reloads skill metadata.
 | **DOM** | `get-html`, `get-text`, `query`, `summary` |
 | **Interaction** | `click`, `type`, `hover`, `mouse-move`, `scroll`, `press-key`, `select-option`, `check`, `upload` |
 | **Capture** | `screenshot`, `metrics` |
+| **Emulation** | `set-viewport` |
 | **Execution** | `eval` |
 | **Wait** | `wait-selector`, `wait-url`, `wait-text`, `wait-network-idle` |
 | **Cookies** | `cookies-get`, `cookies-set`, `cookies-delete` |

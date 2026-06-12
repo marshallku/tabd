@@ -54,6 +54,7 @@ tabd eval 'await fetch("/api/data").then(r => r.json())' --json
 | 페이지 요약 (LLM-friendly) | `tabd summary --json` |
 | JS 실행 / fetch | `tabd eval '<js>' --json` |
 | 스크린샷 | `tabd screenshot --out file.png` |
+| 모바일/반응형 뷰 | `tabd set-viewport 390 844 --mobile` |
 | 클릭 / 타이핑 | `tabd click <sel>` / `tabd click --text "로그인"` (셀렉터 모를 때) / `tabd type <sel> <text>` |
 | 비밀번호 입력 | `tabd type-secret <sel> --secret-id <id>` |
 | 파일 업로드 | `tabd upload <sel> <file>` (`<input type=file>` 전용, 숨겨진 input OK) |

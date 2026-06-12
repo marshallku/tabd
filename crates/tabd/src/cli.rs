@@ -287,6 +287,14 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
             positional: &[],
         },
     );
+    // Audit unit 5c — viewport emulation.
+    m.insert(
+        "set-viewport",
+        Spec {
+            action: "emulation.setViewport",
+            positional: &["width", "height"],
+        },
+    );
     m.insert(
         "summary",
         Spec {
@@ -1052,8 +1060,14 @@ mod tests {
             "secret-delete",
             "type-secret",
         ];
-        // Audit units 3+5: dialog auto-handling, wait-text, upload.
-        let tier_6 = ["wait-text", "dialogs", "dialog-policy", "upload"];
+        // Audit units 3+5: dialog auto-handling, wait-text, upload, viewport.
+        let tier_6 = [
+            "wait-text",
+            "dialogs",
+            "dialog-policy",
+            "upload",
+            "set-viewport",
+        ];
         for name in tier_1
             .iter()
             .chain(tier_3.iter())
