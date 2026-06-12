@@ -667,6 +667,7 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "interaction.pressKey" => interaction::handle_press_key(state, &req.params).await,
         "interaction.selectOption" => interaction::handle_select_option(state, &req.params).await,
         "interaction.check" => interaction::handle_check(state, &req.params).await,
+        "interaction.uploadFile" => interaction::handle_upload_file(state, &req.params).await,
         "monitor.consoleLogs" => monitor::handle_console_logs(state, &req.params).await,
         "monitor.pageErrors" => monitor::handle_page_errors(state, &req.params).await,
         "capture.metrics" => capture::handle_metrics(state, &req.params).await,

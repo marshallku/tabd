@@ -56,6 +56,7 @@ tabd eval 'await fetch("/api/data").then(r => r.json())' --json
 | 스크린샷 | `tabd screenshot --out file.png` |
 | 클릭 / 타이핑 | `tabd click <sel>` / `tabd click --text "로그인"` (셀렉터 모를 때) / `tabd type <sel> <text>` |
 | 비밀번호 입력 | `tabd type-secret <sel> --secret-id <id>` |
+| 파일 업로드 | `tabd upload <sel> <file>` (`<input type=file>` 전용, 숨겨진 input OK) |
 | 로딩 대기 | `tabd wait-selector <sel>` / `tabd wait-url <pat> --pattern-type glob` / `tabd wait-text "문구"` |
 | 네트워크 idle | `tabd wait-network-idle --idle-time 1500` |
 | 쿠키 / 네트워크 로그 | `tabd cookies-get <url> --json` / `tabd network-logs --url-contains /api/ --json` |

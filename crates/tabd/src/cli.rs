@@ -214,6 +214,14 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
             positional: &[],
         },
     );
+    // Audit unit 5b — file upload via DOM.setFileInputFiles.
+    m.insert(
+        "upload",
+        Spec {
+            action: "interaction.uploadFile",
+            positional: &["selector", "path"],
+        },
+    );
     // Phase 3d — Tier 4 interaction extras.
     m.insert(
         "hover",
@@ -671,6 +679,33 @@ pub async fn run(args: Vec<OsString>) -> Result<i32> {
         parsed.options.entry("tabId".to_string()).or_insert(tab);
     }
 
+    // `upload`: resolve the file path against the CALLER's cwd before it
+    // crosses to the daemon (whose cwd is wherever it was first spawned).
+    if name == "upload" {
+        let Some(raw) = parsed.options.get("path").and_then(Value::as_str) else {
+            eprintln!("upload: usage: tabd upload <selector> <file>");
+            return Ok(2);
+        };
+        match std::fs::canonicalize(raw) {
+            Ok(abs) => {
+                // canonicalize proves existence, not readability — open it so
+                // an unreadable file fails here (exit 2), not in chromium.
+                if let Err(err) = std::fs::File::open(&abs) {
+                    eprintln!("upload: cannot read {raw}: {err}");
+                    return Ok(2);
+                }
+                parsed.options.insert(
+                    "path".to_string(),
+                    Value::String(abs.to_string_lossy().into_owned()),
+                );
+            }
+            Err(err) => {
+                eprintln!("upload: cannot resolve {raw}: {err}");
+                return Ok(2);
+            }
+        }
+    }
+
     // `--base-dir` is consumed by ensure_daemon, not forwarded as a param.
     let base_dir = parsed
         .options
@@ -1017,8 +1052,8 @@ mod tests {
             "secret-delete",
             "type-secret",
         ];
-        // Audit unit 3: dialog auto-handling + wait-text.
-        let tier_6 = ["wait-text", "dialogs", "dialog-policy"];
+        // Audit units 3+5: dialog auto-handling, wait-text, upload.
+        let tier_6 = ["wait-text", "dialogs", "dialog-policy", "upload"];
         for name in tier_1
             .iter()
             .chain(tier_3.iter())

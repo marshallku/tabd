@@ -82,6 +82,7 @@ pub(crate) fn classify_error_code(message: &str) -> ErrorCode {
         || m.contains("invalid '")
         || m.contains("is required")
         || m.contains("unsupported patterntype")
+        || m.contains("file not found")
     {
         ErrorCode::InvalidRequest
     } else if m.contains("result too large") {
@@ -212,6 +213,10 @@ mod tests {
         );
         assert_eq!(
             classify_error_code("invalid 'action' (expected accept|dismiss, got 'maybe')"),
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            classify_error_code("file not found: /tmp/missing.csv"),
             ErrorCode::InvalidRequest
         );
     }

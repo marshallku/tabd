@@ -9,8 +9,8 @@ the daemon see [operations.md](operations.md).
 
 - [Conventions](#conventions) — global flags, argv parsing, tab semantics
 - [Daemon control](#daemon-control) — `daemon start/stop/ping/health`
-- Actions (42 total, grouped):
-  - [Tabs](#tabs) (8) · [DOM](#dom) (4) · [Interaction](#interaction) (8)
+- Actions (43 total, grouped):
+  - [Tabs](#tabs) (8) · [DOM](#dom) (4) · [Interaction](#interaction) (9)
   - [Capture](#capture) (2) · [Execution](#execution) (1) · [Wait](#wait) (4)
   - [Cookies](#cookies) (3) · [Storage](#storage) (3) · [Monitor](#monitor) (4)
   - [Dialogs](#dialogs-1) (1) · [Secrets](#secrets) (4)
@@ -346,6 +346,25 @@ One of `<selector>` / `--text` is required.
 **Errors**: `"selector SELECTOR not visible after N ms"`,
 `"no element with text \"TEXT\" found after N ms"` (both `selector_not_found`,
 exit 5), `"'selector' or 'text' is required"`.
+
+### upload
+
+```bash
+tabd upload <selector> <file> [--tab N]
+```
+
+Sets a local file on an `<input type=file>` via CDP `DOM.setFileInputFiles`
+(the DevTools-native path — works where synthetic DataTransfer events don't).
+
+- A relative `<file>` resolves against **your shell's cwd** (the CLI
+  canonicalizes before dispatch); a missing file exits `2` without touching
+  the daemon.
+- No visibility wait: hidden file inputs behind styled labels are fine.
+- One file per call.
+
+**Returns**: `{ "ok": true, "path": "/abs/path" }`.
+
+**Errors**: `"Selector not found: SELECTOR"` (exit 5), `"file not found: PATH"`.
 
 ### type
 

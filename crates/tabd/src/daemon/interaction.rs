@@ -85,6 +85,60 @@ pub(super) async fn handle_click(
     }
 }
 
+/// `interaction.uploadFile` — set a local file on an `<input type=file>` via
+/// CDP `DOM.setFileInputFiles` (the DevTools-native path; no synthetic
+/// DataTransfer fragility). Deliberately no visibility wait: file inputs are
+/// routinely hidden behind styled labels, and the CDP call doesn't need a
+/// rendered element. The CLI already canonicalized the path against the
+/// caller's cwd; the existence re-check here is defense in depth.
+pub(super) async fn handle_upload_file(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let selector = require_string(params, "selector")?;
+    let path = require_string(params, "path")?;
+    if !std::path::Path::new(&path).is_file() {
+        return Err(format!("file not found: {path}"));
+    }
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+
+    let doc = client
+        .send_to(&tid, "DOM.getDocument", json!({ "depth": 0 }))
+        .await
+        .map_err(|e| e.to_string())?;
+    let root_id = doc
+        .get("root")
+        .and_then(|r| r.get("nodeId"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "DOM.getDocument response missing root nodeId".to_string())?;
+    let node = client
+        .send_to(
+            &tid,
+            "DOM.querySelector",
+            json!({ "nodeId": root_id, "selector": selector }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let node_id = node.get("nodeId").and_then(Value::as_u64).unwrap_or(0);
+    if node_id == 0 {
+        return Err(format!("Selector not found: {selector}"));
+    }
+    client
+        .send_to(
+            &tid,
+            "DOM.setFileInputFiles",
+            json!({ "files": [path], "nodeId": node_id }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(json!({ "ok": true, "path": path })))
+}
+
 pub(super) async fn handle_type(
     state: &DaemonState,
     params: &Value,

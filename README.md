@@ -47,13 +47,13 @@ afterwards so it reloads skill metadata.
 
 ## Surface
 
-42 action subcommands + 4 daemon controls.
+43 action subcommands + 4 daemon controls.
 
 | Category | Commands |
 |---|---|
 | **Tabs** | `navigate`, `open-tab`, `close-tab`, `list-tabs`, `activate-tab`, `back`, `forward`, `reload` |
 | **DOM** | `get-html`, `get-text`, `query`, `summary` |
-| **Interaction** | `click`, `type`, `hover`, `mouse-move`, `scroll`, `press-key`, `select-option`, `check` |
+| **Interaction** | `click`, `type`, `hover`, `mouse-move`, `scroll`, `press-key`, `select-option`, `check`, `upload` |
 | **Capture** | `screenshot`, `metrics` |
 | **Execution** | `eval` |
 | **Wait** | `wait-selector`, `wait-url`, `wait-text`, `wait-network-idle` |
@@ -146,7 +146,7 @@ cargo build --release --manifest-path crates/tabd/Cargo.toml
 
 # Test
 cargo test --bins --manifest-path crates/tabd/Cargo.toml         # 120 unit
-bash tests/cli-direct-smoke.sh                                          # 4 cases
+bash tests/cli-direct-smoke.sh                                          # CLI smoke (auto-spawn, render, error contracts)
 bash tests/spike-daemon-compat.sh                                       # 39 cases (real Chromium)
 ```
 

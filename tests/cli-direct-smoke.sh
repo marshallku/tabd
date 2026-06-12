@@ -69,6 +69,8 @@ cat > "$HTML" <<'EOF'
 <h1>Direct Smoke</h1>
 <button id="alert-btn" onclick="alert('hello from dialog')">Alert</button>
 <button id="do-btn" onclick="document.title='Clicked'">Do Thing</button>
+<input type="file" id="file-in" style="display:none">
+<label for="file-in">Attach file</label>
 <script>
   setTimeout(() => {
     const div = document.createElement("div");
@@ -236,6 +238,31 @@ if [[ "$CT_MISS_RC" == "5" ]]; then
   pass "click --text absent label → exit 5"
 else
   fail "click --text absent label" "rc=$CT_MISS_RC"
+fi
+
+# Case 15: upload — relative path resolved against the CLI's cwd (different
+# from the daemon's cwd), set on a hidden file input via DOM.setFileInputFiles.
+echo "csv,data" > "$TMP/upload-src.txt"
+set +e
+(cd "$TMP" && "$BIN" upload '#file-in' 'upload-src.txt') >/dev/null 2>&1
+UP_RC=$?
+UP_NAME="$("$BIN" eval 'document.querySelector("#file-in").files[0]?.name ?? "none"' --json 2>/dev/null)"
+set -e
+if [[ "$UP_RC" == "0" && "$UP_NAME" == '"upload-src.txt"' ]]; then
+  pass "upload via relative path onto hidden file input"
+else
+  fail "upload" "rc=$UP_RC files0=$UP_NAME"
+fi
+
+# Case 16: upload with a missing file → client-side usage error, exit 2.
+set +e
+"$BIN" upload '#file-in' '/definitely/missing/file.bin' >/dev/null 2>&1
+UP_MISS_RC=$?
+set -e
+if [[ "$UP_MISS_RC" == "2" ]]; then
+  pass "upload missing file → exit 2 (client-side)"
+else
+  fail "upload missing file" "rc=$UP_MISS_RC"
 fi
 
 echo "== summary =="
