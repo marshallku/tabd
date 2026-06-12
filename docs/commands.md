@@ -9,11 +9,11 @@ the daemon see [operations.md](operations.md).
 
 - [Conventions](#conventions) — global flags, argv parsing, tab semantics
 - [Daemon control](#daemon-control) — `daemon start/stop/ping/health`
-- Actions (44 total, grouped):
+- Actions (47 total, grouped):
   - [Tabs](#tabs) (8) · [DOM](#dom) (4) · [Interaction](#interaction) (9)
-  - [Capture](#capture) (2) · [Emulation](#emulation) (1) · [Execution](#execution) (1) · [Wait](#wait) (4)
-  - [Cookies](#cookies) (3) · [Storage](#storage) (3) · [Monitor](#monitor) (4)
-  - [Dialogs](#dialogs-1) (1) · [Secrets](#secrets) (4)
+  - [Capture](#capture) (2) · [Emulation](#emulation) (1) · [Execution](#execution) (1) · [Wait](#wait) (5)
+  - [Cookies](#cookies) (3) · [Storage](#storage) (3) · [Monitor](#monitor) (5)
+  - [Dialogs](#dialogs-1) (1) · [Downloads](#downloads-1) (1) · [Secrets](#secrets) (4)
 
 ---
 
@@ -632,6 +632,24 @@ from slow content and also ends in `timeout` (exit 4). Default timeout
 
 **Errors**: `"wait-text timed out after N ms (text=...)"`.
 
+### wait-download
+
+```bash
+tabd wait-download [--guid G] [--timeout MS]
+```
+
+Blocks until a captured download reaches `completed` (returns its entry) or
+`canceled` (errors). Without `--guid`, targets the most-recently-started
+download whatever its state — a tiny file already `completed` by the time you
+call resolves immediately. Requires [`download-dir`](#download-dir) first.
+
+**Returns**: the download entry (see [`downloads`](#downloads)), incl.
+`savedPath`.
+
+**Errors**: `"download was canceled: GUID"` (internal),
+`"no downloads recorded"` (invalid_request — nothing captured yet),
+`"wait-download timed out after N ms"` (timeout, exit 4).
+
 ### wait-network-idle
 
 ```bash
@@ -835,6 +853,68 @@ last). Audit trail for the auto-handling described under [Dialogs](#dialogs-1)
   {"dialogType": "confirm", "message": "Are you sure?", "action": "dismiss", "timestamp": 1701337200000},
   {"dialogType": "prompt", "message": "Name?", "action": "accept", "promptText": "tabd", "timestamp": 1701337201000}
 ]
+```
+
+### downloads
+
+```bash
+tabd downloads [--limit N]
+```
+
+Browser-global list of captured downloads (newest last), independent of
+`--tab`. Requires [`download-dir`](#download-dir) to have enabled capture.
+
+**Returns**:
+```json
+[
+  {
+    "guid": "A1B2-…",
+    "url": "https://app/export.csv",
+    "suggestedFilename": "export.csv",
+    "state": "completed",
+    "totalBytes": 1234,
+    "receivedBytes": 1234,
+    "savedPath": "/your/dir/A1B2-…",
+    "startedAt": 1701337200000
+  }
+]
+```
+`state` ∈ `inProgress` | `completed` | `canceled`. In-progress entries are
+never evicted from the (capacity-100) history.
+
+---
+
+## Downloads
+
+Downloads are **dropped by default** — headless tabd has nowhere to put them.
+Call `download-dir` once to opt in; from then on every download is written to
+that directory and tracked. tabd **never deletes** the saved files (the agent
+owns them). Interception is in-memory: after a daemon or Chromium restart it
+must be re-enabled.
+
+### download-dir
+
+```bash
+tabd download-dir <dir>
+```
+
+Enables capture and routes downloads to `<dir>`. The path is resolved against
+**your shell's cwd** and must be an existing, writable directory (a
+missing/non-dir/non-writable path exits `2` without touching the daemon).
+Files are named by an opaque guid (`<dir>/<guid>`, collision-free via CDP
+`allowAndName`); the original name is the `suggestedFilename` in
+[`downloads`](#downloads) / [`wait-download`](#wait-download).
+
+**Returns**: `{ "dir": "/abs/dir" }`.
+
+**Errors**: `"not a directory: PATH"`, `"download dir is not writable: PATH"`.
+
+Typical flow:
+```bash
+tabd download-dir ./out
+tabd click --text 'Export CSV'
+saved=$(tabd wait-download --json | jq -r .savedPath)
+mv "$saved" ./out/report.csv     # rename guid → real name yourself
 ```
 
 ---

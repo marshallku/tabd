@@ -55,6 +55,7 @@ tabd eval 'await fetch("/api/data").then(r => r.json())' --json
 | JS 실행 / fetch | `tabd eval '<js>' --json` |
 | 스크린샷 | `tabd screenshot --out file.png` |
 | 모바일/반응형 뷰 | `tabd set-viewport 390 844 --mobile` |
+| 파일 다운로드 받기 | `tabd download-dir ./out` (1회) → 클릭 → `tabd wait-download --json` (savedPath) |
 | 클릭 / 타이핑 | `tabd click <sel>` / `tabd click --text "로그인"` (셀렉터 모를 때) / `tabd type <sel> <text>` |
 | 비밀번호 입력 | `tabd type-secret <sel> --secret-id <id>` |
 | 파일 업로드 | `tabd upload <sel> <file>` (`<input type=file>` 전용, 숨겨진 input OK) |
@@ -101,7 +102,9 @@ tabd eval 'await fetch("/api/data").then(r => r.json())' --json
 
 10. **iframe 안 요소는 `--frame '<iframe selector>'`로 접근** — `get-text`/`get-html`/`query`/`click`/`type`/`wait-selector`/`wait-text`에서 지원. same-origin 프레임만 가능하고 cross-origin이면 `invalid_request`로 즉시 실패 (결제 위젯 등 cross-origin iframe은 자동화 불가 — 사용자에게 한계 안내).
 
-11. **`get-html`/`get-text`/`eval` 출력은 기본 500k chars에서 잘림** (`…[truncated: …]` 마커 부착). 전체가 필요하면 `--max-chars 0`, 더 줄이려면 `--max-chars 5000` 등. 객체를 반환하는 `eval`이 한도를 넘으면 `output_too_large` 에러 — 표현식에서 덜 가져오게 좁힐 것.
+11. **다운로드는 기본 버려짐 — `download-dir <dir>`로 opt-in 후 캡처**. 파일은 guid로 저장(`<dir>/<guid>`)되고 원래 이름은 `downloads`/`wait-download`의 `suggestedFilename`에. `wait-download`의 `savedPath`로 받아서 직접 rename. daemon/chromium 재시작하면 다시 `download-dir` 호출해야 함. tabd는 저장 파일을 절대 안 지움.
+
+12. **`get-html`/`get-text`/`eval` 출력은 기본 500k chars에서 잘림** (`…[truncated: …]` 마커 부착). 전체가 필요하면 `--max-chars 0`, 더 줄이려면 `--max-chars 5000` 등. 객체를 반환하는 `eval`이 한도를 넘으면 `output_too_large` 에러 — 표현식에서 덜 가져오게 좁힐 것.
 
 ## 시크릿 (vault) 사용
 

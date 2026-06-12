@@ -69,6 +69,46 @@ pub(super) async fn handle_wait_text(
     }
 }
 
+pub(super) async fn handle_wait_download(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let guid = params
+        .get("guid")
+        .and_then(Value::as_str)
+        .filter(|g| !g.is_empty())
+        .map(str::to_owned);
+    let timeout_ms = clamped_wait_ms(params, 30_000);
+    let client = client_or_err(state).await?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let downloads = client.downloads_snapshot().await;
+        // Without --guid, target the most-recently-STARTED download whatever
+        // its state — a tiny file already `completed` by the time the click
+        // returned must resolve immediately, not read as "none in progress".
+        let entry = match &guid {
+            Some(g) => downloads.iter().find(|d| &d.guid == g),
+            None => downloads.iter().max_by_key(|d| d.started_at),
+        };
+        match entry {
+            None => {
+                return Err("no downloads recorded".to_string());
+            }
+            Some(d) if d.state == "completed" => {
+                return Ok(Some(serde_json::to_value(d).map_err(|e| e.to_string())?));
+            }
+            Some(d) if d.state == "canceled" => {
+                return Err(format!("download was canceled: {}", d.guid));
+            }
+            Some(_) => {} // inProgress — keep polling
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("wait-download timed out after {timeout_ms}ms"));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 pub(super) async fn handle_wait_url(
     state: &DaemonState,
     params: &Value,

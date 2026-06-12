@@ -108,6 +108,28 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
             positional: &["text"],
         },
     );
+    // Audit unit 6 — download interception.
+    m.insert(
+        "wait-download",
+        Spec {
+            action: "wait.download",
+            positional: &[],
+        },
+    );
+    m.insert(
+        "download-dir",
+        Spec {
+            action: "browser.setDownloadDir",
+            positional: &["dir"],
+        },
+    );
+    m.insert(
+        "downloads",
+        Spec {
+            action: "monitor.downloads",
+            positional: &[],
+        },
+    );
     m.insert(
         "dialogs",
         Spec {
@@ -714,6 +736,40 @@ pub async fn run(args: Vec<OsString>) -> Result<i32> {
         }
     }
 
+    // `download-dir`: resolve against the CALLER's cwd and verify it's an
+    // existing, writable directory before the daemon ever sees it — chromium
+    // writes downloads there, so a non-writable dir would fail silently later.
+    if name == "download-dir" {
+        let Some(raw) = parsed.options.get("dir").and_then(Value::as_str) else {
+            eprintln!("download-dir: usage: tabd download-dir <dir>");
+            return Ok(2);
+        };
+        let abs = match std::fs::canonicalize(raw) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("download-dir: cannot resolve {raw}: {err}");
+                return Ok(2);
+            }
+        };
+        if !abs.is_dir() {
+            eprintln!("download-dir: not a directory: {raw}");
+            return Ok(2);
+        }
+        // Unique-named probe (never a fixed filename) so a same-named user
+        // file in the download dir can't be truncated/deleted. Auto-removed.
+        if let Err(err) = tempfile::Builder::new()
+            .prefix(".tabd-probe-")
+            .tempfile_in(&abs)
+        {
+            eprintln!("download-dir: directory is not writable: {raw} ({err})");
+            return Ok(2);
+        }
+        parsed.options.insert(
+            "dir".to_string(),
+            Value::String(abs.to_string_lossy().into_owned()),
+        );
+    }
+
     // `--base-dir` is consumed by ensure_daemon, not forwarded as a param.
     let base_dir = parsed
         .options
@@ -1060,13 +1116,16 @@ mod tests {
             "secret-delete",
             "type-secret",
         ];
-        // Audit units 3+5: dialog auto-handling, wait-text, upload, viewport.
+        // Audit units 3+5+6: dialogs, wait-text, upload, viewport, downloads.
         let tier_6 = [
             "wait-text",
             "dialogs",
             "dialog-policy",
             "upload",
             "set-viewport",
+            "wait-download",
+            "download-dir",
+            "downloads",
         ];
         for name in tier_1
             .iter()

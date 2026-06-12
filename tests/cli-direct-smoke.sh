@@ -309,6 +309,40 @@ else
   fail "--frame cross-origin" "rc=$XFR_RC out=$XFR_OUT"
 fi
 
+# Case 20: download interception — enable a dir, trigger a data: download,
+# wait for completion, assert the guid file landed on disk with expected bytes.
+DLDIR="$TMP/downloads"
+mkdir -p "$DLDIR"
+set +e
+"$BIN" download-dir "$DLDIR" >/dev/null 2>&1
+DD_RC=$?
+# Inject an <a download> with a data: URL and click it (in-page, no server).
+"$BIN" eval '(() => {
+  const a = document.createElement("a");
+  a.href = "data:text/plain;base64,aGVsbG8tZG93bmxvYWQ=";
+  a.download = "hello.txt";
+  document.body.appendChild(a);
+  a.click();
+  return true;
+})()' >/dev/null 2>&1
+WD_OUT="$("$BIN" wait-download --timeout 8000 --json 2>/dev/null)"
+WD_RC=$?
+set -e
+SAVED="$(printf '%s' "$WD_OUT" | node -e 'try{const d=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(d.savedPath||"")}catch(e){}' 2>/dev/null || true)"
+if [[ "$DD_RC" == "0" && "$WD_RC" == "0" && -n "$SAVED" && -f "$SAVED" && "$(cat "$SAVED")" == "hello-download" ]]; then
+  pass "download intercept: data: URL → wait-download → file on disk"
+else
+  fail "download interception" "dd=$DD_RC wd=$WD_RC saved=$SAVED out=$WD_OUT"
+fi
+
+# Case 21: downloads lists the captured entry.
+DLS_OUT="$("$BIN" downloads --json 2>/dev/null || true)"
+if [[ "$DLS_OUT" == *'"suggestedFilename":"hello.txt"'* && "$DLS_OUT" == *'"state":"completed"'* ]]; then
+  pass "downloads lists completed entry"
+else
+  fail "downloads list" "got: $DLS_OUT"
+fi
+
 echo "== summary =="
 echo "passed: $PASS_COUNT"
 echo "failed: $FAIL_COUNT"

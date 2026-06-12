@@ -87,6 +87,9 @@ pub(crate) fn classify_error_code(message: &str) -> ErrorCode {
         || m.contains("is required")
         || m.contains("unsupported patterntype")
         || m.contains("file not found")
+        || m.contains("not a directory")
+        || m.contains("not writable")
+        || m.contains("no downloads recorded")
     {
         ErrorCode::InvalidRequest
     } else if m.contains("result too large") {
@@ -223,6 +226,18 @@ mod tests {
             classify_error_code("file not found: /tmp/missing.csv"),
             ErrorCode::InvalidRequest
         );
+        assert_eq!(
+            classify_error_code("not a directory: /tmp/x"),
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            classify_error_code("download dir is not writable: /ro (Permission denied)"),
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            classify_error_code("no downloads recorded"),
+            ErrorCode::InvalidRequest
+        );
         // --frame on a cross-origin iframe — capability limit, not a flaky
         // selector; must hold even wrapped in the eval prefix.
         assert_eq!(
@@ -250,5 +265,10 @@ mod tests {
             ErrorCode::Internal
         );
         assert_eq!(classify_error_code(""), ErrorCode::Internal);
+        // A canceled download is a runtime failure, not a bad request.
+        assert_eq!(
+            classify_error_code("download was canceled: abc123"),
+            ErrorCode::Internal
+        );
     }
 }

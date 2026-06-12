@@ -22,6 +22,10 @@ const MAX_CONSOLE: usize = 100;
 const MAX_PAGE_ERRORS: usize = 100;
 const MAX_NETWORK: usize = 500;
 const MAX_DIALOGS: usize = 50;
+/// Cap on the registry-global download history. In-progress entries are NEVER
+/// evicted (only terminal completed/canceled entries are dropped over cap), so
+/// a burst of downloads can't make an active `wait-download` impossible.
+const MAX_DOWNLOADS: usize = 100;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsoleEntry {
@@ -152,13 +156,84 @@ pub struct DialogPolicy {
     pub prompt_text: Option<String>,
 }
 
-/// Multi-tab registry. Single Mutex guards both fields so split-brain races
-/// between `tabs` and `active` are impossible.
+/// A captured browser download. `saved_path` is `<download_dir>/<guid>`
+/// (Browser.setDownloadBehavior `allowAndName` names files by guid, so there
+/// are no collisions); the original name lives in `suggested_filename`. The
+/// agent owns the file afterwards — tabd never deletes it.
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadEntry {
+    pub guid: String,
+    pub url: String,
+    #[serde(rename = "suggestedFilename")]
+    pub suggested_filename: String,
+    /// "inProgress" | "completed" | "canceled".
+    pub state: String,
+    #[serde(rename = "totalBytes", skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(rename = "receivedBytes")]
+    pub received_bytes: u64,
+    #[serde(rename = "savedPath")]
+    pub saved_path: String,
+    /// Epoch ms when downloadWillBegin arrived — orders "most recent".
+    #[serde(rename = "startedAt")]
+    pub started_at: u64,
+}
+
+impl DownloadEntry {
+    fn is_terminal(&self) -> bool {
+        self.state == "completed" || self.state == "canceled"
+    }
+}
+
+/// Apply a `downloadWillBegin` to the store: insert a fresh in-progress entry,
+/// then ring-cap by dropping only the OLDEST terminal entries (in-progress
+/// downloads are never evicted — see [`MAX_DOWNLOADS`]). Pure for testability.
+pub(crate) fn download_begin(store: &mut Vec<DownloadEntry>, entry: DownloadEntry, max: usize) {
+    store.push(entry);
+    while store.len() > max {
+        match store.iter().position(|e| e.is_terminal()) {
+            Some(i) => {
+                store.remove(i);
+            }
+            None => break, // all in-progress — keep them all
+        }
+    }
+}
+
+/// Apply a `downloadProgress` to the store: update bytes/state of the matching
+/// guid. Unknown guids are ignored (the willBegin may have been evicted or the
+/// download predates enablement). Pure for testability.
+pub(crate) fn download_progress(
+    store: &mut [DownloadEntry],
+    guid: &str,
+    state: &str,
+    total_bytes: Option<u64>,
+    received_bytes: Option<u64>,
+) {
+    if let Some(e) = store.iter_mut().find(|e| e.guid == guid) {
+        if !state.is_empty() {
+            e.state = state.to_owned();
+        }
+        if let Some(t) = total_bytes {
+            e.total_bytes = Some(t);
+        }
+        if let Some(r) = received_bytes {
+            e.received_bytes = r;
+        }
+    }
+}
+
+/// Multi-tab registry. Single Mutex guards all fields so split-brain races are
+/// impossible.
 #[derive(Debug, Default)]
 pub struct TabRegistry {
     pub tabs: HashMap<String, TabState>, // targetId → state
     pub active: Option<String>,          // currently focused targetId
     pub dialog_policy: DialogPolicy,
+    /// Download interception target dir; None until `download-dir` enables it.
+    pub download_dir: Option<std::path::PathBuf>,
+    /// Browser-global download history (newest last).
+    pub downloads: Vec<DownloadEntry>,
 }
 
 #[derive(Debug)]
@@ -413,14 +488,70 @@ impl CdpClient {
                     }
                     continue;
                 }
-                // Events: route by sessionId into the matching TabState. RPC
-                // calls from here are forbidden — they'd deadlock against
-                // dispatch() (same registry mutex). Push/trim only.
-                let (Some(method), Some(sid)) = (parsed.method, parsed.session_id) else {
+                // Events: RPC calls from here are forbidden — they'd deadlock
+                // against dispatch() (same registry mutex). Push/trim only.
+                let Some(method) = parsed.method else {
                     continue;
                 };
                 let params = parsed.params.unwrap_or(Value::Null);
                 let mut reg = registry_for_reader.lock().await;
+
+                // Browser-level download events carry NO sessionId and are
+                // browser-global — handle them against the registry store
+                // before the per-tab sessionId gate below.
+                if method == "Browser.downloadWillBegin" {
+                    if let Some(dir) = reg.download_dir.clone() {
+                        let guid = params
+                            .get("guid")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        if !guid.is_empty() {
+                            let saved = dir.join(&guid).to_string_lossy().into_owned();
+                            let entry = DownloadEntry {
+                                url: params
+                                    .get("url")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_owned(),
+                                suggested_filename: params
+                                    .get("suggestedFilename")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_owned(),
+                                guid,
+                                state: "inProgress".to_owned(),
+                                total_bytes: None,
+                                received_bytes: 0,
+                                saved_path: saved,
+                                started_at: now_ms(),
+                            };
+                            download_begin(&mut reg.downloads, entry, MAX_DOWNLOADS);
+                        }
+                    }
+                    continue;
+                }
+                if method == "Browser.downloadProgress" {
+                    let guid = params.get("guid").and_then(Value::as_str).unwrap_or("");
+                    if !guid.is_empty() {
+                        let state = params.get("state").and_then(Value::as_str).unwrap_or("");
+                        let total = params.get("totalBytes").and_then(Value::as_f64);
+                        let received = params.get("receivedBytes").and_then(Value::as_f64);
+                        download_progress(
+                            &mut reg.downloads,
+                            guid,
+                            state,
+                            total.map(|t| t as u64),
+                            received.map(|r| r as u64),
+                        );
+                    }
+                    continue;
+                }
+
+                // Per-tab events: require a sessionId to route into a TabState.
+                let Some(sid) = parsed.session_id else {
+                    continue;
+                };
                 // Cloned before `state` mutably borrows reg.tabs below.
                 let dialog_policy = if method == "Page.javascriptDialogOpening" {
                     Some(reg.dialog_policy.clone())
@@ -711,6 +842,13 @@ impl CdpClient {
         .await
     }
 
+    /// Send a browser-level (`Browser.*`) method call — no sessionId. `send()`
+    /// routes through the active tab session, which the browser domain rejects;
+    /// download behavior and other browser-scoped commands go here.
+    pub async fn send_browser(&self, method: &str, params: Value) -> Result<Value> {
+        self.dispatch(method, params, ResolvedTarget::Root).await
+    }
+
     async fn dispatch(&self, method: &str, params: Value, target: ResolvedTarget) -> Result<Value> {
         // Resolve session at dispatch entry (not at response receive). If the
         // active tab flips mid-call, this request still completes on the
@@ -909,6 +1047,21 @@ impl CdpClient {
         };
     }
 
+    /// Record the download target dir on the registry so the reader can compute
+    /// `saved_path` for incoming downloads. Call ONLY after
+    /// `Browser.setDownloadBehavior` succeeds — otherwise the registry would
+    /// claim downloads are enabled for a behavior chromium never accepted.
+    pub async fn set_download_dir(&self, dir: std::path::PathBuf) {
+        let mut reg = self.registry.lock().await;
+        reg.download_dir = Some(dir);
+    }
+
+    /// Snapshot the download history (newest last).
+    pub async fn downloads_snapshot(&self) -> Vec<DownloadEntry> {
+        let reg = self.registry.lock().await;
+        reg.downloads.clone()
+    }
+
     /// Registry-only active flip. Does NOT call CDP `Target.activateTarget`,
     /// so it's safe to use for internal bookkeeping (e.g. `tabs.open` setting
     /// the new tab as active without an OS-focus RPC that can no-op or fail
@@ -1001,6 +1154,56 @@ fn build_frame(id: u64, method: &str, params: Value, session_id: Option<&str>) -
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn dl(guid: &str, started: u64, state: &str) -> DownloadEntry {
+        DownloadEntry {
+            guid: guid.to_owned(),
+            url: "http://x/f".to_owned(),
+            suggested_filename: "f".to_owned(),
+            state: state.to_owned(),
+            total_bytes: None,
+            received_bytes: 0,
+            saved_path: format!("/dl/{guid}"),
+            started_at: started,
+        }
+    }
+
+    #[test]
+    fn download_progress_updates_matching_guid() {
+        let mut store = vec![dl("a", 1, "inProgress")];
+        download_progress(&mut store, "a", "completed", Some(100), Some(100));
+        assert_eq!(store[0].state, "completed");
+        assert_eq!(store[0].total_bytes, Some(100));
+        assert_eq!(store[0].received_bytes, 100);
+        // Unknown guid is a no-op.
+        download_progress(&mut store, "zzz", "canceled", None, None);
+        assert_eq!(store[0].state, "completed");
+    }
+
+    #[test]
+    fn download_begin_never_evicts_in_progress() {
+        let mut store = Vec::new();
+        // Fill past cap with in-progress entries — none may be evicted.
+        for i in 0..5 {
+            download_begin(&mut store, dl(&format!("p{i}"), i, "inProgress"), 3);
+        }
+        assert_eq!(store.len(), 5, "in-progress entries must not be evicted");
+        // A terminal entry IS evictable; adding past cap drops the oldest
+        // terminal one (front), keeping in-progress intact.
+        let mut store2 = vec![
+            dl("done0", 0, "completed"),
+            dl("done1", 1, "completed"),
+            dl("live", 2, "inProgress"),
+        ];
+        download_begin(&mut store2, dl("new", 3, "inProgress"), 3);
+        assert!(
+            !store2.iter().any(|e| e.guid == "done0"),
+            "oldest terminal evicted"
+        );
+        assert!(store2.iter().any(|e| e.guid == "live"));
+        assert!(store2.iter().any(|e| e.guid == "new"));
+        assert_eq!(store2.len(), 3);
+    }
 
     #[test]
     fn pending_guard_removes_entry_on_drop() {

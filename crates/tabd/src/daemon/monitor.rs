@@ -103,6 +103,64 @@ fn parse_dialog_action(action: &str) -> Result<bool, String> {
     }
 }
 
+pub(super) async fn handle_downloads(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+    let client = client_or_err(state).await?;
+    let mut entries = client.downloads_snapshot().await;
+    if entries.len() > limit {
+        let excess = entries.len() - limit;
+        entries.drain(0..excess);
+    }
+    let json = serde_json::to_value(entries).map_err(|e| e.to_string())?;
+    Ok(Some(json))
+}
+
+/// Enables download interception: validates the dir, sets the browser-level
+/// download behavior (collision-free guid naming + progress events), and only
+/// then records the dir on the registry so the reader can compute saved paths.
+pub(super) async fn handle_set_download_dir(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let dir = require_string(params, "dir")?;
+    // Re-validate for direct (non-CLI) clients — the CLI also canonicalizes +
+    // probes, but the daemon must not trust a raw param. canonicalize makes it
+    // absolute (chromium needs an absolute downloadPath) and proves existence.
+    let path = std::fs::canonicalize(&dir).map_err(|e| format!("not a directory: {dir} ({e})"))?;
+    if !path.is_dir() {
+        return Err(format!("not a directory: {dir}"));
+    }
+    // Unique-named probe (never a fixed filename) so we can't truncate/delete a
+    // user file that happens to share the name. Dropped → removed automatically.
+    if let Err(e) = tempfile::Builder::new()
+        .prefix(".tabd-probe-")
+        .tempfile_in(&path)
+    {
+        return Err(format!("download dir is not writable: {dir} ({e})"));
+    }
+
+    let client = client_or_err(state).await?;
+    // Browser-level: allowAndName writes each file as <dir>/<guid>;
+    // eventsEnabled turns on downloadWillBegin/downloadProgress.
+    client
+        .send_browser(
+            "Browser.setDownloadBehavior",
+            json!({
+                "behavior": "allowAndName",
+                "downloadPath": path.to_string_lossy(),
+                "eventsEnabled": true,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    // Only after the CDP call succeeds (codex C3 — no false-enabled state).
+    client.set_download_dir(path.clone()).await;
+    Ok(Some(json!({ "dir": path.to_string_lossy() })))
+}
+
 /// Pre-configures how FUTURE dialogs are auto-answered. It cannot rescue an
 /// already-open dialog — that action holds the global action mutex, which is
 /// exactly why the event reader auto-handles dialogs in the first place.
