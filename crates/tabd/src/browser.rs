@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -228,28 +229,80 @@ async fn probe_json_version(port: u16) -> Result<String> {
     }))
 }
 
+/// Chromium-based executables to probe on `$PATH`, highest priority first.
+/// Chrome / Chromium proper come before Edge and Brave, which also speak CDP
+/// and work as a last resort. These are the common Linux package names; macOS
+/// ships `.app` bundles instead (see [`app_bundle_candidates`]).
+const PATH_CANDIDATES: &[&str] = &[
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+    "chrome",
+    "microsoft-edge",
+    "brave-browser",
+];
+
+/// Locate a launchable Chromium-based browser. Resolution order, first hit wins:
+///   1. `$BROWSER_EXECUTABLE` (explicit override)
+///   2. a [`PATH_CANDIDATES`] name on `$PATH` (the Linux path)
+///   3. a standard macOS `.app` bundle ([`app_bundle_candidates`])
+///   4. the most recent Playwright-cached Chromium ([`playwright_cache_chromium`])
 fn discover_chromium() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("BROWSER_EXECUTABLE")
         && !path.is_empty()
     {
         return Ok(PathBuf::from(path));
     }
-    for candidate in [
-        "google-chrome",
-        "google-chrome-stable",
-        "chromium",
-        "chromium-browser",
-    ] {
+    for &candidate in PATH_CANDIDATES {
         if let Some(path) = which(candidate) {
             return Ok(path);
+        }
+    }
+    // macOS keeps browsers in .app bundles that aren't on $PATH.
+    for candidate in app_bundle_candidates() {
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
         }
     }
     if let Some(path) = playwright_cache_chromium() {
         return Ok(path);
     }
     Err(anyhow!(
-        "no Chromium binary found. Set $BROWSER_EXECUTABLE, install chromium via your system package manager, or run `npx playwright install chromium`"
+        "no Chromium-based browser found. Set $BROWSER_EXECUTABLE, install Chrome/Chromium via your system package manager, or run `npx playwright install chromium`"
     ))
+}
+
+/// Standard macOS application-bundle binaries for Chromium-based browsers, in
+/// priority order, under both `/Applications` and `~/Applications`. Empty on
+/// non-macOS targets, which rely on `$PATH` + the Playwright cache instead.
+fn app_bundle_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        // (bundle dir, binary name inside Contents/MacOS).
+        const BUNDLES: &[(&str, &str)] = &[
+            ("Google Chrome.app", "Google Chrome"),
+            ("Chromium.app", "Chromium"),
+            ("Google Chrome Canary.app", "Google Chrome Canary"),
+            ("Microsoft Edge.app", "Microsoft Edge"),
+            ("Brave Browser.app", "Brave Browser"),
+        ];
+        let mut roots: Vec<PathBuf> = vec![PathBuf::from("/Applications")];
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join("Applications"));
+        }
+        let mut out = Vec::with_capacity(BUNDLES.len() * roots.len());
+        for (bundle, binary) in BUNDLES {
+            for root in &roots {
+                out.push(root.join(bundle).join("Contents/MacOS").join(binary));
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -272,28 +325,153 @@ fn is_executable_file(p: &std::path::Path) -> bool {
     p.is_file()
 }
 
+/// Relative path from a `chromium-<rev>` cache dir to the launchable binary,
+/// per OS, tried in order. Newer Playwright uses `chrome-linux64`; older builds
+/// used `chrome-linux`. macOS ships the binary inside a `.app` bundle.
+#[cfg(target_os = "macos")]
+const PLAYWRIGHT_REL_CANDIDATES: &[&str] = &["chrome-mac/Chromium.app/Contents/MacOS/Chromium"];
+#[cfg(not(target_os = "macos"))]
+const PLAYWRIGHT_REL_CANDIDATES: &[&str] = &["chrome-linux64/chrome", "chrome-linux/chrome"];
+
+/// Most recent Chromium from the Playwright browser cache, if present. Handles
+/// the per-OS cache root and bundle layout.
 fn playwright_cache_chromium() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let cache_root = home.join(".cache/ms-playwright");
+    let cache_root = playwright_cache_root()?;
     let entries = std::fs::read_dir(&cache_root).ok()?;
 
     let mut versions: Vec<(u32, PathBuf)> = entries
         .flatten()
         .filter_map(|e| {
-            let name = e.file_name();
-            let rest = name.to_string_lossy().strip_prefix("chromium-")?.to_owned();
-            let ver = rest.parse::<u32>().ok()?;
-            let chrome = e.path().join("chrome-linux64/chrome");
-            chrome.is_file().then_some((ver, chrome))
+            let ver = parse_chromium_dir_version(&e.file_name().to_string_lossy())?;
+            let base = e.path();
+            // First layout whose binary actually exists on disk.
+            let chrome = PLAYWRIGHT_REL_CANDIDATES
+                .iter()
+                .map(|rel| base.join(rel))
+                .find(|p| p.is_file())?;
+            Some((ver, chrome))
         })
         .collect();
     versions.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
     versions.into_iter().next().map(|(_, p)| p)
 }
 
+/// Resolve the Playwright browser cache root from the environment.
+fn playwright_cache_root() -> Option<PathBuf> {
+    resolve_cache_root(
+        std::env::var_os("PLAYWRIGHT_BROWSERS_PATH").as_deref(),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
+}
+
+/// Pure resolver for the cache root. `$PLAYWRIGHT_BROWSERS_PATH` wins when set
+/// to a real path (CI often relocates the cache there); `"0"` is Playwright's
+/// "install next to the package" sentinel we can't resolve, so it falls back to
+/// the per-OS default under `$HOME`.
+fn resolve_cache_root(custom: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(custom) = custom
+        && !custom.is_empty()
+        && custom != OsStr::new("0")
+    {
+        return Some(PathBuf::from(custom));
+    }
+    let home = home?;
+    #[cfg(target_os = "macos")]
+    {
+        Some(home.join("Library/Caches/ms-playwright"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(home.join(".cache/ms-playwright"))
+    }
+}
+
+/// Parse the chromium revision from a Playwright cache dir name
+/// (`chromium-1217` → `1217`). Rejects other browsers and the
+/// `chromium_headless_shell-*` variant (full Chromium only).
+fn parse_chromium_dir_version(dir_name: &str) -> Option<u32> {
+    dir_name.strip_prefix("chromium-")?.parse::<u32>().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_devtools_port;
+    use super::{
+        PATH_CANDIDATES, PLAYWRIGHT_REL_CANDIDATES, parse_chromium_dir_version,
+        parse_devtools_port, resolve_cache_root,
+    };
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    // -- Browser discovery (cross-platform) --
+
+    #[test]
+    fn chromium_dir_version_parses_and_rejects() {
+        assert_eq!(parse_chromium_dir_version("chromium-1217"), Some(1217));
+        // Other browsers / non-numeric / empty revision are rejected.
+        assert_eq!(parse_chromium_dir_version("firefox-1487"), None);
+        assert_eq!(parse_chromium_dir_version("chromium-"), None);
+        assert_eq!(parse_chromium_dir_version("chromium-beta"), None);
+        // The headless-shell variant must NOT match (we want full Chromium).
+        assert_eq!(
+            parse_chromium_dir_version("chromium_headless_shell-1217"),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_root_prefers_real_custom_path() {
+        let root = resolve_cache_root(Some(OsStr::new("/opt/pw")), Some(Path::new("/home/x")));
+        assert_eq!(root, Some(std::path::PathBuf::from("/opt/pw")));
+    }
+
+    #[test]
+    fn cache_root_ignores_sentinel_and_empty_custom() {
+        // "0" (install-next-to-package) and "" fall back to the $HOME default.
+        for custom in [Some(OsStr::new("0")), Some(OsStr::new("")), None] {
+            let root =
+                resolve_cache_root(custom, Some(Path::new("/home/x"))).expect("home-based root");
+            assert!(root.starts_with("/home/x"), "got: {}", root.display());
+            assert!(root.ends_with("ms-playwright"), "got: {}", root.display());
+        }
+    }
+
+    #[test]
+    fn cache_root_none_without_home() {
+        assert_eq!(resolve_cache_root(None, None), None);
+    }
+
+    #[test]
+    fn path_candidates_prioritize_chrome_over_alternatives() {
+        // Chrome/Chromium proper must be probed before Edge/Brave fallbacks.
+        let chrome = PATH_CANDIDATES.iter().position(|c| *c == "google-chrome");
+        let edge = PATH_CANDIDATES.iter().position(|c| *c == "microsoft-edge");
+        assert!(chrome < edge, "chrome should rank before edge");
+        assert!(!PLAYWRIGHT_REL_CANDIDATES.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_app_bundles_are_absolute_and_chrome_first() {
+        let candidates = super::app_bundle_candidates();
+        assert!(!candidates.is_empty(), "macOS must offer .app candidates");
+        // Every candidate is an absolute path into a Chromium-based .app bundle.
+        for c in &candidates {
+            assert!(c.is_absolute(), "got: {}", c.display());
+            assert!(c.to_string_lossy().contains("Contents/MacOS"));
+        }
+        // Google Chrome is the first thing tried.
+        assert!(
+            candidates[0].to_string_lossy().contains("Google Chrome"),
+            "got: {}",
+            candidates[0].display()
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_has_no_app_bundles() {
+        assert!(super::app_bundle_candidates().is_empty());
+    }
 
     #[test]
     fn parses_devtools_line() {
