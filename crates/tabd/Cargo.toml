@@ -35,3 +35,19 @@ rand = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Release tuning. The daemon is long-lived and the CLI is invoked once per
+# action, so optimize for runtime CPU + binary size over compile time:
+#   - lto=true (fat): cross-crate inlining / dead-code elimination
+#   - codegen-units=1: max optimization (slower build, but this crate is small)
+#   - strip: drop symbols (~23% smaller binary; CI stripped manually before)
+#   - panic=abort: no unwind tables (smaller binary). A panic aborts the daemon
+#     instead of unwinding one task — acceptable here: the CLI auto-respawns the
+#     daemon on the next call, and abort avoids leaving a half-poisoned mutex
+#     behind. `cargo test` uses the dev profile (unwind), so tests are unaffected.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

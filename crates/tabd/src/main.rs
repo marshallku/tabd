@@ -95,32 +95,70 @@ enum SkillCmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    let code: i32 = match cli.command {
-        Command::Daemon { cmd } => match run_daemon_cmd(cmd).await {
-            Ok(()) => 0,
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                1
-            }
-        },
-        Command::Skill { cmd } => match run_skill_cmd(cmd) {
-            Ok(()) => 0,
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                1
-            }
-        },
-        Command::Other(args) => match cli::run(args).await {
-            Ok(code) => code,
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                1
-            }
-        },
+
+    // Runtime sizing by command. Every path is IO-bound (the heavy lifting is
+    // in Chromium, reached over a socket), so worker threads buy little:
+    //   - `daemon start` is long-lived and juggles a few concurrent tasks (CDP
+    //     reader/writer, supervisor, per-connection handlers), but all driver
+    //     actions serialize through one mutex — 2 workers is plenty and leaves
+    //     headroom for an inline pbkdf2 in the secrets path.
+    //   - Every other invocation is a single short-lived request/response over
+    //     the daemon socket; a current-thread runtime avoids spawning 1 worker
+    //     per CPU (was 12 threads on a 12-core box) for a ~2ms round-trip.
+    // Borrow in the match so `cli.command` is only read here, not moved — it is
+    // consumed below in `block_on`. (The `{ .. }` pattern binds nothing, so a
+    // by-value match wouldn't move either, but `&` makes that explicit.)
+    let is_daemon_start = matches!(
+        &cli.command,
+        Command::Daemon {
+            cmd: DaemonCmd::Start { .. }
+        }
+    );
+    let runtime = if is_daemon_start {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
     };
+    let runtime = match runtime {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("error: failed to build tokio runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let code: i32 = runtime.block_on(async {
+        match cli.command {
+            Command::Daemon { cmd } => match run_daemon_cmd(cmd).await {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    1
+                }
+            },
+            Command::Skill { cmd } => match run_skill_cmd(cmd) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    1
+                }
+            },
+            Command::Other(args) => match cli::run(args).await {
+                Ok(code) => code,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    1
+                }
+            },
+        }
+    });
     ExitCode::from(code.clamp(0, 255) as u8)
 }
 
