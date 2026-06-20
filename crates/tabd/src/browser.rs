@@ -230,9 +230,12 @@ async fn probe_json_version(port: u16) -> Result<String> {
 }
 
 /// Chromium-based executables to probe on `$PATH`, highest priority first.
-/// Chrome / Chromium proper come before Edge and Brave, which also speak CDP
-/// and work as a last resort. These are the common Linux package names; macOS
-/// ships `.app` bundles instead (see [`app_bundle_candidates`]).
+/// Chrome / Chromium proper come before Edge, Brave and Vivaldi, which also
+/// speak CDP and work as a last resort. Names vary by distro — e.g. Arch ships
+/// Brave as `brave` while Debian/Ubuntu use `brave-browser` — so both are
+/// listed. (Firefox is intentionally absent: it dropped CDP for WebDriver BiDi,
+/// which tabd's CDP client cannot drive.) macOS ships `.app` bundles instead
+/// (see [`app_bundle_candidates`]).
 const PATH_CANDIDATES: &[&str] = &[
     "google-chrome",
     "google-chrome-stable",
@@ -240,7 +243,11 @@ const PATH_CANDIDATES: &[&str] = &[
     "chromium-browser",
     "chrome",
     "microsoft-edge",
+    "microsoft-edge-stable",
+    "brave",
     "brave-browser",
+    "vivaldi",
+    "vivaldi-stable",
 ];
 
 /// Locate a launchable Chromium-based browser. Resolution order, first hit wins:
@@ -442,10 +449,13 @@ mod tests {
 
     #[test]
     fn path_candidates_prioritize_chrome_over_alternatives() {
-        // Chrome/Chromium proper must be probed before Edge/Brave fallbacks.
-        let chrome = PATH_CANDIDATES.iter().position(|c| *c == "google-chrome");
-        let edge = PATH_CANDIDATES.iter().position(|c| *c == "microsoft-edge");
-        assert!(chrome < edge, "chrome should rank before edge");
+        let pos = |name: &str| PATH_CANDIDATES.iter().position(|c| *c == name);
+        // Chrome/Chromium proper must be probed before the Edge/Brave fallbacks.
+        assert!(pos("google-chrome") < pos("microsoft-edge"));
+        assert!(pos("chromium") < pos("brave"));
+        // Distro name variants are both covered (Arch `brave` vs Debian
+        // `brave-browser`) so discovery isn't packaging-specific.
+        assert!(pos("brave").is_some() && pos("brave-browser").is_some());
         assert!(!PLAYWRIGHT_REL_CANDIDATES.is_empty());
     }
 
