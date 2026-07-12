@@ -9,9 +9,9 @@ the daemon see [operations.md](operations.md).
 
 - [Conventions](#conventions) — global flags, argv parsing, tab semantics
 - [Daemon control](#daemon-control) — `daemon start/stop/ping/health`
-- Actions (47 total, grouped):
+- Actions (48 total, grouped):
   - [Tabs](#tabs) (8) · [DOM](#dom) (4) · [Interaction](#interaction) (9)
-  - [Capture](#capture) (2) · [Emulation](#emulation) (1) · [Execution](#execution) (1) · [Wait](#wait) (5)
+  - [Capture](#capture) (2) · [Emulation](#emulation) (2) · [Execution](#execution) (1) · [Wait](#wait) (5)
   - [Cookies](#cookies) (3) · [Storage](#storage) (3) · [Monitor](#monitor) (5)
   - [Dialogs](#dialogs-1) (1) · [Downloads](#downloads-1) (1) · [Secrets](#secrets) (4)
 
@@ -532,11 +532,31 @@ immediately (no reload); `screenshot` captures the emulated viewport.
 | `--mobile` | bool | `false` | Mobile layout mode (meta-viewport handling, scrollbars). Note: on pages **without** a `<meta name=viewport>` tag, mobile mode lays out at the classic 980px viewport (like a real phone), so `innerWidth` won't equal the device width. |
 
 Persists for the tab until the daemon (or Chromium) restarts. To "reset", set
-the desired size again. User-agent override is intentionally not included.
+the desired size again. For User-Agent override, see [set-user-agent](#set-user-agent).
 
 **Returns**: `{ "width": N, "height": N, "scale": N, "mobile": bool }`.
 
 **Errors**: `"missing 'width' (number)"`, `"invalid 'width'/'height' (must be >= 1)"`.
+
+### set-user-agent
+
+```bash
+tabd set-user-agent <userAgent> [--tab N]
+```
+
+Applies CDP `Network.setUserAgentOverride` to the tab — overrides both the
+JS-visible `navigator.userAgent` and the actual `User-Agent` HTTP header sent
+on subsequent requests (verified against a live echo endpoint). Chromium's
+`--headless=new` still reports `HeadlessChrome/<ver>` in its default UA on
+some builds, which some sites treat as a bot-detection signal; a common
+pattern is to read the current UA via `tabd eval navigator.userAgent` and
+replace `HeadlessChrome` with `Chrome` before navigating anywhere.
+
+Persists for the tab until the daemon (or Chromium) restarts.
+
+**Returns**: `{ "userAgent": string }` — the value that was applied.
+
+**Errors**: `"missing 'userAgent' (string)"`.
 
 ---
 

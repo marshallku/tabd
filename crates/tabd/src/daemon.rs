@@ -735,6 +735,7 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         "monitor.pageErrors" => monitor::handle_page_errors(state, &req.params).await,
         "capture.metrics" => capture::handle_metrics(state, &req.params).await,
         "emulation.setViewport" => capture::handle_set_viewport(state, &req.params).await,
+        "emulation.setUserAgent" => capture::handle_set_user_agent(state, &req.params).await,
         "dom.contentSummary" => dom::handle_content_summary(state, &req.params).await,
         "monitor.networkLogs" => monitor::handle_network_logs(state, &req.params).await,
         "monitor.dialogs" => monitor::handle_dialogs(state, &req.params).await,

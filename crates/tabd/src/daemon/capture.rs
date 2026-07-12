@@ -66,6 +66,35 @@ pub(super) async fn handle_set_viewport(
     })))
 }
 
+/// `emulation.setUserAgent` — Network.setUserAgentOverride on the tab's
+/// session. Persists for the tab until the daemon (or chromium) restarts.
+/// Chromium's `--headless=new` still reports `HeadlessChrome/<ver>` in the
+/// default UA on some builds, a common bot-detection signal; this lets
+/// callers replace it (e.g. with the equivalent non-headless `Chrome/<ver>`
+/// string) before navigating. Lives here alongside `handle_set_viewport`
+/// (two emulation handlers — Rule of Three still says no new module yet).
+pub(super) async fn handle_set_user_agent(
+    state: &DaemonState,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    let user_agent = require_string(params, "userAgent")?;
+    let tab_id = params
+        .get("tabId")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let client = client_or_err(state).await?;
+    let tid = resolve_target_id(&client, tab_id).await?;
+    client
+        .send_to(
+            &tid,
+            "Network.setUserAgentOverride",
+            json!({ "userAgent": user_agent }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(json!({ "userAgent": user_agent })))
+}
+
 pub(super) async fn handle_metrics(
     state: &DaemonState,
     params: &Value,

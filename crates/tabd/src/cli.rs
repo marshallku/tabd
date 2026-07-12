@@ -318,6 +318,13 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
         },
     );
     m.insert(
+        "set-user-agent",
+        Spec {
+            action: "emulation.setUserAgent",
+            positional: &["userAgent"],
+        },
+    );
+    m.insert(
         "summary",
         Spec {
             action: "dom.contentSummary",
@@ -1123,6 +1130,7 @@ mod tests {
             "dialog-policy",
             "upload",
             "set-viewport",
+            "set-user-agent",
             "wait-download",
             "download-dir",
             "downloads",
