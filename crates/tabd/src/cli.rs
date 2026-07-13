@@ -325,6 +325,13 @@ static DISPATCH: LazyLock<std::collections::HashMap<&'static str, Spec>> = LazyL
         },
     );
     m.insert(
+        "add-init-script",
+        Spec {
+            action: "emulation.addInitScript",
+            positional: &["source"],
+        },
+    );
+    m.insert(
         "summary",
         Spec {
             action: "dom.contentSummary",
@@ -1131,6 +1138,7 @@ mod tests {
             "upload",
             "set-viewport",
             "set-user-agent",
+            "add-init-script",
             "wait-download",
             "download-dir",
             "downloads",

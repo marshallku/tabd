@@ -9,9 +9,9 @@ the daemon see [operations.md](operations.md).
 
 - [Conventions](#conventions) — global flags, argv parsing, tab semantics
 - [Daemon control](#daemon-control) — `daemon start/stop/ping/health`
-- Actions (48 total, grouped):
+- Actions (49 total, grouped):
   - [Tabs](#tabs) (8) · [DOM](#dom) (4) · [Interaction](#interaction) (9)
-  - [Capture](#capture) (2) · [Emulation](#emulation) (2) · [Execution](#execution) (1) · [Wait](#wait) (5)
+  - [Capture](#capture) (2) · [Emulation](#emulation) (3) · [Execution](#execution) (1) · [Wait](#wait) (5)
   - [Cookies](#cookies) (3) · [Storage](#storage) (3) · [Monitor](#monitor) (5)
   - [Dialogs](#dialogs-1) (1) · [Downloads](#downloads-1) (1) · [Secrets](#secrets) (4)
 
@@ -557,6 +557,35 @@ Persists for the tab until the daemon (or Chromium) restarts.
 **Returns**: `{ "userAgent": string }` — the value that was applied.
 
 **Errors**: `"missing 'userAgent' (string)"`.
+
+### add-init-script
+
+```bash
+tabd add-init-script <source> [--tab N]
+```
+
+Applies CDP `Page.addScriptToEvaluateOnNewDocument` to the tab — runs
+`<source>` before every SUBSEQUENT navigation's own scripts execute (not
+retroactively on the current document). This is the only way to patch
+automation tells that a page can check before `tabd`'s own actions would
+otherwise get a chance to run an `eval`, most notably `navigator.webdriver`:
+Chromium sets `Navigator.prototype.webdriver = true` as soon as CDP attaches
+to a target, independent of the `--headless` flag or User-Agent, and many
+bot/fraud-detection systems check it. Typical use:
+
+```bash
+tabd add-init-script "Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true });"
+tabd navigate https://example.com
+tabd eval navigator.webdriver   # => false
+```
+
+Persists for the tab (applies to every future navigation) until the daemon
+(or Chromium) restarts.
+
+**Returns**: `{ "identifier": string }` — the CDP script identifier (unused
+by most callers; kept for parity with the underlying protocol response).
+
+**Errors**: `"missing 'source' (string)"`.
 
 ---
 
