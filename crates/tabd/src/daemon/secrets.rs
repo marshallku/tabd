@@ -98,9 +98,13 @@ pub(super) async fn handle_type_secret(
     let sel_lit = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
     let value_lit = serde_json::to_string(&plaintext).map_err(|e| e.to_string())?;
     let clear_lit = if clear { "true" } else { "false" };
+    // React-safe value setter (native prototype setter → real onChange). Without
+    // it, controlled inputs ignore the assignment; see REACT_SAFE_SET_VALUE.
+    let helper = super::interaction::REACT_SAFE_SET_VALUE;
     let expr = format!(
         r#"
         (() => {{
+            {helper}
             const el = document.querySelector({sel_lit});
             if (!el) throw new Error("type-secret: selector miss");
             const editable = (el instanceof HTMLInputElement)
@@ -110,14 +114,18 @@ pub(super) async fn handle_type_secret(
             el.scrollIntoView({{ block: "center", inline: "center" }});
             el.focus();
             const value = {value_lit};
-            if ({clear_lit}) {{
-                if ("value" in el) el.value = "";
-                else el.textContent = "";
+            if ("value" in el) {{
+                // The native setter replaces the whole value, so an explicit
+                // clear is redundant here — and clearing via __tabdSetValue would
+                // emit a stray empty input/change that React could act on before
+                // the real value lands. Fire exactly one input/change.
+                __tabdSetValue(el, value);
+            }} else {{
+                if ({clear_lit}) el.textContent = "";
+                document.execCommand("insertText", false, value);
+                el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                el.dispatchEvent(new Event("change", {{ bubbles: true }}));
             }}
-            if ("value" in el) el.value = value;
-            else document.execCommand("insertText", false, value);
-            el.dispatchEvent(new Event("input", {{ bubbles: true }}));
-            el.dispatchEvent(new Event("change", {{ bubbles: true }}));
             return null;
         }})()
         "#

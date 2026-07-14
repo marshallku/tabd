@@ -5,6 +5,36 @@ use super::*;
 /// Default candidate set for `click --text` when no selector narrows the scope.
 const CLICKABLE_SELECTOR: &str = "a,button,[role=\"button\"],input[type=\"button\"],input[type=\"submit\"],label,summary,[onclick]";
 
+/// JS helper defining `__tabdSetValue(el, value)` for `<input>`/`<textarea>`.
+///
+/// React 16+ installs a `_valueTracker` and overrides the *instance* `value`
+/// setter so that `el.value = x` also advances the tracker. When the ensuing
+/// `input` event fires, React compares the node's value against the tracker,
+/// finds them equal, and treats it as a no-op — so `onChange` never runs and a
+/// controlled input keeps its old React state (Toss's sign-in form left its
+/// submit button permanently disabled this way; see D134). Calling the
+/// *prototype* setter bypasses the instance override, leaving the tracker on the
+/// old value, so React detects a genuine change and dispatches `onChange`. This
+/// is the same technique React Testing Library's `fireEvent` uses.
+pub(super) const REACT_SAFE_SET_VALUE: &str = r#"
+    function __tabdSetValue(el, value) {
+        // Resolve DOM constructors in the element's own realm: an element from a
+        // (same-origin) iframe belongs to that frame's window, so the top-level
+        // HTMLInputElement/HTMLTextAreaElement don't brand-match it and calling
+        // their prototype setter would throw "Illegal invocation".
+        const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+        const proto = el instanceof win.HTMLTextAreaElement
+            ? win.HTMLTextAreaElement.prototype
+            : win.HTMLInputElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, "value");
+        const nativeSet = desc && desc.set;
+        if (nativeSet) nativeSet.call(el, value);
+        else el.value = value;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+"#;
+
 pub(super) async fn handle_click(
     state: &DaemonState,
     params: &Value,
@@ -165,18 +195,18 @@ pub(super) async fn handle_type(
     let sel_lit = serde_json::to_string(&selector).unwrap();
     let text_lit = serde_json::to_string(&text).unwrap();
     let prelude = doc_prelude(frame.as_deref())?;
-    // JS-based type (spike scope) — sets .value + fires input/change events.
-    // Plain HTML forms work; some React/Vue controlled inputs may need the
-    // native setter trick, which is phase 2c (real CDP Input.dispatchKeyEvent).
+    // Sets .value via the native prototype setter (React-safe, see
+    // REACT_SAFE_SET_VALUE) + fires input/change. Plain HTML forms and
+    // React/Vue controlled inputs both pick up the change.
+    let helper = REACT_SAFE_SET_VALUE;
     let expr = format!(
         "(() => {{
     {prelude}
+    {helper}
     const el = __doc.querySelector({sel_lit});
     if (!el) throw new Error('Selector not found: ' + {sel_lit});
     el.focus();
-    el.value = {text_lit};
-    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    __tabdSetValue(el, {text_lit});
     return {{ ok: true }};
 }})()"
     );

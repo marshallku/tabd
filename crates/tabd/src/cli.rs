@@ -424,7 +424,17 @@ fn coerce(value: &str) -> Value {
         return Value::Null;
     }
     static NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^-?\d+(\.\d+)?$").unwrap());
-    if NUM_RE.is_match(value) {
+    // A numeric string with a leading zero in its integer part (007,
+    // 01099998888) is an identifier, not a quantity: JSON numbers can't
+    // round-trip the leading zero, so coercing it would silently corrupt the
+    // value. Keep it a string. This is what lets `type --text 01012345678`
+    // survive intact (the Toss sign-in phone field, and OTPs / zip codes
+    // generally). A bare "0" and fractionals like "0.5" are still numbers.
+    let int_part = value.strip_prefix('-').unwrap_or(value);
+    let has_leading_zero = int_part.len() > 1
+        && int_part.starts_with('0')
+        && int_part.as_bytes()[1].is_ascii_digit();
+    if NUM_RE.is_match(value) && !has_leading_zero {
         if !value.contains('.')
             && let Ok(n) = value.parse::<i64>()
         {
@@ -931,6 +941,21 @@ mod tests {
         assert_eq!(coerce("True"), json!("True")); // case-sensitive
         assert_eq!(coerce("1e5"), json!("1e5")); // regex doesn't match scientific
         assert_eq!(coerce(""), json!(""));
+    }
+
+    #[test]
+    fn coerce_leading_zero_stays_string() {
+        // Identifiers (phone numbers, OTPs, zip codes) keep their leading zero —
+        // coercing to a number would drop it. Toss's phone field is the driver:
+        // `type --text 01099998888` must reach the daemon as a string.
+        assert_eq!(coerce("01099998888"), json!("01099998888"));
+        assert_eq!(coerce("007"), json!("007"));
+        assert_eq!(coerce("-07"), json!("-07"));
+        assert_eq!(coerce("00"), json!("00"));
+        // But a bare zero and fractionals are still real numbers.
+        assert_eq!(coerce("0"), json!(0));
+        assert_eq!(coerce("0.5"), json!(0.5));
+        assert_eq!(coerce("-0.5"), json!(-0.5));
     }
 
     #[test]

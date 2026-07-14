@@ -38,7 +38,7 @@ Mirrors the original TS CLI for tooling compatibility:
 - A value that itself starts with `--` must use the `--flag=VALUE` form
   (e.g. `--text=--weird-label`); `--flag --weird-label` reads as two bare flags
 - Positionals: action-specific (see each entry's signature)
-- Coercion: `true`/`false`/`null` → typed; integer literals → `i64`; decimal literals → `f64`; anything else → `string`
+- Coercion: `true`/`false`/`null` → typed; integer literals → `i64`; decimal literals → `f64`; anything else → `string`. A numeric literal with a leading zero (`007`, `01099998888`) stays a **string** — it's an identifier (phone/OTP/zip) a JSON number couldn't round-trip
 - kebab-case flag names get camelCased before reaching the daemon:
   `--pattern-type` ⇒ `patternType`, `--include-body` ⇒ `includeBody`,
   `--max-headings` ⇒ `maxHeadings`, etc.
@@ -392,8 +392,11 @@ tabd type <selector> <text> [--timeout MS] [--frame SEL] [--tab N]
 ```
 
 Types `text` into an `<input>` / `<textarea>` / `contentEditable` element.
-Sets `.value` directly **and** dispatches `input` event — works on most
-controlled inputs (React/Vue). For sensitive values use [type-secret](#type-secret).
+Sets the value through the **native prototype setter** (bypassing React's
+instance-level value-tracker override) **and** dispatches `input` + `change` —
+so React/Vue controlled inputs fire their real `onChange` and re-validate (a
+plain `.value =` assignment does not, which is why some sign-in forms kept their
+submit button disabled). For sensitive values use [type-secret](#type-secret).
 
 ### hover
 
