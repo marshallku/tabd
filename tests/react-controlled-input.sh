@@ -99,9 +99,15 @@ cat >"$HTML" <<EOF
 <meta charset="utf-8">
 <title>react-controlled</title>
 <input id="ctrl" type="text">
+<div id="edit" contenteditable="true"></div>
 <iframe id="fr" srcdoc="$FRAME_DOC"></iframe>
 <script>$REACT_SHIM
 installReactInput(document.getElementById("ctrl"), window, "__committed");
+// contentEditable has no value tracker; just record that an input event fired.
+window.__editInput = null;
+document.getElementById("edit").addEventListener("input", (e) => {
+  window.__editInput = e.target.textContent;
+});
 </script>
 EOF
 
@@ -147,6 +153,18 @@ else
     fail "type-secret fires React onChange" "committed=$SEC_COMMITTED"
   fi
   "$BIN" secret-delete --secret-id "$SID" >/dev/null 2>&1 || true
+fi
+
+# type into a contentEditable element. It has no `value`, so the native
+# prototype setter must NOT be used (it would throw "Illegal invocation");
+# handle_type falls back to execCommand("insertText") and fires input/change.
+"$BIN" type --selector "#edit" --text "hello world" >/dev/null 2>&1 || true
+EDIT_TEXT="$("$BIN" eval 'document.getElementById("edit").textContent' --json 2>/dev/null)"
+EDIT_INPUT="$("$BIN" eval 'window.__editInput' --json 2>/dev/null)"
+if echo "$EDIT_TEXT" | grep -q 'hello world' && echo "$EDIT_INPUT" | grep -q 'hello world'; then
+  pass "type into contentEditable sets text and fires input"
+else
+  fail "type into contentEditable" "text=$EDIT_TEXT input=$EDIT_INPUT"
 fi
 
 # type --frame into a controlled input that lives in a same-origin iframe. The

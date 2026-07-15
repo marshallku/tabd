@@ -206,7 +206,21 @@ pub(super) async fn handle_type(
     const el = __doc.querySelector({sel_lit});
     if (!el) throw new Error('Selector not found: ' + {sel_lit});
     el.focus();
-    __tabdSetValue(el, {text_lit});
+    if ('value' in el) {{
+        // <input>/<textarea>: native prototype setter (React-safe).
+        __tabdSetValue(el, {text_lit});
+    }} else if (el.isContentEditable) {{
+        // contentEditable has no `value`; the prototype setter would throw
+        // 'Illegal invocation'. Replace its text (matching the value-input
+        // replace semantics) via execCommand and fire input/change ourselves.
+        const doc = el.ownerDocument || document;
+        el.textContent = '';
+        doc.execCommand('insertText', false, {text_lit});
+        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    }} else {{
+        throw new Error('type: element is not editable: ' + {sel_lit});
+    }}
     return {{ ok: true }};
 }})()"
     );
