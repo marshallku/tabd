@@ -225,6 +225,7 @@ shell scripts. The fields that matter:
 | `lastError` | `null` or `{action, message, at}`. Populated by any failed daemon-side request. |
 | `driver.chromiumPid` | Current chromium pid. Changes after every supervisor restart. |
 | `driver.chromiumRssBytes` | Most recent RSS read from `/proc`. Watch for unbounded growth. |
+| `driver.headed` | `true` if chromium was launched with a visible window (`TABD_HEADED`). See [Headed mode](#headed-mode-visible-window). |
 | `driver.restartAttempts` | How many times the supervisor has rebooted chromium. Non-zero = something is unhappy. |
 | `driver.restarting` | `true` while a restart is in progress. |
 
@@ -262,6 +263,46 @@ done
 
 If you want a longer drain (e.g. an in-flight `screenshot` of a slow page),
 set `Environment=TABD_DRAIN_TIMEOUT_MS=30000` in the systemd unit.
+
+---
+
+## Headed mode (visible window)
+
+tabd runs headless by default (`--headless=new`), which is the point on a
+server or over SSH. For local debugging — watching a login flow, inspecting a
+page that behaves differently with a real window — set **`TABD_HEADED`** to a
+truthy value (`1`, `true`, `yes`, `on`) and the daemon launches Chromium with a
+visible window (no `--headless=new` / `--disable-gpu`):
+
+```bash
+TABD_HEADED=1 tabd navigate https://example.com
+```
+
+The daemon inherits your environment on auto-spawn, so no extra wiring is
+needed. Confirm the live mode via `daemon.health` → `driver.headed`:
+
+```bash
+tabd daemon health | jq .driver.headed   # true when headed
+```
+
+**The mode is fixed when the daemon boots.** A daemon that is already running
+is reused as-is — setting `TABD_HEADED=1` against a running *headless* daemon
+has no effect. To switch, either stop the current daemon first:
+
+```bash
+tabd daemon stop && TABD_HEADED=1 tabd navigate …
+```
+
+…or give the headed session its own daemon via a separate base dir, so it lives
+alongside your headless one instead of replacing it:
+
+```bash
+TABD_BASE_DIR="$HOME/.cache/tabd-headed" TABD_HEADED=1 tabd navigate …
+```
+
+Over SSH, headed mode needs a reachable display (X11 forwarding, a local
+X/Wayland session, or `xvfb-run`); without one Chromium fails to start. On a
+desktop (macOS/Linux with a session) it just works.
 
 ---
 

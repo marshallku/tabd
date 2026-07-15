@@ -18,8 +18,31 @@ const GRACEFUL_WAIT: Duration = Duration::from_secs(2);
 pub struct Browser {
     child: Child,
     ws_endpoint: String,
+    // Whether this Chromium was launched with a visible window (no
+    // `--headless=new`). Surfaced via `daemon.health` so a caller can tell
+    // which mode the live daemon is in.
+    headed: bool,
     // Kept alive to defer tempdir cleanup until Browser is dropped.
     _user_data_dir: TempDir,
+}
+
+/// Truthy check for the `TABD_HEADED` env toggle. Accepts the common
+/// affirmative spellings (case-insensitive); everything else — including unset,
+/// empty, and `0`/`false` — means headless. Pure so it can be unit-tested
+/// without mutating the process environment.
+fn is_truthy(val: Option<&str>) -> bool {
+    matches!(
+        val.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Headed mode is opt-in via `TABD_HEADED`. The daemon inherits the caller's
+/// environment on auto-spawn, so `TABD_HEADED=1 tabd navigate …` boots a
+/// visible browser without any extra flags. Read once at launch — the mode is
+/// fixed for the daemon's lifetime.
+fn headed_from_env() -> bool {
+    is_truthy(std::env::var("TABD_HEADED").ok().as_deref())
 }
 
 #[derive(Deserialize)]
@@ -32,21 +55,30 @@ impl Browser {
     pub async fn launch() -> Result<Self> {
         let executable = discover_chromium()?;
         let user_data_dir = TempDir::new().context("create tempdir for --user-data-dir")?;
+        let headed = headed_from_env();
+
+        // `--headless=new` + `--disable-gpu` are the only flags that differ by
+        // mode; a visible window wants the real GPU path, so both are dropped in
+        // headed mode. The rest are launch hygiene and apply to either mode.
+        let mut args: Vec<&str> = Vec::with_capacity(11);
+        if !headed {
+            args.push("--headless=new");
+            args.push("--disable-gpu");
+        }
+        args.extend([
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-extensions",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+        ]);
 
         let mut child = Command::new(&executable)
-            .args([
-                "--headless=new",
-                "--disable-gpu",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-background-networking",
-                "--disable-sync",
-                "--disable-extensions",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-debugging-port=0",
-            ])
+            .args(&args)
             .arg(format!(
                 "--user-data-dir={}",
                 user_data_dir.path().display()
@@ -86,12 +118,18 @@ impl Browser {
         Ok(Browser {
             child,
             ws_endpoint,
+            headed,
             _user_data_dir: user_data_dir,
         })
     }
 
     pub fn ws_endpoint(&self) -> &str {
         &self.ws_endpoint
+    }
+
+    /// Whether this Chromium was launched with a visible window.
+    pub fn headed(&self) -> bool {
+        self.headed
     }
 
     /// PID of the spawned Chromium process. `None` if the child has already
@@ -520,7 +558,19 @@ mod tests {
         super::Browser {
             child,
             ws_endpoint: String::new(),
+            headed: false,
             _user_data_dir: tempfile::TempDir::new().expect("tempdir"),
+        }
+    }
+
+    #[test]
+    fn headed_env_truthy_parsing() {
+        use super::is_truthy;
+        for v in ["1", "true", "TRUE", "Yes", "on", " on "] {
+            assert!(is_truthy(Some(v)), "{v:?} should be truthy");
+        }
+        for v in [None, Some(""), Some("0"), Some("false"), Some("no"), Some("headless")] {
+            assert!(!is_truthy(v), "{v:?} should be falsy");
         }
     }
 

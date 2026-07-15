@@ -239,15 +239,22 @@ impl DaemonState {
         let last_err = self.last_error.lock().await.clone();
         let restart_attempts = self.restart_attempts.load(Ordering::Acquire);
         let ready = self.ready.load(Ordering::Acquire);
-        let driver = match self.browser.lock().await.as_ref().and_then(|b| b.pid()) {
-            Some(pid) => json!({
-                "chromiumPid": pid,
-                "chromiumRssBytes": read_process_rss_bytes(pid),
-                "restartAttempts": restart_attempts,
-                "restartAttempt": restart_attempts, // legacy field for spike-daemon-compat
-                "restarting": !ready && restart_attempts > 0,
-            }),
-            None => Value::Null,
+        let driver = {
+            let guard = self.browser.lock().await;
+            match guard.as_ref() {
+                Some(browser) => match browser.pid() {
+                    Some(pid) => json!({
+                        "chromiumPid": pid,
+                        "chromiumRssBytes": read_process_rss_bytes(pid),
+                        "headed": browser.headed(),
+                        "restartAttempts": restart_attempts,
+                        "restartAttempt": restart_attempts, // legacy field for spike-daemon-compat
+                        "restarting": !ready && restart_attempts > 0,
+                    }),
+                    None => Value::Null,
+                },
+                None => Value::Null,
+            }
         };
         let body = json!({
             "pid": self.pid,
