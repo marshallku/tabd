@@ -7,7 +7,7 @@ between.
 
 For the system surface itself (commands, daemon shape), see
 [architecture.md](architecture.md). For install, see
-[INSTALL.md](../INSTALL.md).
+[INSTALL.md](../../../INSTALL.md).
 
 ---
 

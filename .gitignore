@@ -4,3 +4,6 @@ node_modules/
 # Rust spike (crates/cdp-spike)
 target/
 
+
+# docs/ lives in ~/docs/repo-docs/tabd (private SSoT); this is a symlink, tracked there only
+/docs

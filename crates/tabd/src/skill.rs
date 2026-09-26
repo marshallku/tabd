@@ -10,10 +10,10 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 const SKILL_MD: &str = include_str!("../../../.claude/skills/tabd/SKILL.md");
-const COMMANDS_MD: &str = include_str!("../../../docs/commands.md");
-const COOKBOOK_MD: &str = include_str!("../../../docs/cookbook.md");
-const OPERATIONS_MD: &str = include_str!("../../../docs/operations.md");
-const ARCHITECTURE_MD: &str = include_str!("../../../docs/architecture.md");
+const COMMANDS_MD: &str = include_str!("../../../.claude/skills/tabd/commands.md");
+const COOKBOOK_MD: &str = include_str!("../../../.claude/skills/tabd/cookbook.md");
+const OPERATIONS_MD: &str = include_str!("../../../.claude/skills/tabd/operations.md");
+const ARCHITECTURE_MD: &str = include_str!("../../../.claude/skills/tabd/architecture.md");
 
 const FILES: &[(&str, &str)] = &[
     ("SKILL.md", SKILL_MD),

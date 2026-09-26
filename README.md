@@ -41,7 +41,7 @@ tabd skill install --target codex --force   # explicit one-target, overwrite
 tabd skill install --path .claude/skills/tabd   # project-local
 ```
 
-Writes `SKILL.md` + the four `docs/*.md` references into
+Writes `SKILL.md` + the four reference docs (`.claude/skills/tabd/*.md`) into
 `~/.claude/skills/tabd/` and/or `~/.codex/skills/tabd/`. Restart the client
 afterwards so it reloads skill metadata.
 
@@ -164,18 +164,16 @@ bash tests/spike-daemon-compat.sh                                       # 39 cas
 
 ## Docs
 
-- [`docs/commands.md`](docs/commands.md) — per-action reference: positional
+- [`commands.md`](.claude/skills/tabd/commands.md) — per-action reference: positional
   args, every `--flag`, return shapes, error strings. The thing you'll
   actually keep open while writing a script.
-- [`docs/cookbook.md`](docs/cookbook.md) — full scenarios stitched
+- [`cookbook.md`](.claude/skills/tabd/cookbook.md) — full scenarios stitched
   together: 2FA login + data extract, three patterns for capturing API
   responses, session save/restore, infinite scroll, isolated CI daemon,
   gotchas.
-- [`docs/architecture.md`](docs/architecture.md) — why `tabd` is shaped
+- [`architecture.md`](.claude/skills/tabd/architecture.md) — why `tabd` is shaped
   this way (daemon, multi-tab registry, reader task, supervisor, secrets
   vault).
-- [`docs/operations.md`](docs/operations.md) — running `tabd` as a
+- [`operations.md`](.claude/skills/tabd/operations.md) — running `tabd` as a
   long-lived service: systemd user unit, launchd LaunchAgent, shell-rc
   fallback, drain semantics, health watchdog, troubleshooting.
-- [`docs/history/`](docs/history/) — phase 0-3 migration plans, kept as
-  immutable historical record. Not documentation of current behavior.

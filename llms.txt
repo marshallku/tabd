@@ -1,0 +1,14 @@
+# tabd
+
+SSH-friendly single-binary Rust browser automation CLI — daemon-shared Chromium over CDP.
+
+## Documentation
+
+- User-facing references (shipped inside the binary by `tabd skill install`):
+  `.claude/skills/tabd/{SKILL,commands,cookbook,operations,architecture}.md`
+- Contributor docs (design drafts, phase-plan history) live in the private SSoT (`~/docs`), not in this repo:
+  `~/docs/repo-docs/tabd/` — surfaced here as the `docs/` symlink. Start at `docs/INDEX.md`.
+- SSoT topic note (why/history/cross-links): `~/docs/topics/repos/tabd.md`
+
+The `docs/` directory in this repo is a symlink into `~/docs/repo-docs/tabd` and is
+gitignored here; those files are tracked only in the `~/docs` repo.
