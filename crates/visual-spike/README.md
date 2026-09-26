@@ -48,3 +48,33 @@ stderr. Exit code 1 if any probe returned `fail`.
 `q6-profile-copy` always runs last and refuses to start while any Brave is
 running, so a browser leaked by an earlier probe makes it abort loudly instead
 of producing a wrong answer.
+
+## The Fetch / auto-attach probes
+
+`q4` / `q9` / `q10` / `q11` / `q12` measure against `fixture.rs`, a logging HTTP
+origin, because `Fetch.requestPaused` firing proves interception happened — not
+that the request stayed in. The decisive evidence is always the origin's own
+request log, and `q0-http-smoke` exists to prove the browser can reach it at all
+before any of them is believed.
+
+The fixture binds **distinct loopback IPs** (127.0.0.1/.2/.3) rather than just
+distinct ports: Chromium's site isolation does not treat the port as part of a
+site, so a "cross-origin" iframe between two ports stays in the same renderer
+and never becomes an OOPIF — which would quietly make `q10` and `q11` test
+nothing. Where the alias cannot be bound (macOS without
+`sudo ifconfig lo0 alias 127.0.0.2`) it falls back to 127.0.0.1 and those two
+probes degrade to same-site.
+
+These probes pass `--password-store=basic`. Without it, a locked session keyring
+makes Brave put up a modal "the login keyring did not get unlocked" prompt and
+then complete **no network request at all**: the navigation commits,
+`Network.requestWillBeSent` fires, and nothing further happens — no response, no
+failure, and the page session stops answering CDP. That is the normal state for
+a browser driven over ssh. The flag is deliberately not used by
+`q6-profile-copy`, whose question is whether the real profile's OSCrypt key
+still works.
+
+Navigations in these probes are sent fire-and-forget: `Page.navigate` only
+returns once the navigation commits, and under interception the commit cannot
+happen until the pause is answered — awaiting it deadlocks against our own
+policy.

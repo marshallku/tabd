@@ -60,22 +60,31 @@ impl Outcome {
     }
 }
 
-type ProbeResult = io::Result<(Verdict, String, Value)>;
+pub type ProbeResult = io::Result<(Verdict, String, Value)>;
 
 /// `q6` is last on purpose: it aborts if any Brave is running, so it must not
 /// see a browser an earlier probe leaked.
 pub const PROBE_IDS: &[&str] = &[
+    "q0-http-smoke",
     "q1-pipe-launch",
     "q2-webdriver",
     "q3-infobar",
+    "q4-hit-test",
     "q5-singleton",
     "q7-app-id",
     "q8-dunst-actions",
+    "q9-fetch-coverage",
+    "q10-oopif-leak",
+    "q11-popup",
+    "q12-detach-paused",
     "q6-profile-copy",
 ];
 
 fn question_for(id: &str) -> &'static str {
     match id {
+        "q0-http-smoke" => {
+            "Smoke: can the browser reach the local fixture server at all? (Every Fetch probe depends on it.)"
+        }
         "q1-pipe-launch" => {
             "Q1: does Brave 154 + --remote-debugging-pipe + a persistent profile work, and does the browser exit when the pipe closes?"
         }
@@ -87,13 +96,31 @@ fn question_for(id: &str) -> &'static str {
         "q6-profile-copy" => {
             "Q6: do cookies and saved passwords still decrypt in a copy of the default profile?"
         }
+        "q4-hit-test" => {
+            "Q4: does DOM.getNodeForLocation hit-testing behave as expected across shadow DOM and iframe boundaries?"
+        }
         "q7-app-id" => "Q7: does --class reach the Wayland app_id?",
+        "q9-fetch-coverage" => {
+            "Q9: with Fetch.enable on Document/Request, is there a navigation path that escapes interception?"
+        }
+        "q10-oopif-leak" => {
+            "Q10: can an OOPIF's first document request escape before its auto-attached session is configured?"
+        }
+        "q11-popup" => {
+            "Q11: is a popup from an owned tab stopped before its first navigation request?"
+        }
+        "q12-detach-paused" => {
+            "Q12: what happens to a request left paused by Fetch when its session detaches?"
+        }
         "q8-dunst-actions" => "Q8: can a dunst notification action be selected?",
         _ => "unknown",
     }
 }
 
 pub fn run_probe(id: &'static str, ctx: &Ctx) -> Outcome {
+    if let Some(result) = crate::probes_fetch::run(id, ctx) {
+        return finish(id, result);
+    }
     let result = match id {
         "q1-pipe-launch" => q1_pipe_launch(ctx),
         "q2-webdriver" => q2_webdriver(ctx),
@@ -104,6 +131,10 @@ pub fn run_probe(id: &'static str, ctx: &Ctx) -> Outcome {
         "q8-dunst-actions" => q8_dunst_actions(ctx),
         other => Err(io::Error::other(format!("unknown probe {other}"))),
     };
+    finish(id, result)
+}
+
+fn finish(id: &'static str, result: ProbeResult) -> Outcome {
     match result {
         Ok((verdict, answer, evidence)) => Outcome {
             id,
@@ -124,7 +155,7 @@ pub fn run_probe(id: &'static str, ctx: &Ctx) -> Outcome {
 
 // ---------------------------------------------------------------- helpers
 
-fn nonce() -> String {
+pub fn nonce() -> String {
     format!(
         "{:x}",
         std::time::SystemTime::now()
@@ -134,7 +165,7 @@ fn nonce() -> String {
     )
 }
 
-fn attach(browser: &PipeBrowser, target_id: &str) -> io::Result<String> {
+pub fn attach(browser: &PipeBrowser, target_id: &str) -> io::Result<String> {
     let res = browser.call(
         "Target.attachToTarget",
         json!({ "targetId": target_id, "flatten": true }),
@@ -145,7 +176,7 @@ fn attach(browser: &PipeBrowser, target_id: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::other("attachToTarget returned no sessionId"))
 }
 
-fn target_infos(browser: &PipeBrowser) -> io::Result<Vec<Value>> {
+pub fn target_infos(browser: &PipeBrowser) -> io::Result<Vec<Value>> {
     Ok(browser
         .call("Target.getTargets", json!({}))?
         .get("targetInfos")

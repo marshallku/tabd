@@ -5,7 +5,7 @@
 //! mechanism behaves the way `docs/visual-mode-plan.md` assumes.
 
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -38,6 +38,11 @@ pub fn visual_base_args() -> Vec<String> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         args.push("--ozone-platform-hint=auto".into());
     }
+    // Escape hatch for bisecting launch flags against a real browser (e.g.
+    // "is the network service failing because the sandbox cannot start?").
+    if let Ok(extra) = std::env::var("TABD_SPIKE_EXTRA_ARGS") {
+        args.extend(extra.split_whitespace().map(str::to_string));
+    }
     args
 }
 
@@ -50,6 +55,11 @@ pub fn brave_executable() -> PathBuf {
 #[derive(Default)]
 struct State {
     responses: HashMap<u64, Value>,
+    /// Ids sent fire-and-forget. The reader stores every id-bearing frame in
+    /// `responses` and there is no pending registry, so without this set an
+    /// un-awaited response would sit there forever and the map would grow with
+    /// every Fetch decision.
+    forgotten: HashSet<u64>,
     events: Vec<Value>,
     /// Set when the browser's end of the response pipe hit EOF, or the reader
     /// was told to stop. Waiters must wake up instead of hanging.
@@ -262,6 +272,54 @@ impl PipeBrowser {
         write_all_bounded(fd.as_raw_fd(), &buf, WRITE_TIMEOUT)
     }
 
+    /// Send a command and never wait for its response.
+    ///
+    /// A CDP command **must** carry an `id` — a frame without one can be
+    /// rejected outright, which for `Fetch.continueRequest`/`failRequest`
+    /// would silently leave the request paused. So an id is allocated as
+    /// usual, and it is the *response* that is discarded. This mirrors the
+    /// dialog path in `crates/tabd/src/cdp.rs` and is the fire-and-forget
+    /// shape the visual-mode design specifies for its reader task.
+    pub fn send_and_forget(
+        &self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> io::Result<()> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut frame = json!({ "id": id, "method": method, "params": params });
+        if let Some(session) = session {
+            frame["sessionId"] = json!(session);
+        }
+        self.shared.state.lock().unwrap().forgotten.insert(id);
+        match self.send(&frame.to_string()) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // A failed write means no response will ever arrive, so the
+                // id has to be reclaimed here.
+                self.shared.state.lock().unwrap().forgotten.remove(&id);
+                Err(err)
+            }
+        }
+    }
+
+    /// Wait for an event with `method` on a specific session.
+    pub fn wait_event_session(
+        &self,
+        cursor: &mut usize,
+        session: Option<&str>,
+        method: &str,
+        limit: Duration,
+    ) -> Option<Value> {
+        self.wait_event(cursor, limit, |ev| {
+            ev.get("method").and_then(Value::as_str) == Some(method)
+                && match session {
+                    Some(want) => ev.get("sessionId").and_then(Value::as_str) == Some(want),
+                    None => true,
+                }
+        })
+    }
+
     /// Events observed so far, from `*cursor` onward; advances the cursor.
     pub fn drain_events(&self, cursor: &mut usize) -> Vec<Value> {
         let guard = self.shared.state.lock().unwrap();
@@ -424,7 +482,12 @@ fn reader_loop(res_r: OwnedFd, wake_r: OwnedFd, shared: Arc<Shared>) {
             match serde_json::from_slice::<Value>(&frame) {
                 Ok(value) => {
                     if let Some(id) = value.get("id").and_then(Value::as_u64) {
-                        guard.responses.insert(id, value);
+                        if guard.forgotten.remove(&id) {
+                            // Fire-and-forget: nobody is waiting, so drop it
+                            // rather than letting `responses` grow unbounded.
+                        } else {
+                            guard.responses.insert(id, value);
+                        }
                     } else {
                         guard.events.push(value);
                     }
@@ -443,7 +506,12 @@ fn reader_loop(res_r: OwnedFd, wake_r: OwnedFd, shared: Arc<Shared>) {
     // in `disconnect`, no descriptor of either pipe is left in this process.
     drop(res_r);
     drop(wake_r);
-    shared.state.lock().unwrap().closed = true;
+    {
+        let mut guard = shared.state.lock().unwrap();
+        guard.closed = true;
+        // Nothing can arrive any more, so held ids would never be reclaimed.
+        guard.forgotten.clear();
+    }
     shared.cv.notify_all();
 }
 
@@ -689,6 +757,42 @@ mod tests {
         });
         write_all_bounded(w.as_raw_fd(), &payload, Duration::from_secs(5)).unwrap();
         assert_eq!(reader.join().unwrap(), expected);
+    }
+
+    /// A fire-and-forget command must not leave an entry behind: the reader
+    /// stores every id-bearing frame, so without the forgotten-id set the
+    /// response map would grow with every Fetch decision.
+    #[test]
+    fn forgotten_responses_are_dropped_not_accumulated() {
+        let shared = Arc::new(Shared::default());
+        {
+            let mut guard = shared.state.lock().unwrap();
+            guard.forgotten.insert(7);
+        }
+        // Simulate what the reader does for a response to a forgotten id.
+        {
+            let mut guard = shared.state.lock().unwrap();
+            let id = 7u64;
+            if guard.forgotten.remove(&id) {
+                // dropped
+            } else {
+                guard.responses.insert(id, json!({"id": id}));
+            }
+            assert!(
+                guard.responses.is_empty(),
+                "forgotten id must not be stored"
+            );
+            assert!(guard.forgotten.is_empty(), "the id must be reclaimed");
+        }
+        // An id nobody forgot is still delivered.
+        {
+            let mut guard = shared.state.lock().unwrap();
+            let id = 8u64;
+            if !guard.forgotten.remove(&id) {
+                guard.responses.insert(id, json!({"id": id}));
+            }
+            assert_eq!(guard.responses.len(), 1);
+        }
     }
 
     #[test]

@@ -5,8 +5,10 @@
 //! here ships: it is a separate crate precisely so the tabd binary, install.sh
 //! and CI stay untouched.
 
+mod fixture;
 mod pipe;
 mod probes;
+mod probes_fetch;
 mod scratch;
 mod sys;
 
