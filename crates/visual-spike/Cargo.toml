@@ -1,0 +1,20 @@
+[package]
+name = "visual-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "V0 verification spike for tabd visual mode (docs/visual-mode-plan.md §9)"
+license = "MIT"
+
+# Deliberately a separate crate, not a [[bin]] of crates/tabd: the shipped
+# binary, install.sh and both CI workflows must stay untouched by spike code.
+# Deliberately dependency-light (no tokio, no tungstenite): the point is to
+# validate the OS-level pipe mechanism with blocking std I/O, not to prototype
+# the eventual async transport.
+[[bin]]
+name = "visual-spike"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+libc = "0.2"
