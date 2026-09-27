@@ -33,14 +33,52 @@ pub fn brave_browser_pids() -> Vec<u32> {
         .collect()
 }
 
+/// Arguments of a process, from `/proc/<pid>/cmdline`.
+///
+/// Normally NUL-separated — but Chromium rewrites its own argv (that is how
+/// `--type=renderer` shows up in `ps`), and the rewritten browser-process
+/// cmdline comes back as ONE space-joined blob with no NULs at all. There is
+/// no way to split that back into arguments without guessing, because a path
+/// may itself contain spaces, so the blob is returned as a single element
+/// rather than a plausible-looking but wrong split. Callers must therefore
+/// use substring matching, not element equality — see [`user_data_dir_of`].
 pub fn cmdline_of(pid: u32) -> Vec<String> {
     let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return Vec::new();
     };
-    raw.split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).to_string())
-        .collect()
+    let trimmed = raw.strip_suffix(&[0]).unwrap_or(&raw);
+    if trimmed.contains(&0) {
+        trimmed
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect()
+    } else {
+        vec![String::from_utf8_lossy(trimmed).to_string()]
+    }
+}
+
+/// Whether a process was launched with exactly `dir` as its `--user-data-dir`.
+///
+/// This is a *check*, not an extraction, on purpose. A rewritten (space-joined)
+/// cmdline cannot be split back into arguments, so there is no way to read the
+/// value out: `--user-data-dir=/a/b x` is indistinguishable from a profile
+/// path that genuinely contains a space.
+///
+/// Matching the prefix alone is not enough either — an expected `/tmp/p` would
+/// be satisfied by an actual `/tmp/p other`. So the match must also land on a
+/// boundary the caller can vouch for: end of string, the next `--` switch, or
+/// `next`, the argument the caller knows it put immediately afterwards.
+pub fn runs_with_profile(pid: u32, dir: &Path, next: Option<&str>) -> bool {
+    let blob = cmdline_of(pid).join(" ");
+    let needle = format!("--user-data-dir={}", dir.display());
+    let Some(at) = blob.find(&needle) else {
+        return false;
+    };
+    let after = &blob[at + needle.len()..];
+    after.is_empty()
+        || after.starts_with(" --")
+        || next.is_some_and(|next| after.starts_with(&format!(" {next}")))
 }
 
 pub fn hyprctl_clients() -> Option<Vec<Value>> {
@@ -299,4 +337,46 @@ pub fn report_param(path: &str, key: &str) -> Option<String> {
         let (k, v) = pair.split_once('=')?;
         (k == key).then(|| v.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Chromium rewrites its argv, so the browser process's cmdline can come
+    /// back as one space-joined blob. Splitting only on NUL then hides every
+    /// flag behind argv[0] — and "no --user-data-dir" wrongly reads as "this
+    /// is the default profile".
+    #[test]
+    fn user_data_dir_is_found_in_both_cmdline_shapes() {
+        let joined = "/opt/brave-bin/brave --no-first-run --user-data-dir=/tmp/copy/profile x";
+        let args: Vec<String> = joined.split_whitespace().map(str::to_string).collect();
+        assert_eq!(
+            args.iter().find_map(|a| a.strip_prefix("--user-data-dir=")),
+            Some("/tmp/copy/profile")
+        );
+
+        let nul_separated: Vec<String> =
+            ["/opt/brave-bin/brave", "--user-data-dir=/tmp/copy/profile"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(
+            nul_separated
+                .iter()
+                .find_map(|a| a.strip_prefix("--user-data-dir=")),
+            Some("/tmp/copy/profile")
+        );
+    }
+
+    #[test]
+    fn a_default_profile_browser_has_no_user_data_dir_arg() {
+        let args: Vec<String> = "/opt/brave-bin/brave"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            args.iter()
+                .find_map(|a| a.strip_prefix("--user-data-dir="))
+                .is_none()
+        );
+    }
 }

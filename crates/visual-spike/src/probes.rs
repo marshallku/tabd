@@ -475,7 +475,7 @@ fn q3_infobar(ctx: &Ctx) -> ProbeResult {
     // second transport to measure the control would change the control.
     let control_scratch = Scratch::new("q3-control", ctx.keep)?;
     let control_png = ctx.out_dir.join("q3-control.png");
-    let (control_client, control_err, control_cmdline) = {
+    let (control_client, control_err, control_cmdline, control_udd) = {
         let control = PlainBrowser::launch(
             &ctx.exe,
             &control_scratch.child("profile"),
@@ -483,7 +483,16 @@ fn q3_infobar(ctx: &Ctx) -> ProbeResult {
             Some(start_url),
         )?;
         let (client, err) = screenshot_of_pid(control.pid, &control_png, Duration::from_secs(20));
-        (client, err, sys::cmdline_of(control.pid))
+        (
+            client,
+            err,
+            sys::cmdline_of(control.pid),
+            sys::runs_with_profile(
+                control.pid,
+                &control_scratch.child("profile"),
+                Some(start_url),
+            ),
+        )
     };
 
     // Pipe launch.
@@ -496,6 +505,8 @@ fn q3_infobar(ctx: &Ctx) -> ProbeResult {
         Some(start_url),
     )?;
     let pipe_cmdline = sys::cmdline_of(pipe.pid());
+    let pipe_udd =
+        sys::runs_with_profile(pipe.pid(), &pipe_scratch.child("profile"), Some(start_url));
     let (pipe_client, pipe_err) = screenshot_of_pid(pipe.pid(), &pipe_png, Duration::from_secs(20));
     pipe.shutdown();
 
@@ -510,13 +521,22 @@ fn q3_infobar(ctx: &Ctx) -> ProbeResult {
         (Ok(a), Ok(b)) => Some(a == b),
         _ => None,
     };
-    let verdict = if identical == Some(true) && control_err.is_none() && pipe_err.is_none() {
+    // If either browser did not actually run on the scratch profile it was
+    // handed, the two screenshots are not the comparison this probe claims to
+    // be making, and "byte-identical" would be meaningless.
+    let verdict = if identical == Some(true)
+        && control_err.is_none()
+        && pipe_err.is_none()
+        && control_udd
+        && pipe_udd
+    {
         Verdict::Pass
     } else {
         Verdict::Inconclusive
     };
     let answer = format!(
-        "--enable-automation present in the pipe launch: {automation_flag}; captures byte-identical: {identical:?}. Screenshots: {}, {}",
+        "--enable-automation present in the pipe launch: {automation_flag}; captures byte-identical: {identical:?}; both launches verified on their own scratch profiles: {}. Screenshots: {}, {}",
+        control_udd && pipe_udd,
         control_png.display(),
         pipe_png.display()
     );
@@ -532,6 +552,10 @@ fn q3_infobar(ctx: &Ctx) -> ProbeResult {
             "pipeCaptureError": pipe_err,
             "controlCmdline": control_cmdline,
             "pipeCmdline": pipe_cmdline,
+            // Cheap guard that each launch really used the scratch profile it
+            // was given, rather than silently falling back to the real one.
+            "controlUsedItsScratchProfile": control_udd,
+            "pipeUsedItsScratchProfile": pipe_udd,
             "enableAutomationPresent": automation_flag,
             "capturesByteIdentical": identical,
         }),
@@ -693,30 +717,62 @@ fn q8_dunst_actions(ctx: &Ctx) -> ProbeResult {
     let rc = std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|h| h.join(".config/dunst/dunstrc"));
-    let binding = rc
+    let config = rc
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|text| {
-            text.lines()
-                .filter(|l| l.contains("do_action"))
-                .map(str::trim)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
         .unwrap_or_default();
+    let binding: Vec<String> = config
+        .lines()
+        .filter(|l| l.contains("do_action"))
+        .map(|l| l.trim().to_string())
+        .collect();
+    let menu_program: Option<String> = config
+        .lines()
+        .find(|l| l.trim_start().starts_with("dmenu"))
+        .map(|l| l.trim().to_string());
+
+    // The plumbing half needs no human: with exactly ONE action, `dunstctl
+    // action` performs it directly, and `notify-send --wait` then prints the
+    // action key. That is precisely the channel V4's approval UI depends on,
+    // so it can be asserted rather than eyeballed.
+    // Only the SINGLE-action path is asserted. Driving the two-action path
+    // means leaving a real chooser window open on a live desktop waiting for
+    // a pick that a test cannot make, and an unanswered chooser then blocks
+    // dunst from handling any further action — it wedges the very channel
+    // being measured. The design does not need it either: a single "approve"
+    // action with timeout-as-deny (which §V4 already specifies) never opens a
+    // chooser at all.
+    let plumbing = q8_plumbing();
 
     if !ctx.interactive {
+        let verdict = match &plumbing {
+            Ok(key) if !key.is_empty() => Verdict::Pass,
+            _ => Verdict::Fail,
+        };
         return Ok((
-            Verdict::Inconclusive,
+            verdict,
             format!(
-                "needs one human click; re-run with --interactive. dunst: {version}. do_action bindings in dunstrc: {}",
+                "action plumbing (single action, triggered with `dunstctl action`): {}. The two-action approve/deny path is NOT asserted here: it opens a chooser that only a human can answer, and an unanswered chooser blocks every later dunst action. Use a single action with timeout-as-deny. dunst: {version}; do_action binding: {}; chooser: {}",
+                match &plumbing {
+                    Ok(key) if !key.is_empty() => format!("notify-send returned {key:?}"),
+                    Ok(_) => "notify-send returned nothing".to_string(),
+                    Err(err) => format!("failed: {err}"),
+                },
                 if binding.is_empty() {
                     "none".to_string()
                 } else {
                     binding.join(" | ")
-                }
+                },
+                menu_program.clone().unwrap_or_else(|| "unset".to_string()),
             ),
-            json!({ "dunstVersion": version, "doActionBindings": binding, "ran": false }),
+            json!({
+                "dunstVersion": version,
+                "doActionBindings": binding,
+                "menuProgram": menu_program,
+                "plumbing": plumbing.as_deref().ok(),
+                "plumbingError": plumbing.as_ref().err().map(ToString::to_string),
+                "humanHalfRan": false,
+            }),
         ));
     }
 
@@ -728,10 +784,12 @@ fn q8_dunst_actions(ctx: &Ctx) -> ProbeResult {
             "-A",
             "deny=Deny",
             "--wait",
+            // Long enough for a human to actually reach the laptop: the
+            // notification has to still be on screen when they get there.
             "-t",
-            "20000",
+            "90000",
             "tabd visual spike",
-            "Click Approve or Deny to answer Q8",
+            "Click this notification, then pick Approve or Deny",
         ],
     )?;
     let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -743,20 +801,47 @@ fn q8_dunst_actions(ctx: &Ctx) -> ProbeResult {
     Ok((
         verdict,
         format!(
-            "notify-send --wait returned {:?} (empty = no action could be selected). dunst: {version}",
-            chosen
+            "two-action approve/deny: notify-send --wait returned {chosen:?} (empty = nothing was selected). Single-action plumbing: {:?}. dunst: {version}",
+            plumbing.as_deref().ok()
         ),
         json!({
             "dunstVersion": version,
             "doActionBindings": binding,
-            "ran": true,
-            "stdout": chosen,
+            "menuProgram": menu_program,
+            "plumbing": plumbing.as_deref().ok(),
+            "humanHalfRan": true,
+            "humanChoice": chosen,
             "status": out.status.to_string(),
         }),
     ))
 }
 
-// ------------------------------------------------------------------- Q6
+/// Post a one-action notification and trigger it with `dunstctl action`,
+/// returning whatever key `notify-send --wait` printed.
+fn q8_plumbing() -> io::Result<String> {
+    let child = std::process::Command::new("notify-send")
+        .args([
+            "-A",
+            "ok=Acknowledge",
+            "--wait",
+            "-t",
+            "8000",
+            "tabd visual spike",
+            "plumbing check (answered automatically)",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    // Give dunst a moment to display it before asking for the default action.
+    std::thread::sleep(Duration::from_millis(800));
+    let _ = sys::run("dunstctl", &["action"]);
+    // `--wait` exits once the action is taken or the notification expires, so
+    // the 8 s timeout is the bound here.
+    let out = child.wait_with_output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+// ------------------------------------------------------------------- Q6// ------------------------------------------------------------------- Q6
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CookieId {
@@ -915,12 +1000,38 @@ fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
     // Now launch the copy and see which of those identities come back.
     let mut browser =
         PipeBrowser::launch(&ctx.exe, &staging, &visual_base_args(), Some("about:blank"))?;
-    let cookies = browser
-        .call("Storage.getCookies", json!({}))?
-        .get("cookies")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    // q6 deliberately does NOT pass `--password-store=basic` — its whole
+    // question is whether the real profile's OSCrypt key still works. That
+    // means a locked session keyring puts up a modal prompt and the browser
+    // then answers nothing at all, so a timeout here is almost always "the
+    // keyring is locked", not "cookies are broken". Say so instead of dying
+    // with a bare RPC timeout.
+    let cookies = match browser.call("Storage.getCookies", json!({})) {
+        Ok(result) => result
+            .get("cookies")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+            browser.shutdown();
+            return Ok((
+                Verdict::Inconclusive,
+                format!(
+                    "the browser stopped answering while reading cookies ({err}). This is what a LOCKED SESSION KEYRING looks like: Brave puts up a modal \"the login keyring did not get unlocked\" prompt and then completes no request and answers no CDP command. Unlock the keyring in the graphical session and re-run."
+                ),
+                json!({
+                    "realProfile": real.to_string_lossy(),
+                    "stagingProfile": staging.to_string_lossy(),
+                    "prunedFromCopy": pruned,
+                    "profiles": profiles,
+                    "lastUsedProfile": last_used,
+                    "perProfile": Value::Object(per_profile),
+                    "likelyCause": "locked session keyring",
+                }),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
     let live: HashSet<CookieId> = cookies
         .iter()
         .map(|c| CookieId {
