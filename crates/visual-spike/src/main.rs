@@ -10,6 +10,8 @@ mod fixture;
 mod pipe;
 mod probes;
 mod probes_fetch;
+#[cfg(target_os = "macos")]
+mod probes_macos;
 mod scratch;
 mod sys;
 

@@ -82,6 +82,10 @@ pub const PROBE_IDS: &[&str] = &[
     "q10-oopif-leak",
     "q11-popup",
     "q12-detach-paused",
+    "q14-launchservices",
+    "q16-launchagent-ui",
+    "q17-keychain-rebuild",
+    "q18-seatbelt",
     "q6-profile-copy",
 ];
 
@@ -118,6 +122,18 @@ fn question_for(id: &str) -> &'static str {
             "Q12: what happens to a request left paused by Fetch when its session detaches?"
         }
         "q8-dunst-actions" => "Q8: can a dunst notification action be selected?",
+        "q14-launchservices" => {
+            "Q14: does a link go to the browser instance already running on the tabd profile, and can a wrapper .app register as an http/https handler?"
+        }
+        "q16-launchagent-ui" => {
+            "Q16: can a helper spawned by a LaunchAgent-launched daemon reach the UI?"
+        }
+        "q17-keychain-rebuild" => {
+            "Q17: does rebuilding the binary make macOS re-prompt for Keychain access?"
+        }
+        "q18-seatbelt" => {
+            "Q18: can a Seatbelt profile deny Keychain, Apple Events and screen capture while ordinary work still runs?"
+        }
         _ => "unknown",
     }
 }
@@ -125,6 +141,26 @@ fn question_for(id: &str) -> &'static str {
 pub fn run_probe(id: &'static str, ctx: &Ctx) -> Outcome {
     if let Some(result) = crate::probes_fetch::run(id, ctx) {
         return finish(id, result);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(result) = crate::probes_macos::run(id, ctx) {
+        return finish(id, result);
+    }
+    // The macOS-only questions still appear in a Linux run, as an explicit
+    // Inconclusive rather than vanishing from the probe list.
+    #[cfg(not(target_os = "macos"))]
+    if matches!(
+        id,
+        "q14-launchservices" | "q16-launchagent-ui" | "q17-keychain-rebuild" | "q18-seatbelt"
+    ) {
+        return finish(
+            id,
+            Ok((
+                Verdict::Inconclusive,
+                "macOS-only question (LaunchServices / LaunchAgent / Keychain / Seatbelt)".into(),
+                json!({ "macosOnly": true }),
+            )),
+        );
     }
     let result = match id {
         "q1-pipe-launch" => q1_pipe_launch(ctx),
