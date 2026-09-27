@@ -4,6 +4,7 @@ mod cli;
 mod cmd;
 mod daemon;
 mod platform;
+mod profile;
 mod secrets;
 mod skill;
 
@@ -81,6 +82,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Move your everyday browser profile under tabd's control (owner only).
+    Profile {
+        #[command(subcommand)]
+        cmd: ProfileCmd,
+    },
     /// Install the Claude Code / Codex CLI skill (SKILL.md + 4 docs) onto disk.
     Skill {
         #[command(subcommand)]
@@ -91,6 +97,42 @@ enum Command {
     /// for the dispatch table and `secret-put` for the plaintext-safe branch.
     #[command(external_subcommand)]
     Other(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// Copy your real browser profile to a staging directory, for you to
+    /// check before anything is published. Reads the original and nothing
+    /// else — it is never moved, modified or deleted.
+    ///
+    /// Requires the browser to be fully quit: a live profile copies as an
+    /// inconsistent SQLite snapshot.
+    Import {
+        /// The profile to copy. Defaults to the real profile of the browser
+        /// tabd would launch.
+        #[arg(long)]
+        from: Option<String>,
+        /// Where visual mode will look for it. Defaults to the visual profile
+        /// directory.
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Publish the staged copy with an atomic rename, once you have checked
+    /// it. Refuses if the destination is not empty.
+    Cutover {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Delete the staging copy. It holds real cookies and passwords, so this
+    /// exists rather than asking you to `rm -rf` the right path by hand.
+    Discard {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -182,6 +224,13 @@ fn main() -> ExitCode {
                     1
                 }
             },
+            Command::Profile { cmd } => match run_profile_cmd(cmd) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    1
+                }
+            },
             Command::Skill { cmd } => match run_skill_cmd(cmd) {
                 Ok(()) => 0,
                 Err(err) => {
@@ -199,6 +248,20 @@ fn main() -> ExitCode {
         }
     });
     ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+fn run_profile_cmd(cmd: ProfileCmd) -> Result<()> {
+    let (from, to) = match &cmd {
+        ProfileCmd::Import { from, to }
+        | ProfileCmd::Cutover { from, to }
+        | ProfileCmd::Discard { from, to } => (from.clone(), to.clone()),
+    };
+    let plan = profile::plan(from.as_deref(), to.as_deref())?;
+    match cmd {
+        ProfileCmd::Import { .. } => profile::import(&plan),
+        ProfileCmd::Cutover { .. } => profile::cutover(&plan),
+        ProfileCmd::Discard { .. } => profile::discard(&plan),
+    }
 }
 
 fn run_skill_cmd(cmd: SkillCmd) -> Result<()> {

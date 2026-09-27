@@ -19,7 +19,6 @@ use super::*;
 use crate::browser::{LaunchSpec, VisualSpec};
 use crate::cdp::{CdpClient, ConnectOptions};
 use crate::platform;
-use std::os::fd::AsRawFd;
 
 /// How long the post-connect CDP handshake may take. This is what catches a
 /// launch that the Chromium singleton handed off to an already-running
@@ -36,48 +35,6 @@ const EOF_EXIT_WAIT: Duration = Duration::from_secs(5);
 /// After SIGTERM, how long before SIGKILL. Reaching this loses the human's
 /// session-restore data, so it is the last thing tried, never the first.
 const SIGTERM_EXIT_WAIT: Duration = Duration::from_secs(5);
-
-// -- Profile lock -----------------------------------------------------------
-
-/// Exclusive ownership of one browser profile, as an advisory `flock` on
-/// `<profile>.lock`.
-///
-/// Keyed on the profile rather than the daemon base dir on purpose: two
-/// daemons started with different `$TABD_BASE_DIR` but the same profile would
-/// otherwise both drive it. The lock is released when the file is closed,
-/// which `Drop` does, and which the kernel does if the daemon dies.
-#[derive(Debug)]
-pub(super) struct ProfileLock {
-    // Held only to keep the descriptor open; closing it releases the flock.
-    _file: std::fs::File,
-}
-
-impl ProfileLock {
-    pub(super) fn acquire(profile_dir: &Path) -> Result<Self> {
-        let path = platform::profile_lock_path(profile_dir);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("open profile lock {}", path.display()))?;
-        // SAFETY: `file` owns a live descriptor for the duration of the call.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            bail!(
-                "another tabd already owns profile {} ({}): {err}",
-                profile_dir.display(),
-                path.display()
-            );
-        }
-        Ok(ProfileLock { _file: file })
-    }
-}
 
 // -- Browser binding --------------------------------------------------------
 
@@ -148,7 +105,7 @@ fn bind_browser(profile_dir: &Path, executable: &Path) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
-            std::fs::write(&marker, executable.to_string_lossy().as_bytes())
+            platform::write_sidecar(&marker, executable.to_string_lossy().as_bytes())
                 .with_context(|| format!("record browser binding {}", marker.display()))?;
         }
         Err(err) => {

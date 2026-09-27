@@ -21,7 +21,8 @@ use crate::browser::{Browser, LaunchSpec};
 use crate::cdp::{CdpClient, ConnectOptions};
 use crate::cmd::page;
 use crate::platform;
-use visual::{Lifecycle, ProfileLock};
+use platform::ProfileLock;
+use visual::Lifecycle;
 
 // Domain handler submodules. Each accesses shared state/helpers via `use
 // super::*` and exposes its handlers as `pub(super)` for process_request.

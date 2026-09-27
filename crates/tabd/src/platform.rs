@@ -10,6 +10,7 @@
 //! gets its own tree so the two daemons coexist.
 
 use anyhow::{Context, Result};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 fn home() -> Result<PathBuf> {
@@ -97,25 +98,208 @@ pub fn profile_lock_path(profile_dir: &Path) -> PathBuf {
 /// real name.
 ///
 /// The directory may not exist yet on a first launch, and `canonicalize`
-/// requires an existing path, so the parent is resolved and the final
-/// component appended.
+/// requires an existing path, so the nearest existing ancestor is resolved and
+/// the remaining components appended.
+///
+/// **Creates nothing.** An earlier version created the missing parents so it
+/// could canonicalize them, which meant `tabd profile import --to
+/// <source>/nested/x` made directories *inside the source profile* before the
+/// overlap check rejected it — in a command whose whole promise is that it
+/// does not touch the original.
 pub fn canonical_profile_dir(profile_dir: &Path) -> Result<PathBuf> {
     if let Ok(resolved) = profile_dir.canonicalize() {
         return Ok(resolved);
     }
-    let parent = profile_dir.parent().unwrap_or_else(|| Path::new("."));
-    let name = profile_dir.file_name().with_context(|| {
-        format!(
-            "profile path has no final component: {}",
-            profile_dir.display()
-        )
-    })?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create profile parent {}", parent.display()))?;
-    let parent = parent
+    let absolute = if profile_dir.is_absolute() {
+        profile_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve the current directory")?
+            .join(profile_dir)
+    };
+
+    let mut existing = absolute.as_path();
+    let mut trailing: Vec<&OsStr> = Vec::new();
+    while !existing.exists() {
+        let name = existing.file_name().with_context(|| {
+            format!(
+                "no existing ancestor of {} could be resolved",
+                absolute.display()
+            )
+        })?;
+        trailing.push(name);
+        existing = existing.parent().with_context(|| {
+            format!(
+                "no existing ancestor of {} could be resolved",
+                absolute.display()
+            )
+        })?;
+    }
+    let mut resolved = existing
         .canonicalize()
-        .with_context(|| format!("resolve profile parent {}", parent.display()))?;
-    Ok(parent.join(name))
+        .with_context(|| format!("resolve {}", existing.display()))?;
+    for name in trailing.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
+/// Where a given browser keeps the profile the human uses every day.
+///
+/// Keyed on the executable's file name, which is stable across the
+/// distro-specific paths (`/usr/bin/brave` vs `/opt/brave-bin/brave`) that
+/// `discover_chromium` can return. `None` for a browser we do not recognize —
+/// the caller then requires an explicit `--from`, because guessing would mean
+/// copying one browser's data and opening it with another.
+pub fn real_profile_dir(executable: &Path) -> Option<PathBuf> {
+    let name = executable
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let home = home().ok()?;
+    let relative = match name.as_str() {
+        "google chrome" | "google-chrome" | "google-chrome-stable" | "chrome" => {
+            if cfg!(target_os = "macos") {
+                "Google/Chrome"
+            } else {
+                "google-chrome"
+            }
+        }
+        "google chrome canary" | "google-chrome-canary" => {
+            if cfg!(target_os = "macos") {
+                "Google/Chrome Canary"
+            } else {
+                "google-chrome-canary"
+            }
+        }
+        "brave browser" | "brave" | "brave-browser" => "BraveSoftware/Brave-Browser",
+        "chromium" | "chromium-browser" => {
+            if cfg!(target_os = "macos") {
+                "Chromium"
+            } else {
+                "chromium"
+            }
+        }
+        "microsoft edge" | "microsoft-edge" | "microsoft-edge-stable" => {
+            if cfg!(target_os = "macos") {
+                "Microsoft Edge"
+            } else {
+                "microsoft-edge"
+            }
+        }
+        "vivaldi" | "vivaldi-stable" => {
+            if cfg!(target_os = "macos") {
+                "Vivaldi"
+            } else {
+                "vivaldi"
+            }
+        }
+        _ => return None,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        Some(home.join("Library/Application Support").join(relative))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(home.join(".config").join(relative))
+    }
+}
+
+/// Exclusive ownership of one browser profile, as an advisory `flock` on
+/// `<profile>.lock`.
+///
+/// Keyed on the profile rather than the daemon base dir on purpose: two
+/// daemons started with different `$TABD_BASE_DIR` but the same profile would
+/// otherwise both drive it. The lock is released when the file is closed,
+/// which `Drop` does, and which the kernel does if the holder dies.
+#[derive(Debug)]
+pub struct ProfileLock {
+    // Held only to keep the descriptor open; closing it releases the flock.
+    _file: std::fs::File,
+}
+
+impl ProfileLock {
+    pub fn acquire(profile_dir: &Path) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let path = profile_lock_path(profile_dir);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        // `O_NOFOLLOW`: without it, a `<profile>.lock` that is a dangling
+        // symlink into somewhere else gets *created there*. For
+        // `<staging>.lock` that somewhere else can be inside the original
+        // profile, which `tabd profile import` exists to leave untouched.
+        // The atomic-sidecar path does not cover this one — locks are opened,
+        // not renamed into place.
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("open profile lock {}", path.display()))?;
+        if !file
+            .metadata()
+            .with_context(|| format!("stat profile lock {}", path.display()))?
+            .is_file()
+        {
+            anyhow::bail!("profile lock {} is not a regular file", path.display());
+        }
+        // SAFETY: `file` owns a live descriptor for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!(
+                "another tabd already owns profile {} ({}): {err}",
+                profile_dir.display(),
+                path.display()
+            );
+        }
+        Ok(ProfileLock { _file: file })
+    }
+}
+
+/// Write a small sidecar file beside a profile, replacing whatever is there.
+///
+/// Through an exclusively-created temporary and a rename, for two reasons. A
+/// plain write **follows a symlink and truncates its target**: a
+/// `<destination>.import` that happens to be a link to the source's `History`
+/// would have the original database overwritten with JSON. And a partial write
+/// would leave an unparsable record behind. `rename` replaces the link itself,
+/// and is atomic.
+pub fn write_sidecar(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = parent.join(format!(".tabd-tmp-{}-{stamp}", std::process::id()));
+
+    let write = || -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true) // never opens something that already exists
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+            .with_context(|| format!("create {}", temp.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("write {}", temp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flush {}", temp.display()))?;
+        std::fs::rename(&temp, path).with_context(|| format!("publish {}", path.display()))
+    };
+    let result = write();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// Whether the profile reopens its tabs on startup.
@@ -241,8 +425,103 @@ mod tests {
         let resolved = canonical_profile_dir(&fresh).expect("fresh profile");
         assert!(resolved.is_absolute(), "got: {}", resolved.display());
         assert_eq!(resolved.file_name(), fresh.file_name());
-        // Resolving must not create the profile itself — only its parent.
         assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn canonical_profile_dir_creates_nothing() {
+        // `tabd profile import --to <source>/a/b/c` must not make directories
+        // inside the source while working out whether the paths overlap.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let deep = dir.path().join("a/b/c");
+        let resolved = canonical_profile_dir(&deep).expect("deep path");
+        assert!(resolved.ends_with("a/b/c"), "got: {}", resolved.display());
+        assert!(!dir.path().join("a").exists(), "nothing may be created");
+    }
+
+    #[test]
+    fn real_profile_dirs_are_per_browser_and_absolute() {
+        // Distro spellings of the same browser land on one profile.
+        let brave_a = real_profile_dir(Path::new("/usr/bin/brave")).expect("brave");
+        let brave_b = real_profile_dir(Path::new("/opt/brave-bin/brave-browser")).expect("brave");
+        assert_eq!(brave_a, brave_b);
+        assert!(brave_a.is_absolute());
+
+        // Different browsers must never share one — copying Chrome's data and
+        // opening it with Brave rewrites it.
+        let chrome = real_profile_dir(Path::new("/usr/bin/google-chrome-stable")).expect("chrome");
+        assert_ne!(chrome, brave_a);
+
+        // macOS bundle binary names carry spaces.
+        assert!(
+            real_profile_dir(Path::new(
+                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+            ))
+            .is_some()
+        );
+
+        // An unrecognized browser has no configuration — guessing is worse
+        // than making the caller pass --from.
+        assert_eq!(real_profile_dir(Path::new("/opt/weird/browser")), None);
+    }
+
+    #[test]
+    fn profile_lock_is_exclusive_and_releasable() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let profile = dir.path().join("profile");
+        let first = ProfileLock::acquire(&profile).expect("first");
+        let err = ProfileLock::acquire(&profile).expect_err("second must fail");
+        assert!(
+            err.to_string().contains("already owns profile"),
+            "got: {err}"
+        );
+        drop(first);
+        ProfileLock::acquire(&profile).expect("reacquire after release");
+    }
+
+    #[test]
+    fn profile_lock_refuses_to_follow_a_symlink() {
+        // A dangling `<profile>.lock` symlink must not make us create its
+        // target — that target can be inside the profile an import is meant
+        // to leave alone.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let victim = dir.path().join("inside-the-original");
+        let profile = dir.path().join("profile");
+        std::os::unix::fs::symlink(&victim, profile_lock_path(&profile)).expect("symlink");
+
+        assert!(ProfileLock::acquire(&profile).is_err());
+        assert!(!victim.exists(), "the symlink target must not be created");
+    }
+
+    #[test]
+    fn write_sidecar_replaces_a_symlink_instead_of_its_target() {
+        // A plain write would follow the link and truncate the victim — and
+        // the victim here is the kind of file this whole command exists to
+        // protect.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let victim = dir.path().join("precious");
+        std::fs::write(&victim, b"do not destroy").expect("write");
+        let sidecar = dir.path().join("profile.import");
+        std::os::unix::fs::symlink(&victim, &sidecar).expect("symlink");
+
+        write_sidecar(&sidecar, b"{}").expect("write sidecar");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not destroy");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"{}");
+        assert!(!sidecar.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn write_sidecar_leaves_no_temporary_behind() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        write_sidecar(&dir.path().join("x.import"), b"a").expect("write");
+        write_sidecar(&dir.path().join("x.import"), b"bb").expect("overwrite");
+        assert_eq!(std::fs::read(dir.path().join("x.import")).unwrap(), b"bb");
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tabd-tmp-"))
+            .collect();
+        assert!(strays.is_empty(), "temporary left behind");
     }
 
     #[test]
