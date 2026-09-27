@@ -612,6 +612,18 @@ async fn render_result(resp: &Value, parsed: &ParsedArgs) -> Result<i32> {
 /// argv to a running instance, is exactly what `browser.ensure`'s serialized
 /// lifecycle exists to avoid.
 pub async fn run_browser(urls: Vec<String>, base_dir: Option<&str>, json: bool) -> Result<i32> {
+    // Partitioned, not all-or-nothing: `%U` can hand over a mixed list, and
+    // sending one `tabd:` url along with the rest made `parse_urls` fail the
+    // whole request — so `tabd browser tabd://x https://example.com` opened
+    // nothing when the user expected example.com.
+    let (checks, urls) = split_delivery_checks(&urls);
+    if !checks.is_empty() {
+        record_delivery_checks(&checks, base_dir)?;
+        if urls.is_empty() {
+            return Ok(0);
+        }
+    }
+
     let paths = ensure_visual_daemon(base_dir).await?;
     let resp = send_action(
         &paths.socket_path,
@@ -756,6 +768,67 @@ fn wrong_mode_error(mode: &str, socket_path: &Path) -> anyhow::Error {
     )
 }
 
+/// Split urls into delivery checks and real urls.
+///
+/// Case-insensitive: LaunchServices matches `CFBundleURLSchemes` without
+/// regard to case, so `open TABD://hello` reaches the wrapper — and a
+/// case-sensitive test here would let it fall through to the daemon, be
+/// rejected as an unknown scheme, and be swallowed by the wrapper's `try`.
+/// That is exactly the silent-no-op failure this check was added to remove.
+fn split_delivery_checks(urls: &[String]) -> (Vec<String>, Vec<String>) {
+    let scheme = crate::service::TEST_SCHEME;
+    urls.iter().cloned().partition(|url| {
+        url.split_once(':')
+            .is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case(scheme))
+    })
+}
+
+/// Record delivery checks for the private scheme.
+///
+/// Answered here, before the daemon is involved, because the daemon only
+/// accepts `http`/`https`/`file`. Recorded rather than only printed: the macOS
+/// wrapper runs this with no terminal attached, so the log is the evidence.
+fn record_delivery_checks(checks: &[String], base_dir: Option<&str>) -> Result<()> {
+    // The same hygiene `validate_url` applies, and for the same reason: this
+    // goes into a log that `tabd service status` prints verbatim to a
+    // terminal, so a newline forges a log line and an escape sequence reaches
+    // the terminal.
+    for url in checks {
+        if url.chars().any(char::is_control) {
+            bail!("invalid url: contains a control character");
+        }
+    }
+    let paths = daemon::resolve_paths_for(base_dir, daemon::DaemonMode::Visual)?;
+    std::fs::create_dir_all(&paths.base_dir)
+        .with_context(|| format!("create {}", paths.base_dir.display()))?;
+    let log = paths.base_dir.join("url-delivery.log");
+    let line = format!("{} {}\n", unix_timestamp(), checks.join(" "));
+
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .with_context(|| format!("open {}", log.display()))?;
+    file.write_all(line.as_bytes())
+        .with_context(|| format!("write {}", log.display()))?;
+
+    for url in checks {
+        println!("url delivery ok: {url}");
+    }
+    eprintln!("recorded in {}", log.display());
+    Ok(())
+}
+
+/// Seconds since the epoch. A real timestamp would mean a date dependency for
+/// one log line.
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Reach the visual daemon, starting it if it is not there.
 ///
 /// Unlike [`ensure_daemon`] this waits only for *reachable*, never for
@@ -808,6 +881,50 @@ async fn ensure_visual_daemon(base_dir: Option<&str>) -> Result<daemon::DaemonPa
                 VISUAL_START_DEADLINE.as_secs()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::split_delivery_checks;
+
+    fn split(urls: &[&str]) -> (Vec<String>, Vec<String>) {
+        let owned: Vec<String> = urls.iter().map(|u| (*u).to_string()).collect();
+        split_delivery_checks(&owned)
+    }
+
+    #[test]
+    fn the_private_scheme_is_matched_case_insensitively() {
+        // LaunchServices matches CFBundleURLSchemes without regard to case, so
+        // `open TABD://x` reaches the wrapper. A case-sensitive test here let
+        // it fall through to the daemon, be rejected, and be swallowed by the
+        // wrapper's `try` — silently doing nothing while looking fine.
+        for spelling in ["tabd://x", "TABD://x", "TaBd://x"] {
+            let (checks, rest) = split(&[spelling]);
+            assert_eq!(checks.len(), 1, "{spelling}");
+            assert!(rest.is_empty(), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_mixed_list_is_partitioned_not_rejected() {
+        // `%U` can hand over both at once, and the entry claims both schemes.
+        // Sending the lot to the daemon made `parse_urls` fail the whole
+        // request, so the real url opened nothing.
+        let (checks, rest) = split(&["tabd://probe", "https://example.com", "file:///tmp/x"]);
+        assert_eq!(checks, vec!["tabd://probe"]);
+        assert_eq!(rest, vec!["https://example.com", "file:///tmp/x"]);
+    }
+
+    #[test]
+    fn ordinary_urls_are_untouched() {
+        let (checks, rest) = split(&["https://example.com"]);
+        assert!(checks.is_empty());
+        assert_eq!(rest, vec!["https://example.com"]);
+        // A host that merely starts with the scheme name is not the scheme.
+        let (checks, rest) = split(&["https://tabd.example.com"]);
+        assert!(checks.is_empty());
+        assert_eq!(rest.len(), 1);
     }
 }
 

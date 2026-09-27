@@ -6,6 +6,7 @@ mod daemon;
 mod platform;
 mod profile;
 mod secrets;
+mod service;
 mod skill;
 
 use anyhow::Result;
@@ -87,6 +88,11 @@ enum Command {
         #[command(subcommand)]
         cmd: ProfileCmd,
     },
+    /// Register tabd with the OS so it can be launched as a browser.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
     /// Install the Claude Code / Codex CLI skill (SKILL.md + 4 docs) onto disk.
     Skill {
         #[command(subcommand)]
@@ -97,6 +103,41 @@ enum Command {
     /// for the dispatch table and `secret-put` for the plaintext-safe branch.
     #[command(external_subcommand)]
     Other(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Install the desktop entry / wrapper app and the background service.
+    ///
+    /// Does NOT make tabd your default browser, and does not start the
+    /// service, unless you ask for those explicitly.
+    Install {
+        /// Make tabd the default web browser (Linux only; on macOS this is a
+        /// user gesture the command prints instructions for).
+        #[arg(long)]
+        set_default: bool,
+        /// Enable and start the background service now.
+        #[arg(long)]
+        enable_service: bool,
+        /// Install under this directory instead of $HOME. For testing.
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+    /// Remove what `install` added. Refuses while tabd is the default browser.
+    Uninstall {
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+    /// Show what is installed.
+    Status {
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Which visual daemon's state to read (the url-delivery log).
+        /// Defaults to $TABD_BASE_DIR or the platform default, matching
+        /// `tabd browser --base-dir`.
+        #[arg(long)]
+        base_dir: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -165,6 +206,7 @@ enum SkillCmd {
 }
 
 fn main() -> ExitCode {
+    quiet_broken_pipe();
     let cli = Cli::parse();
 
     // Runtime sizing by command. Every path is IO-bound (the heavy lifting is
@@ -231,6 +273,13 @@ fn main() -> ExitCode {
                     1
                 }
             },
+            Command::Service { cmd } => match run_service_cmd(cmd) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    1
+                }
+            },
             Command::Skill { cmd } => match run_skill_cmd(cmd) {
                 Ok(()) => 0,
                 Err(err) => {
@@ -248,6 +297,70 @@ fn main() -> ExitCode {
         }
     });
     ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+/// Exit quietly when stdout goes away, instead of aborting.
+///
+/// Rust ignores `SIGPIPE`, so a `println!` into a closed pipe returns an error
+/// that the macro turns into a panic — and this crate builds with
+/// `panic = "abort"`, so `tabd … | head -1` died with "Abort trap: 6".
+///
+/// The obvious fix, restoring `SIGPIPE` to `SIG_DFL`, is wrong here: it
+/// applies to *every* write in the process, including the daemon's writes to
+/// Chromium's debugging pipe. A browser exiting mid-write would then kill the
+/// daemon outright rather than producing the `EPIPE` the transport is written
+/// to handle. So the signal disposition is left alone and only the specific
+/// panic is intercepted.
+fn quiet_broken_pipe() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info.to_string();
+        // Matched on the print macros' own wording, not on "Broken pipe"
+        // anywhere in the panic. Any panic carrying an `io::Error` with
+        // `ErrorKind::BrokenPipe` would otherwise become a *successful* exit —
+        // and both service definitions this crate generates read exit 0 as
+        // "do not restart" (`Restart=on-failure`, `KeepAlive
+        // { SuccessfulExit: false }`), so a daemon crash would turn into a
+        // permanently dead service.
+        let from_stdout = message.contains("failed printing to stdout")
+            || message.contains("failed writing to stdout");
+        // Both halves are needed. The macro wording alone covers *every*
+        // stdout write failure — a full disk or a would-block on a nonblocking
+        // pipe would exit 0 with truncated output and no diagnostic — and the
+        // broken-pipe text alone catches unrelated panics carrying an EPIPE.
+        let broken_pipe = message.contains("Broken pipe") || message.contains("os error 32");
+        if from_stdout && broken_pipe {
+            // The reader is gone; there is nobody to report anything to.
+            std::process::exit(0);
+        }
+        previous(info);
+    }));
+}
+
+fn run_service_cmd(cmd: ServiceCmd) -> Result<()> {
+    fn resolve(dir: Option<String>) -> Result<service::Prefix> {
+        match dir {
+            Some(dir) => Ok(service::Prefix::at(&dir)),
+            None => service::Prefix::home(),
+        }
+    }
+    match cmd {
+        ServiceCmd::Install {
+            set_default,
+            enable_service,
+            prefix,
+        } => service::install(
+            &resolve(prefix)?,
+            &service::Options {
+                set_default,
+                enable_service,
+            },
+        ),
+        ServiceCmd::Uninstall { prefix } => service::uninstall(&resolve(prefix)?),
+        ServiceCmd::Status { prefix, base_dir } => {
+            service::status(&resolve(prefix)?, base_dir.as_deref())
+        }
+    }
 }
 
 fn run_profile_cmd(cmd: ProfileCmd) -> Result<()> {
