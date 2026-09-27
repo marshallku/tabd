@@ -431,9 +431,8 @@ fn coerce(value: &str) -> Value {
     // survive intact (the Toss sign-in phone field, and OTPs / zip codes
     // generally). A bare "0" and fractionals like "0.5" are still numbers.
     let int_part = value.strip_prefix('-').unwrap_or(value);
-    let has_leading_zero = int_part.len() > 1
-        && int_part.starts_with('0')
-        && int_part.as_bytes()[1].is_ascii_digit();
+    let has_leading_zero =
+        int_part.len() > 1 && int_part.starts_with('0') && int_part.as_bytes()[1].is_ascii_digit();
     if NUM_RE.is_match(value) && !has_leading_zero {
         if !value.contains('.')
             && let Ok(n) = value.parse::<i64>()
@@ -594,6 +593,13 @@ async fn render_result(resp: &Value, parsed: &ParsedArgs) -> Result<i32> {
         Some(v) => println!("{}", serde_json::to_string_pretty(v)?),
     }
     Ok(0)
+}
+
+/// Every daemon action the CLI can reach, for tests that must stay in step
+/// with the dispatch table rather than hard-coding a list that rots.
+#[cfg(test)]
+pub(crate) fn dispatch_actions() -> Vec<&'static str> {
+    DISPATCH.values().map(|spec| spec.action).collect()
 }
 
 // ---------------------------------------------------------------------------

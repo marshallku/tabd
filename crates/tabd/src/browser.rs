@@ -1,6 +1,16 @@
+// The visual-mode surface (`LaunchSpec::Visual` and the teardown primitives
+// it needs) is implemented and tested here, but the daemon does not reach it
+// yet — wiring it up is the next work-unit, §V1 "lifecycle" in
+// docs/visual-mode-plan.md. Silence dead-code warnings at the module level
+// until then so release builds stay quiet, same as cdp.rs does.
+#![allow(dead_code)]
+
+use crate::cdp::Transport;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::ffi::OsStr;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -14,16 +24,57 @@ const STDERR_WAIT: Duration = Duration::from_secs(10);
 const JSON_VERSION_WAIT: Duration = Duration::from_secs(5);
 const JSON_VERSION_POLL: Duration = Duration::from_millis(200);
 const GRACEFUL_WAIT: Duration = Duration::from_secs(2);
+/// Poll interval while waiting for a child to exit.
+const REAP_POLL: Duration = Duration::from_millis(25);
+
+/// What kind of browser to launch.
+///
+/// The two modes differ in more than a flag: headless owns a throwaway
+/// profile and talks over a TCP-backed WebSocket, visual drives the human's
+/// permanent profile over an inherited pipe that no other local process can
+/// reach. Keeping them as one enum means a caller cannot half-configure one.
+pub enum LaunchSpec {
+    /// Agent mode, unchanged: `TempDir` profile, `--no-sandbox`, WebSocket.
+    Headless,
+    /// Visual mode (`docs/visual-mode-plan.md` §V1).
+    Visual(VisualSpec),
+}
+
+pub struct VisualSpec {
+    /// The permanent user-data-dir. Never a `TempDir`.
+    pub profile_dir: PathBuf,
+    /// Resolved by the caller *together with* `profile_dir` as one
+    /// configuration. A V0 lesson: an executable override must never make us
+    /// launch browser X against browser Y's profile.
+    pub executable: PathBuf,
+    /// Urls to open at startup (`tabd browser <url>...`). May be empty.
+    pub start_urls: Vec<String>,
+    /// Where the browser's stderr goes. There is no `DevTools listening on`
+    /// line to scrape in pipe mode, so this file is the only record of a
+    /// launch that fails after `exec`.
+    pub stderr_log: PathBuf,
+}
+
+/// How the daemon will reach this browser over CDP.
+enum Endpoint {
+    WebSocket(String),
+    /// `None` once [`Browser::take_transport`] has handed the descriptors to
+    /// the client. They are deliberately not kept here as well: while the
+    /// parent holds *any* copy, the browser does not see EOF.
+    Pipe(Option<(OwnedFd, OwnedFd)>),
+}
 
 pub struct Browser {
     child: Child,
-    ws_endpoint: String,
+    endpoint: Endpoint,
     // Whether this Chromium was launched with a visible window (no
     // `--headless=new`). Surfaced via `daemon.health` so a caller can tell
     // which mode the live daemon is in.
     headed: bool,
-    // Kept alive to defer tempdir cleanup until Browser is dropped.
-    _user_data_dir: TempDir,
+    visual: bool,
+    // Kept alive to defer tempdir cleanup until Browser is dropped. `None` in
+    // visual mode, where the profile outlives the process by design.
+    _user_data_dir: Option<TempDir>,
 }
 
 /// Truthy check for the `TABD_HEADED` env toggle. Accepts the common
@@ -51,31 +102,80 @@ struct JsonVersion {
     web_socket_debugger_url: String,
 }
 
+/// Headless launch flags. `--headless=new` + `--disable-gpu` are the only
+/// flags that differ by mode; a visible window wants the real GPU path, so
+/// both are dropped in headed mode. The rest are launch hygiene and apply to
+/// either mode. Pure so the flag set can be asserted in a unit test.
+fn headless_args(headed: bool) -> Vec<&'static str> {
+    let mut args: Vec<&str> = Vec::with_capacity(11);
+    if !headed {
+        args.push("--headless=new");
+        args.push("--disable-gpu");
+    }
+    args.extend([
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-extensions",
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-debugging-port=0",
+    ]);
+    args
+}
+
+/// Visual launch flags. What is *absent* is the point (design doc §V1):
+///
+/// - no `--no-sandbox` — turning the renderer sandbox off in the browser
+///   someone reads their mail in is not acceptable
+/// - no `--disable-extensions` — their password manager lives there
+/// - no `--disable-sync` / `--disable-background-networking` — sync, updates
+///   and Safe Browsing keep working
+/// - no `--remote-debugging-port` — the pipe is the whole A3 defense
+/// - no `--headless=new` / `--disable-gpu`
+/// - and **never** `--enable-automation`, which would paint the "controlled by
+///   automated software" infobar across their everyday browser
+///
+/// Note what this does *not* include either: `--password-store=basic`. A
+/// throwaway profile gets it to dodge a locked keyring, but a visual profile
+/// needs the real credential store — V0 measured that a locked one stalls
+/// every network request with no error anywhere, which is a condition to
+/// diagnose, not to paper over.
+fn visual_args(profile_dir: &Path, start_urls: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "--remote-debugging-pipe".to_string(),
+        format!("--user-data-dir={}", profile_dir.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+    ];
+    if !start_urls.is_empty() {
+        // Chromium stops parsing switches at a bare `--`. Without it a url of
+        // `--no-sandbox` would turn off the renderer sandbox on the human's
+        // browser, and `--user-data-dir=…` would silently open a *different*
+        // profile from the one whose lock we hold. The callers also validate
+        // (see `daemon::visual::parse_urls`); this is the second layer, and
+        // the one that holds even if a future caller forgets.
+        args.push("--".to_string());
+        args.extend(start_urls.iter().cloned());
+    }
+    args
+}
+
 impl Browser {
-    pub async fn launch() -> Result<Self> {
+    pub async fn launch(spec: LaunchSpec) -> Result<Self> {
+        match spec {
+            LaunchSpec::Headless => Self::launch_headless().await,
+            LaunchSpec::Visual(spec) => Self::launch_visual(spec).await,
+        }
+    }
+
+    async fn launch_headless() -> Result<Self> {
         let executable = discover_chromium()?;
         let user_data_dir = TempDir::new().context("create tempdir for --user-data-dir")?;
         let headed = headed_from_env();
-
-        // `--headless=new` + `--disable-gpu` are the only flags that differ by
-        // mode; a visible window wants the real GPU path, so both are dropped in
-        // headed mode. The rest are launch hygiene and apply to either mode.
-        let mut args: Vec<&str> = Vec::with_capacity(11);
-        if !headed {
-            args.push("--headless=new");
-            args.push("--disable-gpu");
-        }
-        args.extend([
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-background-networking",
-            "--disable-sync",
-            "--disable-extensions",
-            "--remote-debugging-address=127.0.0.1",
-            "--remote-debugging-port=0",
-        ]);
+        let args = headless_args(headed);
 
         let mut child = Command::new(&executable)
             .args(&args)
@@ -117,14 +217,93 @@ impl Browser {
 
         Ok(Browser {
             child,
-            ws_endpoint,
+            endpoint: Endpoint::WebSocket(ws_endpoint),
             headed,
-            _user_data_dir: user_data_dir,
+            visual: false,
+            _user_data_dir: Some(user_data_dir),
         })
     }
 
-    pub fn ws_endpoint(&self) -> &str {
-        &self.ws_endpoint
+    async fn launch_visual(spec: VisualSpec) -> Result<Self> {
+        let VisualSpec {
+            profile_dir,
+            executable,
+            start_urls,
+            stderr_log,
+        } = spec;
+
+        std::fs::create_dir_all(&profile_dir)
+            .with_context(|| format!("create profile dir {}", profile_dir.display()))?;
+        if let Some(parent) = stderr_log.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create log dir {}", parent.display()))?;
+        }
+        // Truncated per launch: this is "why did *this* start fail", not a
+        // history, and an append-only log next to a daily-driver browser
+        // would grow without anyone looking at it.
+        let stderr_file = std::fs::File::create(&stderr_log)
+            .with_context(|| format!("create browser log {}", stderr_log.display()))?;
+
+        // fd 3 = browser reads commands, fd 4 = browser writes responses.
+        let (cmd_r, cmd_w) = pipe2_cloexec().context("create cdp command pipe")?;
+        let (res_r, res_w) = pipe2_cloexec().context("create cdp response pipe")?;
+
+        let mut cmd = Command::new(&executable);
+        cmd.args(visual_args(&profile_dir, &start_urls))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
+            // Not `kill_on_drop`: closing the pipe is what stops a visual
+            // browser, and it stops it *gracefully* (session restore data is
+            // written). SIGKILLing the human's browser because the daemon
+            // panicked would throw away their tabs.
+            .kill_on_drop(false);
+
+        let cmd_r_raw = cmd_r.as_raw_fd();
+        let res_w_raw = res_w.as_raw_fd();
+        // SAFETY: the closure runs between fork and exec and calls only
+        // async-signal-safe functions (fcntl/dup2/close).
+        unsafe {
+            cmd.pre_exec(move || dup_onto_cdp_fds(cmd_r_raw, res_w_raw));
+        }
+
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("spawn browser: {}", executable.display()))?;
+        // The child has its own copies now. While the parent keeps these two,
+        // the browser would never see EOF on its command pipe.
+        drop(cmd_r);
+        drop(res_w);
+
+        Ok(Browser {
+            child,
+            endpoint: Endpoint::Pipe(Some((cmd_w, res_r))),
+            headed: true,
+            visual: true,
+            _user_data_dir: None,
+        })
+    }
+
+    /// Take the CDP transport. Callable exactly once — the pipe descriptors
+    /// move to the client, which is what lets a client teardown close them.
+    pub fn take_transport(&mut self) -> Result<Transport> {
+        match &mut self.endpoint {
+            Endpoint::WebSocket(url) => Ok(Transport::WebSocket(url.clone())),
+            Endpoint::Pipe(slot) => {
+                let (to_browser, from_browser) = slot
+                    .take()
+                    .ok_or_else(|| anyhow!("cdp pipe transport already taken"))?;
+                Ok(Transport::Pipe {
+                    to_browser,
+                    from_browser,
+                })
+            }
+        }
+    }
+
+    /// Whether this browser drives the human's permanent profile.
+    pub fn visual(&self) -> bool {
+        self.visual
     }
 
     /// Whether this Chromium was launched with a visible window.
@@ -156,11 +335,27 @@ impl Browser {
         }
     }
 
-    /// Graceful shutdown: SIGTERM → wait up to `GRACEFUL_WAIT` → SIGKILL fallback.
-    /// `kill_on_drop(true)` covers panic / early-drop paths separately.
-    /// Once cdp.rs lands (task #16) this can additionally send CDP `Browser.close`
-    /// before the signal escalation, but SIGTERM is already a clean exit for chromium.
-    pub async fn shutdown(mut self) -> Result<()> {
+    /// Wait up to `limit` for the child to exit, reaping it if it does.
+    /// Returns whether it exited. Used by the visual teardown sequence, where
+    /// the ordering (CDP `Browser.close` → transport teardown → signals) is
+    /// owned by the daemon, not by this type.
+    pub async fn wait_for_exit(&mut self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            sleep(REAP_POLL).await;
+        }
+    }
+
+    /// Deliver SIGTERM. A no-op if the child has already been reaped.
+    pub fn terminate(&self) {
         #[cfg(unix)]
         if let Some(pid) = self.child.id() {
             // SAFETY: pid is valid until the child is reaped; we only deliver a signal.
@@ -168,15 +363,110 @@ impl Browser {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
         }
+    }
+
+    /// Last resort. For a visual browser this loses the session-restore data
+    /// that a graceful exit would have written, so callers escalate to it only
+    /// after `Browser.close`, transport teardown and SIGTERM have all failed.
+    pub async fn kill(&mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
+
+    /// Graceful shutdown: SIGTERM → wait up to `GRACEFUL_WAIT` → SIGKILL fallback.
+    /// `kill_on_drop(true)` covers panic / early-drop paths separately.
+    /// Headless teardown; visual mode goes through the daemon's lifecycle
+    /// sequence instead, which closes the browser over CDP first.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.terminate();
         match timeout(GRACEFUL_WAIT, self.child.wait()).await {
             Ok(_) => Ok(()),
             Err(_) => {
-                let _ = self.child.kill().await;
-                let _ = self.child.wait().await;
+                self.kill().await;
                 Ok(())
             }
         }
     }
+}
+
+/// `pipe2(O_CLOEXEC)`, or `pipe` + an explicit `FD_CLOEXEC` on platforms that
+/// lack it (macOS). Close-on-exec matters because the child must inherit these
+/// descriptors *only* at 3 and 4 — see [`dup_onto_cdp_fds`].
+///
+/// The macOS fallback is **not atomic**: between `pipe` and `F_SETFD` there is
+/// a window in which another thread's fork+exec would have the child inherit
+/// our ends, and an inherited copy of the command pipe means the browser never
+/// sees EOF on fd 3 — an orphaned visual browser. macOS offers no atomic
+/// syscall, so the invariant is instead a structural one: **nothing else in
+/// this process may spawn while a visual launch is in flight.** Today the only
+/// other spawn sites are the headless launch above and the daemon detach in
+/// `cli.rs`, neither of which can run concurrently with this. A future spawn
+/// site has to honor that, or this needs a process-wide spawn mutex.
+fn pipe2_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as RawFd; 2];
+    #[cfg(target_os = "linux")]
+    // SAFETY: `fds` is a valid 2-element array.
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: as above.
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pipe/pipe2 just handed us two fresh, owned descriptors.
+    let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    #[cfg(not(target_os = "linux"))]
+    for fd in [pair.0.as_raw_fd(), pair.1.as_raw_fd()] {
+        // SAFETY: both descriptors are live and owned by `pair`.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(pair)
+}
+
+/// Runs between fork and exec: place the browser's ends of the two pipes at
+/// fd 3 (it reads commands) and fd 4 (it writes responses), which is the
+/// layout `--remote-debugging-pipe` expects.
+///
+/// # Safety
+/// Only async-signal-safe calls (`fcntl`, `dup2`, `close`) are used, as
+/// required of a `pre_exec` closure.
+fn dup_onto_cdp_fds(cmd_r: RawFd, res_w: RawFd) -> io::Result<()> {
+    // Move both ends out of the 0-9 range first: the descriptors we were
+    // handed could themselves already be 3 or 4, and `dup2(n, n)` is a no-op
+    // that leaves FD_CLOEXEC set — the child would then exec with nothing on
+    // that fd at all.
+    // SAFETY: async-signal-safe, and both descriptors are live in the child.
+    let tmp_in = unsafe { libc::fcntl(cmd_r, libc::F_DUPFD, 10) };
+    if tmp_in < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let tmp_out = unsafe { libc::fcntl(res_w, libc::F_DUPFD, 10) };
+    if tmp_out < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    unsafe {
+        if libc::dup2(tmp_in, 3) < 0 || libc::dup2(tmp_out, 4) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        libc::close(tmp_in);
+        libc::close(tmp_out);
+        // dup2 clears FD_CLOEXEC on the new descriptor, but be explicit —
+        // this is the one thing that must hold after exec.
+        for fd in [3, 4] {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn spawn_stderr_scanner<R>(reader: R) -> Result<u16>
@@ -293,11 +583,11 @@ const PATH_CANDIDATES: &[&str] = &[
 ///   2. a [`PATH_CANDIDATES`] name on `$PATH` (the Linux path)
 ///   3. a standard macOS `.app` bundle ([`app_bundle_candidates`])
 ///   4. the most recent Playwright-cached Chromium ([`playwright_cache_chromium`])
-fn discover_chromium() -> Result<PathBuf> {
+pub fn discover_chromium() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("BROWSER_EXECUTABLE")
         && !path.is_empty()
     {
-        return Ok(PathBuf::from(path));
+        return resolve_override(&path, which);
     }
     for &candidate in PATH_CANDIDATES {
         if let Some(path) = which(candidate) {
@@ -316,6 +606,23 @@ fn discover_chromium() -> Result<PathBuf> {
     Err(anyhow!(
         "no Chromium-based browser found. Set $BROWSER_EXECUTABLE, install Chrome/Chromium via your system package manager, or run `npx playwright install chromium`"
     ))
+}
+
+/// Resolve a `$BROWSER_EXECUTABLE` override to a path that can be launched
+/// *and* recorded.
+///
+/// A bare name means "whatever `$PATH` resolves", which is what `Command::new`
+/// would have done at exec time. Doing it here instead is what lets visual
+/// mode canonicalize the result and bind a profile to one browser — a name is
+/// not an identity, since `$PATH` and the working directory both move.
+/// An explicit path (anything containing a separator) is used as given; it is
+/// never silently replaced by a `$PATH` hit or by the discovery list, because
+/// an override that cannot be honored should say so.
+fn resolve_override(raw: &str, lookup: impl Fn(&str) -> Option<PathBuf>) -> Result<PathBuf> {
+    if raw.contains(std::path::MAIN_SEPARATOR) {
+        return Ok(PathBuf::from(raw));
+    }
+    lookup(raw).ok_or_else(|| anyhow!("$BROWSER_EXECUTABLE={raw} was not found on $PATH"))
 }
 
 /// Standard macOS application-bundle binaries for Chromium-based browsers, in
@@ -521,6 +828,124 @@ mod tests {
         assert!(super::app_bundle_candidates().is_empty());
     }
 
+    // -- Launch flag sets --
+
+    /// Flags that must never appear in visual mode. Each one is a decision
+    /// from §V1 of the design doc, not a style preference.
+    const VISUAL_FORBIDDEN: &[&str] = &[
+        "--no-sandbox",
+        "--disable-extensions",
+        "--disable-sync",
+        "--disable-background-networking",
+        "--disable-dev-shm-usage",
+        "--headless=new",
+        "--disable-gpu",
+        "--enable-automation",
+        "--password-store=basic",
+    ];
+
+    #[test]
+    fn visual_args_omit_every_forbidden_flag() {
+        let args = super::visual_args(Path::new("/tmp/p"), &["https://x.test/".to_string()]);
+        for forbidden in VISUAL_FORBIDDEN {
+            assert!(
+                !args.iter().any(|a| a == forbidden),
+                "{forbidden} must not reach a visual browser: {args:?}"
+            );
+        }
+        // Debugging must go over the pipe, never a port anyone else can reach.
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--remote-debugging-port")),
+            "visual must not open a debugging port: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--remote-debugging-pipe"));
+        assert!(args.iter().any(|a| a == "--user-data-dir=/tmp/p"));
+        assert!(args.iter().any(|a| a == "--no-first-run"));
+        assert!(args.iter().any(|a| a == "--no-default-browser-check"));
+        // Start urls come last, after every flag, behind a `--` terminator.
+        assert_eq!(args.last().map(String::as_str), Some("https://x.test/"));
+        let sep = args.iter().position(|a| a == "--").expect("-- terminator");
+        assert_eq!(
+            sep,
+            args.len() - 2,
+            "-- must sit immediately before the urls"
+        );
+    }
+
+    #[test]
+    fn visual_args_put_switch_shaped_urls_behind_the_terminator() {
+        // Defense in depth: even if a caller lets one through, Chromium must
+        // read it as a url, not as a switch.
+        let args = super::visual_args(Path::new("/tmp/p"), &["--no-sandbox".to_string()]);
+        let sep = args.iter().position(|a| a == "--").expect("-- terminator");
+        let injected = args.iter().position(|a| a == "--no-sandbox").expect("url");
+        assert!(
+            injected > sep,
+            "switch-shaped url must follow `--`: {args:?}"
+        );
+    }
+
+    #[test]
+    fn visual_args_without_urls_are_flags_only() {
+        let args = super::visual_args(Path::new("/tmp/p"), &[]);
+        assert!(
+            args.iter().all(|a| a.starts_with("--")),
+            "no url means no positional argument: {args:?}"
+        );
+    }
+
+    #[test]
+    fn headless_args_are_unchanged_by_mode() {
+        let headless = super::headless_args(false);
+        let headed = super::headless_args(true);
+        // Headed drops exactly these two and keeps everything else.
+        assert_eq!(headless[0], "--headless=new");
+        assert_eq!(headless[1], "--disable-gpu");
+        assert_eq!(&headless[2..], &headed[..]);
+        // The agent profile is a throwaway, so the hardening flags stay.
+        for expected in [
+            "--no-sandbox",
+            "--disable-extensions",
+            "--disable-sync",
+            "--disable-background-networking",
+            "--remote-debugging-port=0",
+        ] {
+            assert!(headed.contains(&expected), "{expected} missing: {headed:?}");
+        }
+        // Never in either mode: it paints the automation infobar.
+        assert!(!headless.contains(&"--enable-automation"));
+        assert!(!headed.contains(&"--enable-automation"));
+    }
+
+    #[test]
+    fn executable_override_resolves_a_bare_name_through_path() {
+        use super::resolve_override;
+        use std::path::PathBuf;
+
+        let lookup = |name: &str| (name == "brave").then(|| PathBuf::from("/usr/bin/brave"));
+
+        // A bare name is what `$PATH` says it is — not `./brave`.
+        assert_eq!(
+            resolve_override("brave", lookup).unwrap(),
+            PathBuf::from("/usr/bin/brave")
+        );
+        // An explicit path, relative or absolute, is taken as given.
+        assert_eq!(
+            resolve_override("./brave", lookup).unwrap(),
+            PathBuf::from("./brave")
+        );
+        assert_eq!(
+            resolve_override("/opt/x/brave", lookup).unwrap(),
+            PathBuf::from("/opt/x/brave")
+        );
+        // A name that is not on $PATH is an error naming the override, never a
+        // silent fall-through to the discovery list.
+        let err = resolve_override("nope", lookup).unwrap_err().to_string();
+        assert!(err.contains("BROWSER_EXECUTABLE=nope"), "got: {err}");
+    }
+
     #[test]
     fn parses_devtools_line() {
         let line = "DevTools listening on ws://127.0.0.1:54321/devtools/browser/abc-def";
@@ -557,9 +982,10 @@ mod tests {
     fn browser_for_child(child: tokio::process::Child) -> super::Browser {
         super::Browser {
             child,
-            ws_endpoint: String::new(),
+            endpoint: super::Endpoint::WebSocket(String::new()),
             headed: false,
-            _user_data_dir: tempfile::TempDir::new().expect("tempdir"),
+            visual: false,
+            _user_data_dir: Some(tempfile::TempDir::new().expect("tempdir")),
         }
     }
 
@@ -569,7 +995,14 @@ mod tests {
         for v in ["1", "true", "TRUE", "Yes", "on", " on "] {
             assert!(is_truthy(Some(v)), "{v:?} should be truthy");
         }
-        for v in [None, Some(""), Some("0"), Some("false"), Some("no"), Some("headless")] {
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("headless"),
+        ] {
             assert!(!is_truthy(v), "{v:?} should be falsy");
         }
     }
@@ -602,12 +1035,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires real chromium; covers spawn + stderr scan + /json/version probe"]
     async fn launch_smoke() {
-        let browser = super::Browser::launch().await.expect("launch chromium");
-        assert!(
-            browser.ws_endpoint().starts_with("ws://"),
-            "ws_endpoint should start with ws://, got: {}",
-            browser.ws_endpoint()
-        );
+        let mut browser = super::Browser::launch(super::LaunchSpec::Headless)
+            .await
+            .expect("launch chromium");
+        match browser.take_transport().expect("transport") {
+            crate::cdp::Transport::WebSocket(url) => {
+                assert!(url.starts_with("ws://"), "got: {url}");
+            }
+            _ => panic!("headless must use the websocket transport"),
+        }
         browser.shutdown().await.expect("shutdown");
     }
 }

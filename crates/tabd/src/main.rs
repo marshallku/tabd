@@ -3,6 +3,7 @@ mod cdp;
 mod cli;
 mod cmd;
 mod daemon;
+mod platform;
 mod secrets;
 mod skill;
 
@@ -15,9 +16,17 @@ use std::process::ExitCode;
 enum DaemonCmd {
     /// Run the daemon in the foreground (blocks until SIGTERM or daemon.shutdown).
     Start {
-        /// Override base directory. Defaults to $TABD_BASE_DIR or $XDG_RUNTIME_DIR/tabd.
+        /// Override base directory. Defaults to $TABD_BASE_DIR or $XDG_RUNTIME_DIR/tabd
+        /// (visual mode: $XDG_STATE_HOME/tabd/visual, macOS ~/Library/Application Support/tabd/visual).
         #[arg(long)]
         base_dir: Option<String>,
+
+        /// Drive the human's everyday browser over the debugging pipe instead
+        /// of a throwaway headless profile. Serves owner lifecycle actions
+        /// only (`browser.ensure`, `browser.status`) — see
+        /// docs/visual-mode-plan.md.
+        #[arg(long)]
+        visual: bool,
     },
     /// Send daemon.shutdown to a running daemon.
     Stop {
@@ -116,6 +125,7 @@ fn main() -> ExitCode {
             cmd: DaemonCmd::Start { .. }
         }
     );
+
     let runtime = if is_daemon_start {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -181,7 +191,14 @@ fn run_skill_cmd(cmd: SkillCmd) -> Result<()> {
 
 async fn run_daemon_cmd(cmd: DaemonCmd) -> Result<()> {
     match cmd {
-        DaemonCmd::Start { base_dir } => daemon::run(base_dir.as_deref()).await,
+        DaemonCmd::Start { base_dir, visual } => {
+            let mode = if visual {
+                daemon::DaemonMode::Visual
+            } else {
+                daemon::DaemonMode::Headless
+            };
+            daemon::run_mode(base_dir.as_deref(), mode).await
+        }
         DaemonCmd::Stop { base_dir } => print_control(base_dir.as_deref(), "daemon.shutdown").await,
         DaemonCmd::Ping { base_dir } => print_control(base_dir.as_deref(), "daemon.ping").await,
         DaemonCmd::Health { base_dir } => print_control(base_dir.as_deref(), "daemon.health").await,

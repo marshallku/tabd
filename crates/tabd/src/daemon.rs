@@ -17,9 +17,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 
-use crate::browser::Browser;
-use crate::cdp::CdpClient;
+use crate::browser::{Browser, LaunchSpec};
+use crate::cdp::{CdpClient, ConnectOptions};
 use crate::cmd::page;
+use crate::platform;
+use visual::{Lifecycle, ProfileLock};
 
 // Domain handler submodules. Each accesses shared state/helpers via `use
 // super::*` and exposes its handlers as `pub(super)` for process_request.
@@ -32,6 +34,7 @@ mod monitor;
 mod secrets;
 mod storage;
 mod tabs;
+mod visual;
 mod waits;
 
 // -- Path resolution --------------------------------------------------------
@@ -43,11 +46,40 @@ pub struct DaemonPaths {
     pub pid_path: PathBuf,
 }
 
+/// Which browser this daemon drives. The two modes are separate daemons with
+/// separate base dirs and sockets; they coexist (`docs/visual-mode-plan.md`
+/// §3) and headless behavior is untouched by visual mode existing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonMode {
+    /// Agent mode: throwaway profile, WebSocket, restart-on-crash.
+    Headless,
+    /// The human's everyday browser: permanent profile, CDP over the debugging
+    /// pipe, never restarted.
+    Visual,
+}
+
+impl DaemonMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            DaemonMode::Headless => "headless",
+            DaemonMode::Visual => "visual",
+        }
+    }
+}
+
 pub fn resolve_paths(override_base: Option<&str>) -> Result<DaemonPaths> {
+    resolve_paths_for(override_base, DaemonMode::Headless)
+}
+
+pub fn resolve_paths_for(override_base: Option<&str>, mode: DaemonMode) -> Result<DaemonPaths> {
     let base_dir: PathBuf = if let Some(p) = override_base {
         PathBuf::from(p)
     } else if let Ok(d) = std::env::var("TABD_BASE_DIR") {
         PathBuf::from(d)
+    } else if mode == DaemonMode::Visual {
+        // Not `$XDG_RUNTIME_DIR`: a visual daemon is tied to the graphical
+        // session's lifetime, and its log is worth keeping across a reboot.
+        platform::visual_base_dir()?
     } else if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(d).join("tabd")
     } else {
@@ -150,9 +182,22 @@ struct DaemonState {
     /// Phase 3f: passphrase mode only ($TABD_VAULT_KEY required).
     vault: Arc<Mutex<Option<crate::secrets::VaultStore>>>,
     /// Cumulative chromium restart count for this daemon process (3g).
+    /// Visual mode never restarts, so it stays 0 there.
     restart_attempts: Arc<AtomicU32>,
     started_at: Instant,
     pid: u32,
+    mode: DaemonMode,
+    /// The visual profile. Meaningless in headless mode (a `TempDir` the
+    /// daemon never names), so it is only read on the visual paths.
+    profile_dir: Arc<PathBuf>,
+    base_dir: Arc<PathBuf>,
+    /// Visual browser state machine. Idle in headless mode.
+    lifecycle: Arc<Lifecycle>,
+    /// Held for as long as this daemon owns the visual profile.
+    profile_lock: Arc<Mutex<Option<ProfileLock>>>,
+    /// Why `ready` is false, when we know. `browser_closed` is the normal one
+    /// in visual mode: the human shut their browser.
+    not_ready_reason: Arc<Mutex<Option<String>>>,
 }
 
 struct InflightGuard {
@@ -168,7 +213,12 @@ impl Drop for InflightGuard {
 }
 
 impl DaemonState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_mode(DaemonMode::Headless, PathBuf::new(), PathBuf::new())
+    }
+
+    fn with_mode(mode: DaemonMode, profile_dir: PathBuf, base_dir: PathBuf) -> Self {
         DaemonState {
             ready: Arc::new(AtomicBool::new(false)),
             ready_notify: Arc::new(Notify::new()),
@@ -186,6 +236,12 @@ impl DaemonState {
             restart_attempts: Arc::new(AtomicU32::new(0)),
             started_at: Instant::now(),
             pid: std::process::id(),
+            mode,
+            profile_dir: Arc::new(profile_dir),
+            base_dir: Arc::new(base_dir),
+            lifecycle: Arc::new(Lifecycle::default()),
+            profile_lock: Arc::new(Mutex::new(None)),
+            not_ready_reason: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -256,16 +312,30 @@ impl DaemonState {
                 None => Value::Null,
             }
         };
-        let body = json!({
+        let mut body = json!({
             "pid": self.pid,
             "uptimeMs": self.started_at.elapsed().as_millis() as u64,
-            "ready": self.ready.load(Ordering::Acquire),
+            "ready": ready,
             "accepting": self.accepting.load(Ordering::Acquire),
             "inflight": self.inflight.load(Ordering::Acquire),
             "totalRequests": self.total_requests.load(Ordering::Acquire),
             "lastError": last_err,
             "driver": driver,
+            "mode": self.mode.as_str(),
         });
+        if self.mode == DaemonMode::Visual {
+            // One payload, not two: the driver block above never touches the
+            // tab registry, so an empty registry needs no special-casing.
+            body["browserState"] = json!(self.lifecycle.state().as_str());
+            body["profileDir"] = json!(self.profile_dir.display().to_string());
+            body["notReadyReason"] = json!(self.not_ready_reason.lock().await.clone());
+            // Measured: without "continue where you left off", a browser that
+            // exits — gracefully or not — comes back with one new-tab page and
+            // no restore prompt. The daemon owns the pipe, so a daemon crash
+            // closes the browser. tabd cannot turn the pref on (Chromium MACs
+            // it), so it reports, and `tabd browser` warns.
+            body["sessionRestore"] = json!(platform::session_restore(&self.profile_dir).as_str());
+        }
         success_response(id, body)
     }
 
@@ -678,12 +748,47 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         Err(_) => return error_response("", "invalid JSON in request"),
     };
 
-    // Control actions: no admit, no action lock.
+    // Control actions: no admit, no action lock. Served in every mode and
+    // regardless of browser state — "is the right daemon reachable" is a
+    // different question from "is the browser up", and conflating them would
+    // make a closed browser impossible to reopen.
     match req.action.as_str() {
         "daemon.ping" => return state.ping(&req.id),
         "daemon.health" => return state.health(&req.id).await,
         "daemon.shutdown" => return state.shutdown(&req.id).await,
         _ => {}
+    }
+
+    // Visual mode serves owner lifecycle actions and nothing else. This is the
+    // V2 agent boundary enforced a phase early: even with `$TABD_BASE_DIR`
+    // pointed at the visual socket, `tabd navigate` cannot drive the human's
+    // browser in V1. It is one match in one place, and a unit test asserts
+    // every CLI action is rejected by it.
+    if state.mode == DaemonMode::Visual {
+        match req.action.as_str() {
+            "browser.ensure" | "browser.status" => {}
+            other => {
+                return error_response(
+                    &req.id,
+                    &format!(
+                        "action '{other}' is not available on a visual daemon \
+                         (visual mode serves daemon.* and browser.* only)"
+                    ),
+                );
+            }
+        }
+        let result = match req.action.as_str() {
+            "browser.ensure" => visual::handle_ensure(state, &req.params).await,
+            "browser.status" => visual::handle_status(state, &req.params).await,
+            _ => unreachable!("guarded by the allowlist above"),
+        };
+        return match result {
+            Ok(data) => success_response(&req.id, data.unwrap_or(Value::Null)),
+            Err(message) => {
+                state.record_failure(&req.action, &message).await;
+                error_response(&req.id, &message)
+            }
+        };
     }
 
     // Driver actions: admit gate → wait_ready → action_mutex → handler.
@@ -890,18 +995,32 @@ fn write_pid_file(paths: &DaemonPaths) -> Result<()> {
 
 // -- Entry ------------------------------------------------------------------
 
-pub async fn run(override_base: Option<&str>) -> Result<()> {
-    let paths = resolve_paths(override_base)?;
+pub async fn run_mode(override_base: Option<&str>, mode: DaemonMode) -> Result<()> {
+    let paths = resolve_paths_for(override_base, mode)?;
     let listener = bind_listener_with_lock(&paths).await?;
 
-    let state = DaemonState::new();
+    let profile_dir = match mode {
+        DaemonMode::Visual => platform::visual_profile_dir()?,
+        DaemonMode::Headless => PathBuf::new(),
+    };
+    let state = DaemonState::with_mode(mode, profile_dir, paths.base_dir.clone());
     let boot_state = state.clone();
     let boot_paths = paths.clone();
     tokio::spawn(async move {
-        match boot_browser_and_cdp(&boot_state, &boot_paths).await {
+        let booted = match mode {
+            DaemonMode::Headless => boot_browser_and_cdp(&boot_state, &boot_paths).await,
+            // Visual does not launch at boot. The daemon comes up reachable
+            // with the browser `Closed`, and `browser.ensure` opens it — so
+            // `tabd browser` works whether or not a browser is already there,
+            // and a browser the human closed does not take the daemon with it.
+            DaemonMode::Visual => write_pid_file(&boot_paths),
+        };
+        match booted {
             Ok(()) => {
-                boot_state.ready.store(true, Ordering::Release);
-                boot_state.ready_notify.notify_waiters();
+                if mode == DaemonMode::Headless {
+                    boot_state.ready.store(true, Ordering::Release);
+                    boot_state.ready_notify.notify_waiters();
+                }
             }
             Err(err) => {
                 eprintln!("[tabd daemon] boot failed: {err:#}");
@@ -912,8 +1031,12 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
         }
     });
 
-    // Phase 3g: chromium liveness supervisor.
-    tokio::spawn(supervise(state.clone(), paths.clone()));
+    // Phase 3g: chromium liveness supervisor. Headless only — it restarts the
+    // browser, which visual must never do, and it would be a second racing
+    // source of the same truth the transport already reports.
+    if mode == DaemonMode::Headless {
+        tokio::spawn(supervise(state.clone(), paths.clone()));
+    }
 
     // SIGTERM/SIGINT → graceful shutdown
     let sig_state = state.clone();
@@ -953,12 +1076,17 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
         }
     }
 
-    // Cleanup
-    if let Some(client) = state.client.lock().await.take() {
-        let _ = client.close().await;
-    }
-    if let Some(browser) = state.browser.lock().await.take() {
-        let _ = browser.shutdown().await;
+    // Cleanup. Visual inverts the order: `Browser.close` has to go out over a
+    // live client, so the client cannot be torn down first.
+    if state.mode == DaemonMode::Visual {
+        visual::shutdown(&state).await;
+    } else {
+        if let Some(client) = state.client.lock().await.take() {
+            let _ = client.close().await;
+        }
+        if let Some(browser) = state.browser.lock().await.take() {
+            let _ = browser.shutdown().await;
+        }
     }
     let _ = std::fs::remove_file(&paths.socket_path);
     let _ = std::fs::remove_file(&paths.pid_path);
@@ -966,8 +1094,13 @@ pub async fn run(override_base: Option<&str>) -> Result<()> {
 }
 
 async fn boot_browser_and_cdp(state: &DaemonState, paths: &DaemonPaths) -> Result<()> {
-    let browser = Browser::launch().await?;
-    let client = CdpClient::connect(browser.ws_endpoint()).await?;
+    let mut browser = Browser::launch(LaunchSpec::Headless).await?;
+    let transport = browser.take_transport()?;
+    let client = CdpClient::connect_with(ConnectOptions {
+        transport,
+        bootstrap_tab: true,
+    })
+    .await?;
     write_pid_file(paths)?;
     *state.client.lock().await = Some(Arc::new(client));
     *state.browser.lock().await = Some(browser);
@@ -1109,6 +1242,120 @@ mod tests {
         assert_eq!(v["error"], json!("boom"));
         assert_eq!(v["errorCode"], json!("internal"));
         assert!(v.get("data").is_none());
+    }
+
+    // -- Visual mode ----------------------------------------------------
+
+    fn visual_state() -> DaemonState {
+        DaemonState::with_mode(
+            DaemonMode::Visual,
+            PathBuf::from("/nonexistent/tabd-test-profile"),
+            PathBuf::from("/nonexistent/tabd-test-base"),
+        )
+    }
+
+    #[tokio::test]
+    async fn visual_daemon_rejects_every_driver_action() {
+        // The V2 agent boundary, enforced from V1: pointing $TABD_BASE_DIR at
+        // the visual socket must not let `tabd navigate` drive the human's
+        // browser. Driven off the live dispatch table so a new action cannot
+        // be added without either being allowlisted or failing here.
+        let state = visual_state();
+        for action in crate::cli::dispatch_actions() {
+            let line = json!({ "id": "t", "action": action }).to_string();
+            let resp: Value = serde_json::from_str(&process_request(&state, &line).await).unwrap();
+            assert_eq!(resp["success"], json!(false), "{action} was not rejected");
+            assert_eq!(
+                resp["errorCode"],
+                json!("visual_mode_unsupported"),
+                "{action} rejected with the wrong code: {resp}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn visual_daemon_still_answers_control_actions() {
+        // Reachability is a different question from browser readiness: a
+        // daemon whose browser is closed is *intentionally* not ready, and it
+        // has to stay usable or nothing could ever reopen the browser.
+        let state = visual_state();
+        assert!(!state.ready.load(Ordering::Acquire));
+        for action in ["daemon.ping", "daemon.health"] {
+            let line = json!({ "id": "t", "action": action }).to_string();
+            let resp: Value = serde_json::from_str(&process_request(&state, &line).await).unwrap();
+            assert_eq!(resp["success"], json!(true), "{action}: {resp}");
+        }
+    }
+
+    #[tokio::test]
+    async fn visual_health_reports_mode_and_browser_state() {
+        let state = visual_state();
+        let resp: Value = serde_json::from_str(&state.health("h").await).unwrap();
+        let data = &resp["data"];
+        assert_eq!(data["mode"], json!("visual"));
+        assert_eq!(data["browserState"], json!("closed"));
+        assert_eq!(data["driver"], Value::Null, "no child yet");
+        // The profile has never been launched, so the pref is unreadable —
+        // "unknown", not a false "off".
+        assert_eq!(data["sessionRestore"], json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn headless_health_omits_the_visual_fields() {
+        let resp: Value = serde_json::from_str(&DaemonState::new().health("h").await).unwrap();
+        assert_eq!(resp["data"]["mode"], json!("headless"));
+        assert!(resp["data"].get("browserState").is_none());
+        assert!(resp["data"].get("sessionRestore").is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_is_refused_once_shutdown_has_begun() {
+        // Terminal shutdown: `Closing -> Closed` must not read as permission
+        // to reopen.
+        let state = visual_state();
+        state.drain_started.store(true, Ordering::Release);
+        let line = json!({ "id": "t", "action": "browser.ensure" }).to_string();
+        let resp: Value = serde_json::from_str(&process_request(&state, &line).await).unwrap();
+        assert_eq!(resp["success"], json!(false));
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("shutting down"),
+            "got: {resp}"
+        );
+    }
+
+    #[test]
+    fn visual_paths_are_separate_from_headless() {
+        // The two daemons coexist, so their base dirs must not collide.
+        let headless = resolve_paths_for(None, DaemonMode::Headless).unwrap();
+        let visual = resolve_paths_for(None, DaemonMode::Visual).unwrap();
+        assert_ne!(headless.base_dir, visual.base_dir);
+        assert_ne!(headless.socket_path, visual.socket_path);
+        // An explicit override still wins in both modes.
+        let forced = resolve_paths_for(Some("/tmp/forced"), DaemonMode::Visual).unwrap();
+        assert_eq!(forced.base_dir, PathBuf::from("/tmp/forced"));
+    }
+
+    #[test]
+    fn profile_lock_is_exclusive() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let profile = dir.path().join("profile");
+        let first = ProfileLock::acquire(&profile).expect("first acquire");
+        let err = ProfileLock::acquire(&profile).expect_err("second must fail");
+        assert!(
+            err.to_string().contains("already owns profile"),
+            "got: {err}"
+        );
+        assert_eq!(
+            crate::daemon::error::classify_error_code(&err.to_string()).as_str(),
+            "profile_locked"
+        );
+        // Releasing lets the next owner in — a daemon restart must not need a
+        // manual unlock.
+        drop(first);
+        ProfileLock::acquire(&profile).expect("reacquire after release");
     }
 
     #[test]

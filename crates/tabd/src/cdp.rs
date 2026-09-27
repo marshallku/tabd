@@ -4,14 +4,17 @@
 // at the module level until then so release builds stay quiet.
 #![allow(dead_code)]
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::pipe;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -353,6 +356,13 @@ pub struct CdpClient {
     pending: PendingMap,
     // Arc so the reader task can clone-and-move it for event routing.
     registry: Arc<Mutex<TabRegistry>>,
+    // Taken by `close()`. The reader task holds a clone of `out_tx` for its
+    // fire-and-forget dialog replies, so dropping the client's sender alone
+    // never ends the writer — the tasks have to be aborted and joined, and
+    // for the pipe transport that join is what releases the descriptors the
+    // browser is waiting on.
+    tasks: Mutex<Option<TransportTasks>>,
+    transport_closed: Arc<TransportClosed>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -438,352 +448,647 @@ fn trim_ring<T>(buf: &mut Vec<T>, max: usize) {
     }
 }
 
+/// How long teardown waits for the transport tasks to end on their own before
+/// aborting them. For the pipe transport the fds live inside those tasks, so a
+/// join that never completes would keep the browser alive indefinitely.
+const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Upper bound on a partially-received pipe frame. Chromium's own frames are
+/// well under this; the cap exists so a transport that never sends a NUL
+/// cannot grow the accumulator without bound.
+const MAX_PENDING_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// How the client talks to Chromium.
+///
+/// `WebSocket` is the headless path (`--remote-debugging-port`), unchanged.
+/// `Pipe` is visual mode (`--remote-debugging-pipe`): the browser reads
+/// commands on fd 3 and writes responses on fd 4, with `\0`-delimited JSON
+/// frames in both directions. The pipe is not reachable from another local
+/// process, which is the whole point — see the A3 row of the threat model in
+/// `docs/visual-mode-plan.md`.
+pub enum Transport {
+    WebSocket(String),
+    Pipe {
+        /// Parent's write end; peer of the browser's fd 3.
+        to_browser: OwnedFd,
+        /// Parent's read end; peer of the browser's fd 4.
+        from_browser: OwnedFd,
+    },
+}
+
+pub struct ConnectOptions {
+    pub transport: Transport,
+    /// Create + attach an `about:blank` tab and seat it as active. True for
+    /// headless (callers expect a tab to exist); false for visual.
+    pub bootstrap_tab: bool,
+}
+
+/// One-shot "the transport ended" flag with a wakeup. Set by whichever reader
+/// loop is running, exactly once, as it exits.
+#[derive(Default)]
+struct TransportClosed {
+    flag: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl TransportClosed {
+    fn set(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Everything a reader loop needs to route one inbound frame. Identical for
+/// both transports — the transport-specific code ends at "I have a frame".
+struct ReaderCtx {
+    pending: PendingMap,
+    registry: Arc<Mutex<TabRegistry>>,
+    next_id: Arc<AtomicU64>,
+    out_tx: mpsc::UnboundedSender<String>,
+    closed: Arc<TransportClosed>,
+}
+
+/// The spawned writer + reader pair. Held by the client so teardown can wait
+/// for them: for the pipe transport, the browser only exits once both tasks
+/// have dropped their descriptors.
+struct TransportTasks {
+    // `Option` so `shutdown` can consume the handles and leave `Drop` with
+    // nothing to do.
+    writer: Option<tokio::task::JoinHandle<()>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TransportTasks {
+    fn new(writer: tokio::task::JoinHandle<()>, reader: tokio::task::JoinHandle<()>) -> Self {
+        TransportTasks {
+            writer: Some(writer),
+            reader: Some(reader),
+        }
+    }
+
+    /// Abort both tasks and wait for them to actually stop.
+    ///
+    /// Abort rather than "wait for a natural exit": the writer does end when
+    /// the outbound channel drops, but the reader only ends on EOF, and at
+    /// teardown the browser is usually still alive — waiting for it would add
+    /// a fixed stall to every shutdown. The caller has already drained the
+    /// pending map, so nothing in flight is worth flushing. The join is what
+    /// matters: the tasks own the pipe descriptors, and the browser does not
+    /// see EOF until they have been dropped.
+    async fn shutdown(mut self) {
+        // Per-handle rather than a two-slot destructure: an `else` arm that
+        // dropped a tuple holding one `Some` would *detach* that task instead
+        // of aborting it. Both slots are always set and cleared together
+        // today, so that is unreachable — but it costs nothing to make the
+        // unreachable case behave.
+        let writer = self.writer.take();
+        let reader = self.reader.take();
+        if let Some(writer) = &writer {
+            writer.abort();
+        }
+        if let Some(reader) = &reader {
+            reader.abort();
+        }
+        let _ = tokio::time::timeout(TASK_JOIN_TIMEOUT, async {
+            if let Some(writer) = writer {
+                let _ = writer.await;
+            }
+            if let Some(reader) = reader {
+                let _ = reader.await;
+            }
+        })
+        .await;
+    }
+}
+
+impl Drop for TransportTasks {
+    /// Backstop for every path that never reaches `close()`: an early return
+    /// during bootstrap, a cancelled future, a panicking task. A detached
+    /// reader keeps its clone of the outbound sender alive, which keeps the
+    /// writer alive, which keeps the command pipe open — and with visual
+    /// mode's `kill_on_drop(false)`, that leaves a browser running with
+    /// nobody owning it. `Drop` cannot await, so this aborts without joining;
+    /// `close()` still does the bounded join when it is reached.
+    fn drop(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
+        }
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+    }
+}
+
+/// Fail every in-flight request. Idempotent: a second call finds an empty map.
+fn drain_pending(pending: &PendingMap, reason: &str) {
+    let Ok(mut map) = pending.lock() else {
+        return;
+    };
+    for (_, tx) in map.drain() {
+        let _ = tx.send(Err(anyhow!("{reason}")));
+    }
+}
+
+/// Reassembles `\0`-delimited frames from arbitrary pipe reads. A frame can
+/// straddle any number of reads and several frames can arrive in one.
+#[derive(Default)]
+struct FrameAccumulator {
+    buf: Vec<u8>,
+}
+
+impl FrameAccumulator {
+    /// Append `chunk` and drain every complete frame into `out`. Errors only
+    /// when the *unterminated* remainder exceeds `max`.
+    fn push(&mut self, chunk: &[u8], max: usize, out: &mut Vec<String>) -> Result<()> {
+        let mut rest = chunk;
+        while let Some(pos) = rest.iter().position(|b| *b == 0) {
+            self.buf.extend_from_slice(&rest[..pos]);
+            rest = &rest[pos + 1..];
+            let frame = std::mem::take(&mut self.buf);
+            if frame.is_empty() {
+                continue;
+            }
+            match String::from_utf8(frame) {
+                Ok(text) => out.push(text),
+                // Chromium only ever emits UTF-8 JSON here. Dropping the one
+                // malformed frame costs a single RPC (its caller times out)
+                // instead of tearing down the whole transport.
+                Err(_) => eprintln!("[tabd cdp] dropped a non-UTF-8 pipe frame"),
+            }
+        }
+        self.buf.extend_from_slice(rest);
+        if self.buf.len() > max {
+            self.buf.clear();
+            bail!("cdp pipe frame exceeded {max} bytes with no NUL terminator");
+        }
+        Ok(())
+    }
+}
+
+async fn spawn_transport_tasks(
+    transport: Transport,
+    out_rx: mpsc::UnboundedReceiver<String>,
+    ctx: ReaderCtx,
+) -> Result<TransportTasks> {
+    match transport {
+        Transport::WebSocket(url) => {
+            let (ws, _resp) = connect_async(&url)
+                .await
+                .with_context(|| format!("ws connect: {url}"))?;
+            let (sink, stream) = ws.split();
+            Ok(TransportTasks::new(
+                tokio::spawn(writer_ws(sink, out_rx)),
+                tokio::spawn(reader_ws(stream, ctx)),
+            ))
+        }
+        Transport::Pipe {
+            to_browser,
+            from_browser,
+        } => {
+            // Both conversions happen before either spawn, so a failure here
+            // drops both descriptors instead of stranding one in a live task.
+            let tx = pipe::Sender::from_owned_fd(to_browser)
+                .context("wrap cdp pipe write end (fd 3 peer)")?;
+            let rx = pipe::Receiver::from_owned_fd(from_browser)
+                .context("wrap cdp pipe read end (fd 4 peer)")?;
+            Ok(TransportTasks::new(
+                tokio::spawn(writer_pipe(tx, out_rx)),
+                tokio::spawn(reader_pipe(rx, ctx)),
+            ))
+        }
+    }
+}
+
+async fn writer_ws<S>(mut sink: S, mut out_rx: mpsc::UnboundedReceiver<String>)
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    while let Some(msg) = out_rx.recv().await {
+        if sink.send(Message::Text(msg)).await.is_err() {
+            break;
+        }
+    }
+    let _ = sink.close().await;
+}
+
+async fn writer_pipe(mut tx: pipe::Sender, mut out_rx: mpsc::UnboundedReceiver<String>) {
+    while let Some(msg) = out_rx.recv().await {
+        // Payload then terminator. This is the only writer on the pipe, so
+        // the two writes cannot interleave with another frame.
+        if tx.write_all(msg.as_bytes()).await.is_err() || tx.write_all(b"\0").await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn reader_ws<S, E>(mut stream: S, ctx: ReaderCtx)
+where
+    S: futures_util::Stream<Item = std::result::Result<Message, E>> + Unpin,
+{
+    while let Some(msg) = stream.next().await {
+        let Ok(Message::Text(text)) = msg else {
+            continue;
+        };
+        route_frame(text.as_str(), &ctx).await;
+    }
+    ctx.closed.set();
+    drain_pending(&ctx.pending, "cdp websocket closed");
+}
+
+async fn reader_pipe(mut rx: pipe::Receiver, ctx: ReaderCtx) {
+    let mut acc = FrameAccumulator::default();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut frames: Vec<String> = Vec::new();
+    loop {
+        let n = match rx.read(&mut buf).await {
+            Ok(0) => break, // browser closed fd 4
+            Ok(n) => n,
+            Err(err) => {
+                eprintln!("[tabd cdp] pipe read failed: {err}");
+                break;
+            }
+        };
+        if let Err(err) = acc.push(&buf[..n], MAX_PENDING_FRAME_BYTES, &mut frames) {
+            eprintln!("[tabd cdp] {err}");
+            break;
+        }
+        for frame in frames.drain(..) {
+            route_frame(&frame, &ctx).await;
+        }
+    }
+    ctx.closed.set();
+    drain_pending(&ctx.pending, "cdp pipe closed");
+}
+
+/// Route one inbound CDP frame into the pending map or the per-tab registry.
+/// RPC calls from here are forbidden — they would deadlock against
+/// `dispatch()` on the same registry mutex. Push/trim only.
+async fn route_frame(text: &str, ctx: &ReaderCtx) {
+    let Ok(parsed) = serde_json::from_str::<InboundFrame>(text) else {
+        return;
+    };
+    if let Some(id) = parsed.id {
+        let mut map = ctx.pending.lock().unwrap();
+        if let Some(tx) = map.remove(&id) {
+            let value = match parsed.error {
+                Some(err) => Err(anyhow!("cdp error: {err}")),
+                None => Ok(parsed.result.unwrap_or(Value::Null)),
+            };
+            let _ = tx.send(value);
+        }
+        return;
+    }
+    // Events: RPC calls from here are forbidden — they'd deadlock
+    // against dispatch() (same registry mutex). Push/trim only.
+    let Some(method) = parsed.method else {
+        return;
+    };
+    let params = parsed.params.unwrap_or(Value::Null);
+    let mut reg = ctx.registry.lock().await;
+
+    // Browser-level download events carry NO sessionId and are
+    // browser-global — handle them against the registry store
+    // before the per-tab sessionId gate below.
+    if method == "Browser.downloadWillBegin" {
+        if let Some(dir) = reg.download_dir.clone() {
+            let guid = params
+                .get("guid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if !guid.is_empty() {
+                let saved = dir.join(&guid).to_string_lossy().into_owned();
+                let entry = DownloadEntry {
+                    url: params
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    suggested_filename: params
+                        .get("suggestedFilename")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    guid,
+                    state: "inProgress".to_owned(),
+                    total_bytes: None,
+                    received_bytes: 0,
+                    saved_path: saved,
+                    started_at: now_ms(),
+                };
+                download_begin(&mut reg.downloads, entry, MAX_DOWNLOADS);
+            }
+        }
+        return;
+    }
+    if method == "Browser.downloadProgress" {
+        let guid = params.get("guid").and_then(Value::as_str).unwrap_or("");
+        if !guid.is_empty() {
+            let state = params.get("state").and_then(Value::as_str).unwrap_or("");
+            let total = params.get("totalBytes").and_then(Value::as_f64);
+            let received = params.get("receivedBytes").and_then(Value::as_f64);
+            download_progress(
+                &mut reg.downloads,
+                guid,
+                state,
+                total.map(|t| t as u64),
+                received.map(|r| r as u64),
+            );
+        }
+        return;
+    }
+
+    // Per-tab events: require a sessionId to route into a TabState.
+    let Some(sid) = parsed.session_id else {
+        return;
+    };
+    // Cloned before `state` mutably borrows reg.tabs below.
+    let dialog_policy = if method == "Page.javascriptDialogOpening" {
+        Some(reg.dialog_policy.clone())
+    } else {
+        None
+    };
+    let Some(state) = reg.tabs.values_mut().find(|t| t.session_id == sid) else {
+        return;
+    };
+    match method.as_str() {
+        "Page.javascriptDialogOpening" => {
+            // A pending dialog blocks the page's JS while the
+            // triggering action holds the global action mutex, so
+            // this is the only point where it can be answered.
+            // Fire-and-forget enqueue — awaiting an RPC here would
+            // deadlock (see comment above); the reply carries no
+            // payload and is dropped by the no-pending-entry path.
+            let dialog_type = params
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("alert")
+                .to_owned();
+            let message = params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let policy = dialog_policy.unwrap_or_default();
+            // beforeunload always accepts: dismissing it silently
+            // blocks navigation, which is worse for automation
+            // than the (recorded) unsaved-state loss.
+            let accept = dialog_type == "beforeunload" || policy.accept;
+            let prompt_text = if accept && dialog_type == "prompt" {
+                policy.prompt_text.clone()
+            } else {
+                None
+            };
+            state.dialogs.push(DialogEntry {
+                dialog_type,
+                message,
+                action: if accept { "accept" } else { "dismiss" }.to_owned(),
+                prompt_text: prompt_text.clone(),
+                timestamp: now_ms(),
+            });
+            trim_ring(&mut state.dialogs, MAX_DIALOGS);
+            let id = ctx.next_id.fetch_add(1, Ordering::SeqCst);
+            let mut reply_params = json!({ "accept": accept });
+            if let Some(text) = prompt_text {
+                reply_params["promptText"] = json!(text);
+            }
+            let frame = json!({
+                "id": id,
+                "sessionId": sid,
+                "method": "Page.handleJavaScriptDialog",
+                "params": reply_params,
+            })
+            .to_string();
+            let _ = ctx.out_tx.send(frame);
+        }
+        "Runtime.consoleAPICalled" => {
+            let level = params
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("log")
+                .to_owned();
+            let text = console_text_from_args(params.get("args").unwrap_or(&Value::Null));
+            state.console_logs.push(ConsoleEntry {
+                level,
+                text,
+                timestamp: now_ms(),
+            });
+            trim_ring(&mut state.console_logs, MAX_CONSOLE);
+        }
+        "Runtime.exceptionThrown" => {
+            if let Some(entry) = error_entry_from_exception(&params) {
+                state.page_errors.push(entry);
+                trim_ring(&mut state.page_errors, MAX_PAGE_ERRORS);
+            }
+        }
+        "Network.requestWillBeSent" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if request_id.is_empty() {
+                return;
+            }
+            let request = params.get("request").cloned().unwrap_or(Value::Null);
+            let url = request
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let method = request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("GET")
+                .to_owned();
+            let resource_type = params
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let request_headers = request.get("headers").cloned();
+            let request_body = request
+                .get("postData")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            state.network_log.push(NetworkEntry {
+                request_id,
+                url,
+                method,
+                resource_type,
+                status: None,
+                status_text: None,
+                request_headers,
+                response_headers: None,
+                request_body,
+                response_body: None,
+                response_body_truncated: false,
+                response_body_size: None,
+                start_time: now_ms(),
+                end_time: None,
+                duration_ms: None,
+                from_cache: false,
+                failed: false,
+                failure_text: None,
+            });
+            trim_ring(&mut state.network_log, MAX_NETWORK);
+            state.network_pending = state.network_pending.saturating_add(1);
+        }
+        "Network.responseReceived" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if request_id.is_empty() {
+                return;
+            }
+            let response = params.get("response").cloned().unwrap_or(Value::Null);
+            let resource_type = params
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let status = response
+                .get("status")
+                .and_then(Value::as_u64)
+                .map(|n| n as u16);
+            let status_text = response
+                .get("statusText")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let response_headers = response.get("headers").cloned();
+            let from_cache = response
+                .get("fromDiskCache")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(entry) = find_network_entry_mut(&mut state.network_log, request_id) {
+                entry.status = status;
+                entry.status_text = status_text;
+                entry.response_headers = response_headers;
+                entry.from_cache = from_cache;
+                if resource_type.is_some() {
+                    entry.resource_type = resource_type;
+                }
+            }
+        }
+        "Network.loadingFinished" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if request_id.is_empty() {
+                return;
+            }
+            let encoded_length = params.get("encodedDataLength").and_then(Value::as_u64);
+            let now = now_ms();
+            if let Some(entry) = find_network_entry_mut(&mut state.network_log, request_id) {
+                entry.end_time = Some(now);
+                entry.duration_ms = Some(now.saturating_sub(entry.start_time));
+                entry.response_body_size = encoded_length;
+            }
+            state.network_pending = state.network_pending.saturating_sub(1);
+        }
+        "Network.loadingFailed" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if request_id.is_empty() {
+                return;
+            }
+            let error_text = params
+                .get("errorText")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let now = now_ms();
+            if let Some(entry) = find_network_entry_mut(&mut state.network_log, request_id) {
+                entry.failed = true;
+                entry.failure_text = error_text;
+                entry.end_time = Some(now);
+                entry.duration_ms = Some(now.saturating_sub(entry.start_time));
+            }
+            state.network_pending = state.network_pending.saturating_sub(1);
+        }
+        _ => {} // other domain events silently dropped
+    }
+}
+
 impl CdpClient {
-    /// Connect, create the first page target, flatten-attach, enable Page/
-    /// Runtime/Network, and seat the new tab as the active one in the
-    /// registry. The returned client is ready for `send()` calls.
+    /// Connect over a WebSocket endpoint with the historical defaults: a
+    /// bootstrap `about:blank` tab, created and seated as active. This is the
+    /// headless entry point and its behavior is unchanged.
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws, _resp) = connect_async(ws_url)
-            .await
-            .with_context(|| format!("ws connect: {ws_url}"))?;
-        let (mut sink, mut stream) = ws.split();
+        Self::connect_with(ConnectOptions {
+            transport: Transport::WebSocket(ws_url.to_owned()),
+            bootstrap_tab: true,
+        })
+        .await
+    }
+
+    /// Connect over an arbitrary [`Transport`]. Visual mode passes
+    /// `bootstrap_tab: false` — the human already has windows open, and
+    /// manufacturing an `about:blank` tab in their browser would be rude.
+    pub async fn connect_with(opts: ConnectOptions) -> Result<Self> {
+        let ConnectOptions {
+            transport,
+            bootstrap_tab,
+        } = opts;
 
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let pending_for_reader = pending.clone();
         let registry: Arc<Mutex<TabRegistry>> = Arc::new(Mutex::new(TabRegistry::default()));
-        let registry_for_reader = registry.clone();
-
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
         // Shared with the reader task: id allocation for fire-and-forget
         // frames + the outbound channel itself (cloned before the spawn).
         let next_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
-        let next_id_for_reader = next_id.clone();
-        let out_tx_for_reader = out_tx.clone();
+        let transport_closed = Arc::new(TransportClosed::default());
 
-        tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if sink.send(Message::Text(msg)).await.is_err() {
-                    break;
-                }
-            }
-            let _ = sink.close().await;
-        });
-
-        tokio::spawn(async move {
-            while let Some(msg) = stream.next().await {
-                let Ok(Message::Text(text)) = msg else {
-                    continue;
-                };
-                let Ok(parsed) = serde_json::from_str::<InboundFrame>(text.as_str()) else {
-                    continue;
-                };
-                if let Some(id) = parsed.id {
-                    let mut map = pending_for_reader.lock().unwrap();
-                    if let Some(tx) = map.remove(&id) {
-                        let value = match parsed.error {
-                            Some(err) => Err(anyhow!("cdp error: {err}")),
-                            None => Ok(parsed.result.unwrap_or(Value::Null)),
-                        };
-                        let _ = tx.send(value);
-                    }
-                    continue;
-                }
-                // Events: RPC calls from here are forbidden — they'd deadlock
-                // against dispatch() (same registry mutex). Push/trim only.
-                let Some(method) = parsed.method else {
-                    continue;
-                };
-                let params = parsed.params.unwrap_or(Value::Null);
-                let mut reg = registry_for_reader.lock().await;
-
-                // Browser-level download events carry NO sessionId and are
-                // browser-global — handle them against the registry store
-                // before the per-tab sessionId gate below.
-                if method == "Browser.downloadWillBegin" {
-                    if let Some(dir) = reg.download_dir.clone() {
-                        let guid = params
-                            .get("guid")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        if !guid.is_empty() {
-                            let saved = dir.join(&guid).to_string_lossy().into_owned();
-                            let entry = DownloadEntry {
-                                url: params
-                                    .get("url")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_owned(),
-                                suggested_filename: params
-                                    .get("suggestedFilename")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_owned(),
-                                guid,
-                                state: "inProgress".to_owned(),
-                                total_bytes: None,
-                                received_bytes: 0,
-                                saved_path: saved,
-                                started_at: now_ms(),
-                            };
-                            download_begin(&mut reg.downloads, entry, MAX_DOWNLOADS);
-                        }
-                    }
-                    continue;
-                }
-                if method == "Browser.downloadProgress" {
-                    let guid = params.get("guid").and_then(Value::as_str).unwrap_or("");
-                    if !guid.is_empty() {
-                        let state = params.get("state").and_then(Value::as_str).unwrap_or("");
-                        let total = params.get("totalBytes").and_then(Value::as_f64);
-                        let received = params.get("receivedBytes").and_then(Value::as_f64);
-                        download_progress(
-                            &mut reg.downloads,
-                            guid,
-                            state,
-                            total.map(|t| t as u64),
-                            received.map(|r| r as u64),
-                        );
-                    }
-                    continue;
-                }
-
-                // Per-tab events: require a sessionId to route into a TabState.
-                let Some(sid) = parsed.session_id else {
-                    continue;
-                };
-                // Cloned before `state` mutably borrows reg.tabs below.
-                let dialog_policy = if method == "Page.javascriptDialogOpening" {
-                    Some(reg.dialog_policy.clone())
-                } else {
-                    None
-                };
-                let Some(state) = reg.tabs.values_mut().find(|t| t.session_id == sid) else {
-                    continue;
-                };
-                match method.as_str() {
-                    "Page.javascriptDialogOpening" => {
-                        // A pending dialog blocks the page's JS while the
-                        // triggering action holds the global action mutex, so
-                        // this is the only point where it can be answered.
-                        // Fire-and-forget enqueue — awaiting an RPC here would
-                        // deadlock (see comment above); the reply carries no
-                        // payload and is dropped by the no-pending-entry path.
-                        let dialog_type = params
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("alert")
-                            .to_owned();
-                        let message = params
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        let policy = dialog_policy.unwrap_or_default();
-                        // beforeunload always accepts: dismissing it silently
-                        // blocks navigation, which is worse for automation
-                        // than the (recorded) unsaved-state loss.
-                        let accept = dialog_type == "beforeunload" || policy.accept;
-                        let prompt_text = if accept && dialog_type == "prompt" {
-                            policy.prompt_text.clone()
-                        } else {
-                            None
-                        };
-                        state.dialogs.push(DialogEntry {
-                            dialog_type,
-                            message,
-                            action: if accept { "accept" } else { "dismiss" }.to_owned(),
-                            prompt_text: prompt_text.clone(),
-                            timestamp: now_ms(),
-                        });
-                        trim_ring(&mut state.dialogs, MAX_DIALOGS);
-                        let id = next_id_for_reader.fetch_add(1, Ordering::SeqCst);
-                        let mut reply_params = json!({ "accept": accept });
-                        if let Some(text) = prompt_text {
-                            reply_params["promptText"] = json!(text);
-                        }
-                        let frame = json!({
-                            "id": id,
-                            "sessionId": sid,
-                            "method": "Page.handleJavaScriptDialog",
-                            "params": reply_params,
-                        })
-                        .to_string();
-                        let _ = out_tx_for_reader.send(frame);
-                    }
-                    "Runtime.consoleAPICalled" => {
-                        let level = params
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("log")
-                            .to_owned();
-                        let text =
-                            console_text_from_args(params.get("args").unwrap_or(&Value::Null));
-                        state.console_logs.push(ConsoleEntry {
-                            level,
-                            text,
-                            timestamp: now_ms(),
-                        });
-                        trim_ring(&mut state.console_logs, MAX_CONSOLE);
-                    }
-                    "Runtime.exceptionThrown" => {
-                        if let Some(entry) = error_entry_from_exception(&params) {
-                            state.page_errors.push(entry);
-                            trim_ring(&mut state.page_errors, MAX_PAGE_ERRORS);
-                        }
-                    }
-                    "Network.requestWillBeSent" => {
-                        let request_id = params
-                            .get("requestId")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        if request_id.is_empty() {
-                            continue;
-                        }
-                        let request = params.get("request").cloned().unwrap_or(Value::Null);
-                        let url = request
-                            .get("url")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        let method = request
-                            .get("method")
-                            .and_then(Value::as_str)
-                            .unwrap_or("GET")
-                            .to_owned();
-                        let resource_type = params
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        let request_headers = request.get("headers").cloned();
-                        let request_body = request
-                            .get("postData")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        state.network_log.push(NetworkEntry {
-                            request_id,
-                            url,
-                            method,
-                            resource_type,
-                            status: None,
-                            status_text: None,
-                            request_headers,
-                            response_headers: None,
-                            request_body,
-                            response_body: None,
-                            response_body_truncated: false,
-                            response_body_size: None,
-                            start_time: now_ms(),
-                            end_time: None,
-                            duration_ms: None,
-                            from_cache: false,
-                            failed: false,
-                            failure_text: None,
-                        });
-                        trim_ring(&mut state.network_log, MAX_NETWORK);
-                        state.network_pending = state.network_pending.saturating_add(1);
-                    }
-                    "Network.responseReceived" => {
-                        let request_id = params
-                            .get("requestId")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        if request_id.is_empty() {
-                            continue;
-                        }
-                        let response = params.get("response").cloned().unwrap_or(Value::Null);
-                        let resource_type = params
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        let status = response
-                            .get("status")
-                            .and_then(Value::as_u64)
-                            .map(|n| n as u16);
-                        let status_text = response
-                            .get("statusText")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        let response_headers = response.get("headers").cloned();
-                        let from_cache = response
-                            .get("fromDiskCache")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        if let Some(entry) =
-                            find_network_entry_mut(&mut state.network_log, request_id)
-                        {
-                            entry.status = status;
-                            entry.status_text = status_text;
-                            entry.response_headers = response_headers;
-                            entry.from_cache = from_cache;
-                            if resource_type.is_some() {
-                                entry.resource_type = resource_type;
-                            }
-                        }
-                    }
-                    "Network.loadingFinished" => {
-                        let request_id = params
-                            .get("requestId")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        if request_id.is_empty() {
-                            continue;
-                        }
-                        let encoded_length =
-                            params.get("encodedDataLength").and_then(Value::as_u64);
-                        let now = now_ms();
-                        if let Some(entry) =
-                            find_network_entry_mut(&mut state.network_log, request_id)
-                        {
-                            entry.end_time = Some(now);
-                            entry.duration_ms = Some(now.saturating_sub(entry.start_time));
-                            entry.response_body_size = encoded_length;
-                        }
-                        state.network_pending = state.network_pending.saturating_sub(1);
-                    }
-                    "Network.loadingFailed" => {
-                        let request_id = params
-                            .get("requestId")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        if request_id.is_empty() {
-                            continue;
-                        }
-                        let error_text = params
-                            .get("errorText")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        let now = now_ms();
-                        if let Some(entry) =
-                            find_network_entry_mut(&mut state.network_log, request_id)
-                        {
-                            entry.failed = true;
-                            entry.failure_text = error_text;
-                            entry.end_time = Some(now);
-                            entry.duration_ms = Some(now.saturating_sub(entry.start_time));
-                        }
-                        state.network_pending = state.network_pending.saturating_sub(1);
-                    }
-                    _ => {} // other domain events silently dropped
-                }
-            }
-            // Stream closed → fail any still-pending requests so callers don't hang.
-            let mut map = pending_for_reader.lock().unwrap();
-            for (_, tx) in map.drain() {
-                let _ = tx.send(Err(anyhow!("cdp websocket closed")));
-            }
-        });
+        let ctx = ReaderCtx {
+            pending: pending.clone(),
+            registry: registry.clone(),
+            next_id: next_id.clone(),
+            out_tx: out_tx.clone(),
+            closed: transport_closed.clone(),
+        };
+        let tasks = spawn_transport_tasks(transport, out_rx, ctx).await?;
 
         let client = CdpClient {
             next_id,
             out_tx: Mutex::new(Some(out_tx)),
             pending,
             registry,
+            tasks: Mutex::new(Some(tasks)),
+            transport_closed,
         };
 
+        // From here on the tasks are owned by `client`, so every failure path
+        // must run `close()` — dropping the client would leave them detached,
+        // and for the pipe transport that means the browser never sees EOF.
+        if bootstrap_tab && let Err(err) = client.bootstrap_tab().await {
+            let _ = client.close().await;
+            return Err(err);
+        }
+
+        Ok(client)
+    }
+
+    /// Create the first page target, flatten-attach, seat it as active, and
+    /// enable Page/Runtime/Network on it.
+    async fn bootstrap_tab(&self) -> Result<()> {
         // 1. Fresh page target (about:blank — callers navigate later).
-        let target = client
+        let target = self
             .dispatch(
                 "Target.createTarget",
                 json!({ "url": "about:blank" }),
@@ -797,7 +1102,7 @@ impl CdpClient {
             .to_owned();
 
         // 2. Flatten attach (sessionId arrives in the response).
-        let attach = client
+        let attach = self
             .dispatch(
                 "Target.attachToTarget",
                 json!({ "targetId": target_id, "flatten": true }),
@@ -813,18 +1118,29 @@ impl CdpClient {
         // 3. Seat the initial tab as active before enabling domains so the
         // `Active` route resolves correctly for the enable calls below.
         {
-            let mut reg = client.registry.lock().await;
+            let mut reg = self.registry.lock().await;
             reg.tabs
                 .insert(target_id.clone(), TabState::new(session_id));
             reg.active = Some(target_id);
         }
 
         // 4. Enable domains on this session.
-        client.send("Page.enable", json!({})).await?;
-        client.send("Runtime.enable", json!({})).await?;
-        client.send("Network.enable", json!({})).await?;
+        self.send("Page.enable", json!({})).await?;
+        self.send("Runtime.enable", json!({})).await?;
+        self.send("Network.enable", json!({})).await?;
+        Ok(())
+    }
 
-        Ok(client)
+    /// Resolves once the transport has ended — the browser closed its end of
+    /// the pipe / websocket, or the reader hit an unrecoverable error. The
+    /// visual lifecycle coordinator waits on this instead of polling.
+    pub async fn transport_closed(&self) {
+        self.transport_closed.wait().await
+    }
+
+    /// Non-blocking form of [`Self::transport_closed`].
+    pub fn is_transport_closed(&self) -> bool {
+        self.transport_closed.is_closed()
     }
 
     /// Send a method call against the currently active tab.
@@ -1115,7 +1431,13 @@ impl CdpClient {
 
     /// Idempotent shutdown. Best-effort detach every attached session (5s
     /// timeout per call to keep teardown bounded if chromium hangs), then
-    /// drop the writer mpsc → background tasks exit naturally.
+    /// tear the transport down.
+    ///
+    /// The order matters. Dropping the outbound sender is not enough on its
+    /// own (the reader holds a clone of it), and `abort()` skips the reader's
+    /// own pending-map drain, so this fails the in-flight requests itself
+    /// before aborting. Only once both tasks have been joined are the pipe
+    /// descriptors released — which is the event the browser reacts to.
     pub async fn close(&self) -> Result<()> {
         let tabs: Vec<String> = {
             let reg = self.registry.lock().await;
@@ -1133,6 +1455,11 @@ impl CdpClient {
             .await;
         }
         let _ = self.out_tx.lock().await.take();
+        drain_pending(&self.pending, "cdp client closed");
+        if let Some(tasks) = self.tasks.lock().await.take() {
+            tasks.shutdown().await;
+        }
+        self.transport_closed.set();
         Ok(())
     }
 }
@@ -1166,6 +1493,138 @@ mod tests {
             saved_path: format!("/dl/{guid}"),
             started_at: started,
         }
+    }
+
+    // -- Pipe frame accumulator --
+
+    fn drain(acc: &mut FrameAccumulator, chunk: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        acc.push(chunk, MAX_PENDING_FRAME_BYTES, &mut out)
+            .expect("under cap");
+        out
+    }
+
+    #[test]
+    fn accumulator_splits_several_frames_in_one_read() {
+        let mut acc = FrameAccumulator::default();
+        assert_eq!(
+            drain(&mut acc, b"{\"id\":1}\0{\"id\":2}\0"),
+            vec![r#"{"id":1}"#, r#"{"id":2}"#]
+        );
+    }
+
+    #[test]
+    fn accumulator_joins_a_frame_split_across_reads() {
+        let mut acc = FrameAccumulator::default();
+        assert!(drain(&mut acc, b"{\"id\"").is_empty());
+        assert!(drain(&mut acc, b":1}").is_empty(), "no NUL yet");
+        assert_eq!(drain(&mut acc, b"\0"), vec![r#"{"id":1}"#]);
+    }
+
+    #[test]
+    fn accumulator_holds_a_trailing_partial_frame() {
+        let mut acc = FrameAccumulator::default();
+        assert_eq!(drain(&mut acc, b"{\"a\":1}\0{\"b\""), vec![r#"{"a":1}"#]);
+        assert_eq!(drain(&mut acc, b":2}\0"), vec![r#"{"b":2}"#]);
+    }
+
+    #[test]
+    fn accumulator_skips_empty_frames() {
+        let mut acc = FrameAccumulator::default();
+        assert_eq!(drain(&mut acc, b"\0\0{\"a\":1}\0\0"), vec![r#"{"a":1}"#]);
+    }
+
+    #[test]
+    fn accumulator_survives_a_codepoint_split_across_reads() {
+        // A multi-byte UTF-8 sequence cut in half by the read boundary must
+        // not be decoded until the frame is complete.
+        let mut acc = FrameAccumulator::default();
+        let payload = "{\"t\":\"한\"}".as_bytes().to_vec();
+        let (head, tail) = payload.split_at(6);
+        assert!(drain(&mut acc, head).is_empty());
+        let mut rest = tail.to_vec();
+        rest.push(0);
+        assert_eq!(drain(&mut acc, &rest), vec![r#"{"t":"한"}"#]);
+    }
+
+    #[test]
+    fn accumulator_rejects_an_unterminated_frame_over_cap() {
+        let mut acc = FrameAccumulator::default();
+        let mut out = Vec::new();
+        let err = acc.push(&[b'x'; 65], 64, &mut out).expect_err("over cap");
+        assert!(err.to_string().contains("NUL"), "got: {err}");
+        assert!(out.is_empty());
+        // The buffer is cleared, so a later well-formed frame still parses.
+        assert_eq!(drain(&mut acc, b"{\"a\":1}\0"), vec![r#"{"a":1}"#]);
+    }
+
+    #[test]
+    fn accumulator_allows_a_frame_exactly_at_cap() {
+        // The cap is on the *unterminated* remainder, so a frame whose payload
+        // fills the cap and is then terminated must still come through. (This
+        // one never reaches the cap check at all — the NUL drains the buffer
+        // first — which is itself the property being asserted.)
+        let mut acc = FrameAccumulator::default();
+        let mut out = Vec::new();
+        let mut chunk = vec![b'x'; 64];
+        chunk.push(0);
+        acc.push(&chunk, 64, &mut out).expect("terminated at cap");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), 64);
+    }
+
+    #[test]
+    fn accumulator_holds_an_unterminated_remainder_exactly_at_cap() {
+        // The real boundary: `len() > max` errors, `len() == max` does not.
+        // One more byte without a terminator must tip it over.
+        let mut acc = FrameAccumulator::default();
+        let mut out = Vec::new();
+        acc.push(&[b'x'; 64], 64, &mut out)
+            .expect("at cap, not over");
+        assert!(out.is_empty(), "nothing is complete without a NUL");
+        assert!(acc.push(b"x", 64, &mut out).is_err(), "65 bytes is over");
+    }
+
+    #[tokio::test]
+    async fn dropping_transport_tasks_aborts_them() {
+        // The failure this guards: a detached reader keeps its clone of the
+        // outbound sender alive, which keeps the writer alive, which keeps the
+        // pipe open — and a visual browser is then left running with nobody
+        // owning it.
+        let make = || tokio::spawn(std::future::pending::<()>());
+        let (writer, reader) = (make(), make());
+        let (w_probe, r_probe) = (writer.abort_handle(), reader.abort_handle());
+        drop(TransportTasks::new(writer, reader));
+        // `abort` is asynchronous; yield until the runtime has processed it.
+        for _ in 0..100 {
+            if w_probe.is_finished() && r_probe.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(w_probe.is_finished(), "writer task outlived its owner");
+        assert!(r_probe.is_finished(), "reader task outlived its owner");
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_joins_both_tasks() {
+        let make = || tokio::spawn(std::future::pending::<()>());
+        let (writer, reader) = (make(), make());
+        let (w_probe, r_probe) = (writer.abort_handle(), reader.abort_handle());
+        // `shutdown` joins, so both tasks are finished by the time it returns
+        // — no yielding needed, unlike the `Drop` path.
+        TransportTasks::new(writer, reader).shutdown().await;
+        assert!(w_probe.is_finished());
+        assert!(r_probe.is_finished());
+    }
+
+    #[tokio::test]
+    async fn shutdown_tolerates_already_emptied_slots() {
+        let make = || tokio::spawn(std::future::pending::<()>());
+        let mut tasks = TransportTasks::new(make(), make());
+        tasks.writer.take().unwrap().abort();
+        tasks.reader.take().unwrap().abort();
+        tasks.shutdown().await; // must not panic
     }
 
     #[test]
@@ -1383,16 +1842,109 @@ mod tests {
         assert_eq!(p.session_id.as_deref(), Some("s1"));
     }
 
+    /// Visual-mode transport smoke: launch a real browser with
+    /// `--remote-debugging-pipe` against a throwaway profile, drive it over
+    /// the inherited descriptors, and confirm the V0 finding that closing the
+    /// parent's ends is what stops the browser.
+    ///
+    /// Needs a graphical session (a visual launch is by definition not
+    /// headless). Over ssh on Linux, export `WAYLAND_DISPLAY`, `DISPLAY`,
+    /// `XDG_SESSION_TYPE=wayland`, `XDG_RUNTIME_DIR` and
+    /// `DBUS_SESSION_BUS_ADDRESS` first, or the browser dies on startup.
+    ///
+    ///   cargo test --manifest-path crates/tabd/Cargo.toml -- --ignored visual_pipe
+    #[tokio::test]
+    #[ignore = "requires a real browser and a graphical session"]
+    async fn visual_pipe_transport_roundtrip() {
+        use crate::browser::{LaunchSpec, VisualSpec};
+
+        let scratch = tempfile::TempDir::new().expect("tempdir");
+        let profile_dir = scratch.path().join("profile");
+        let mut browser = crate::browser::Browser::launch(LaunchSpec::Visual(VisualSpec {
+            profile_dir: profile_dir.clone(),
+            executable: crate::browser::discover_chromium().expect("a browser"),
+            start_urls: Vec::new(),
+            stderr_log: scratch.path().join("browser-stderr.log"),
+        }))
+        .await
+        .expect("launch visual browser");
+
+        let client = CdpClient::connect_with(ConnectOptions {
+            transport: browser.take_transport().expect("pipe transport"),
+            bootstrap_tab: false,
+        })
+        .await
+        .expect("cdp connect over pipe");
+
+        // Taking the transport twice must fail — the descriptors moved.
+        assert!(browser.take_transport().is_err());
+
+        // `bootstrap_tab: false` means we did not manufacture a tab. The
+        // browser's own startup tab exists, but nothing is in OUR registry.
+        assert!(
+            client.registry.lock().await.tabs.is_empty(),
+            "visual mode must start with an empty tab registry"
+        );
+
+        // A browser-domain round trip proves both directions of the pipe.
+        let version = client
+            .send_browser("Browser.getVersion", json!({}))
+            .await
+            .expect("Browser.getVersion");
+        assert!(
+            version.get("product").and_then(Value::as_str).is_some(),
+            "got: {version:?}"
+        );
+
+        // A page session round trip proves frame routing, not just framing.
+        let tab = client.create_tab("about:blank").await.expect("create_tab");
+        // `send_to`, not `send`: with no bootstrap tab there is no active tab
+        // for the `Active` route to resolve, which is exactly the point.
+        assert!(
+            client
+                .send("Runtime.evaluate", json!({ "expression": "1" }))
+                .await
+                .is_err(),
+            "the Active route must have nothing to resolve to"
+        );
+        let evaluated = client
+            .send_to(
+                &tab,
+                "Runtime.evaluate",
+                json!({ "expression": "1 + 1", "returnByValue": true }),
+            )
+            .await
+            .expect("Runtime.evaluate");
+        assert_eq!(
+            evaluated.pointer("/result/value").and_then(Value::as_i64),
+            Some(2)
+        );
+        client.close_tab(&tab).await.expect("close_tab");
+
+        // V0 Q1: with every parent-side descriptor gone, the browser exits by
+        // itself (75-100 ms on Linux, 876 ms on macOS). `close()` is what
+        // releases them, by joining the transport tasks that own them.
+        client.close().await.expect("close");
+        assert!(client.is_transport_closed());
+        assert!(
+            browser.wait_for_exit(Duration::from_secs(10)).await,
+            "browser must exit once the parent closes the pipe"
+        );
+    }
+
     // End-to-end smoke: spawn real chromium, exercise multi-tab paths.
     #[tokio::test]
     #[ignore = "requires real chromium; covers multi-tab create/activate/eval"]
     async fn cdp_multi_tab_roundtrip() {
-        let browser = crate::browser::Browser::launch()
+        let mut browser = crate::browser::Browser::launch(crate::browser::LaunchSpec::Headless)
             .await
             .expect("launch chromium");
-        let client = CdpClient::connect(browser.ws_endpoint())
-            .await
-            .expect("cdp connect");
+        let client = CdpClient::connect_with(ConnectOptions {
+            transport: browser.take_transport().expect("transport"),
+            bootstrap_tab: true,
+        })
+        .await
+        .expect("cdp connect");
 
         // The initial tab (about:blank) is already active. Open a second
         // with a distinguishable title.
@@ -1432,12 +1984,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires real chromium; covers list_tabs reconciliation"]
     async fn cdp_list_tabs_reconciles_external_close() {
-        let browser = crate::browser::Browser::launch()
+        let mut browser = crate::browser::Browser::launch(crate::browser::LaunchSpec::Headless)
             .await
             .expect("launch chromium");
-        let client = CdpClient::connect(browser.ws_endpoint())
-            .await
-            .expect("cdp connect");
+        let client = CdpClient::connect_with(ConnectOptions {
+            transport: browser.take_transport().expect("transport"),
+            bootstrap_tab: true,
+        })
+        .await
+        .expect("cdp connect");
 
         let t2 = client
             .create_tab("data:text/html,<title>Two</title>")

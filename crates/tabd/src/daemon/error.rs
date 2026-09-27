@@ -28,6 +28,12 @@ pub(crate) enum ErrorCode {
     OutputTooLarge,
     /// Daemon socket unreachable, spawn failed, or drain in progress.
     DaemonUnreachable,
+    /// The action exists, but not on a visual daemon. Visual mode serves only
+    /// `daemon.*` and `browser.*` — the agent boundary from
+    /// `docs/visual-mode-plan.md` §V2, enforced from V1.
+    VisualModeUnsupported,
+    /// Another process already owns the browser profile.
+    ProfileLocked,
     /// Anything not classified above.
     Internal,
 }
@@ -44,6 +50,8 @@ impl ErrorCode {
             ErrorCode::InvalidRequest => "invalid_request",
             ErrorCode::OutputTooLarge => "output_too_large",
             ErrorCode::DaemonUnreachable => "daemon_unreachable",
+            ErrorCode::VisualModeUnsupported => "visual_mode_unsupported",
+            ErrorCode::ProfileLocked => "profile_locked",
             ErrorCode::Internal => "internal",
         }
     }
@@ -96,6 +104,10 @@ pub(crate) fn classify_error_code(message: &str) -> ErrorCode {
         ErrorCode::OutputTooLarge
     } else if m.contains("shutting down (drain in progress)") {
         ErrorCode::DaemonUnreachable
+    } else if m.contains("is not available on a visual daemon") {
+        ErrorCode::VisualModeUnsupported
+    } else if m.contains("already owns profile") {
+        ErrorCode::ProfileLocked
     } else {
         ErrorCode::Internal
     }
@@ -255,6 +267,24 @@ mod tests {
                 "eval result too large (600000 chars > 500000); narrow the expression or pass --max-chars 0"
             ),
             ErrorCode::OutputTooLarge
+        );
+    }
+
+    #[test]
+    fn visual_mode_states_classify() {
+        assert_eq!(
+            classify_error_code(
+                "action 'tabs.navigate' is not available on a visual daemon \
+                 (visual mode serves daemon.* and browser.* only)"
+            ),
+            ErrorCode::VisualModeUnsupported
+        );
+        assert_eq!(
+            classify_error_code(
+                "another tabd already owns profile /home/x/.local/share/tabd/profile \
+                 (/home/x/.local/share/tabd/profile.lock): Resource temporarily unavailable"
+            ),
+            ErrorCode::ProfileLocked
         );
     }
 

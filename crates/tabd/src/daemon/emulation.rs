@@ -108,7 +108,9 @@ pub(super) async fn handle_add_init_script(
     let identifier = resp
         .get("identifier")
         .and_then(Value::as_str)
-        .ok_or_else(|| "Page.addScriptToEvaluateOnNewDocument response missing 'identifier'".to_string())?
+        .ok_or_else(|| {
+            "Page.addScriptToEvaluateOnNewDocument response missing 'identifier'".to_string()
+        })?
         .to_owned();
     Ok(Some(json!({ "identifier": identifier })))
 }
