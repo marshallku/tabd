@@ -38,6 +38,11 @@ pub struct Ctx {
     pub login_url: Option<String>,
     /// Where screenshots land (outside any scratch dir, so they survive).
     pub out_dir: PathBuf,
+    /// The operator's answer to a question the harness cannot measure itself
+    /// (currently Q3's infobar on macOS): "yes", "no", or absent.
+    pub infobar_observed: Option<String>,
+    /// How long a window is left up for a human to look at.
+    pub observe_secs: u64,
 }
 
 pub struct Outcome {
@@ -213,6 +218,7 @@ fn poll_title(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn screenshot_of_pid(pid: u32, out: &Path, wait: Duration) -> (Option<Value>, Option<String>) {
     let Some(client) = sys::wait_for_client(pid, wait) else {
         return (
@@ -316,7 +322,8 @@ fn q1_pipe_launch(ctx: &Ctx) -> ProbeResult {
         Verdict::Inconclusive
     };
     let answer = format!(
-        "pipe transport works on Brave {}; after closing both parent pipe ends the browser {}",
+        "pipe transport works on {} {}; after closing both parent pipe ends the browser {}",
+        crate::browser::Browser::resolve().name,
         version
             .get("product")
             .and_then(Value::as_str)
@@ -461,6 +468,133 @@ fn q2_webdriver(ctx: &Ctx) -> ProbeResult {
 
 // ------------------------------------------------------------------- Q3
 
+#[cfg(not(target_os = "linux"))]
+fn q3_infobar(ctx: &Ctx) -> ProbeResult {
+    // There is no window id and no Accessibility grant here, but none is
+    // needed: the launches place their own window, so capturing that same
+    // rectangle captures that window. The open question a fixed rectangle
+    // cannot answer by itself is "was a window actually there" — so a
+    // BACKGROUND frame is taken first, and each capture must differ from it.
+    // Without that, two captures of an empty desktop would compare equal and
+    // read as "no difference between the two modes".
+    const X: i64 = 80;
+    const Y: i64 = 80;
+    const W: i64 = 1280;
+    const H: i64 = 800;
+    std::fs::create_dir_all(&ctx.out_dir)?;
+
+    let window_args = || {
+        let mut args = visual_base_args();
+        args.push(format!("--window-size={W},{H}"));
+        args.push(format!("--window-position={X},{Y}"));
+        args
+    };
+    let start_url = "data:text/html,<title>q3</title><h1>q3</h1>";
+    let settle = Duration::from_secs(ctx.observe_secs.max(6));
+
+    // A background frame is taken immediately before EACH launch, not once up
+    // front. A single early frame only proves "the screen changed at some
+    // point"; if something transient disappears in between, two later
+    // empty-desktop captures can match each other and both look like windows
+    // were present — exactly the false-identical case this guards against.
+    let control_background_png = ctx.out_dir.join("q3-background-control.png");
+    sys::screencapture_rect(X, Y, W, H, &control_background_png)?;
+
+    let control_scratch = Scratch::new("q3-control", ctx.keep)?;
+    let control_png = ctx.out_dir.join("q3-control.png");
+    let control_cmdline = {
+        let control = PlainBrowser::launch(
+            &ctx.exe,
+            &control_scratch.child("profile"),
+            &window_args(),
+            Some(start_url),
+        )?;
+        std::thread::sleep(settle);
+        let cmdline = sys::cmdline_of(control.pid);
+        sys::screencapture_rect(X, Y, W, H, &control_png)?;
+        cmdline
+    };
+    // Let the window actually go away before the next background frame.
+    std::thread::sleep(Duration::from_secs(3));
+    let pipe_background_png = ctx.out_dir.join("q3-background-pipe.png");
+    sys::screencapture_rect(X, Y, W, H, &pipe_background_png)?;
+
+    let pipe_scratch = Scratch::new("q3-pipe", ctx.keep)?;
+    let pipe_png = ctx.out_dir.join("q3-pipe.png");
+    let mut pipe = PipeBrowser::launch(
+        &ctx.exe,
+        &pipe_scratch.child("profile"),
+        &window_args(),
+        Some(start_url),
+    )?;
+    let pipe_cmdline = sys::cmdline_of(pipe.pid());
+    let pipe_udd =
+        sys::runs_with_profile(pipe.pid(), &pipe_scratch.child("profile"), Some(start_url));
+    std::thread::sleep(settle);
+    sys::screencapture_rect(X, Y, W, H, &pipe_png)?;
+    pipe.shutdown();
+
+    let read = |p: &Path| std::fs::read(p).ok();
+    let control_background = read(&control_background_png);
+    let pipe_background = read(&pipe_background_png);
+    let (control, pipe_shot) = (read(&control_png), read(&pipe_png));
+    // Each capture is compared against the background taken moments before
+    // that same launch, so "a window appeared" is a claim about this launch
+    // rather than about the screen in general.
+    let control_showed_a_window =
+        matches!((&control_background, &control), (Some(b), Some(c)) if b != c);
+    let pipe_showed_a_window =
+        matches!((&pipe_background, &pipe_shot), (Some(b), Some(p)) if b != p);
+    // The two backgrounds must also match each other: if the desktop changed
+    // between launches, a difference between the window captures could be
+    // that change rather than the browser.
+    let backgrounds_stable =
+        matches!((&control_background, &pipe_background), (Some(a), Some(b)) if a == b);
+    let identical = match (&control, &pipe_shot) {
+        (Some(c), Some(p)) => Some(c == p),
+        _ => None,
+    };
+
+    let automation_flag = pipe_cmdline
+        .iter()
+        .any(|a| a.contains("--enable-automation"));
+    let verdict = if !control_showed_a_window || !pipe_showed_a_window || !backgrounds_stable {
+        Verdict::Inconclusive
+    } else if identical == Some(true) && pipe_udd {
+        Verdict::Pass
+    } else {
+        Verdict::Inconclusive
+    };
+    let answer = format!(
+        "captures byte-identical: {identical:?} (a window was present in the control capture: {control_showed_a_window}, and in the pipe capture: {pipe_showed_a_window} — each checked against a background frame taken moments before that launch; the two backgrounds themselves matched: {backgrounds_stable}). `--enable-automation` present in the pipe launch: {automation_flag}. Screenshots: {}, {}, backgrounds {} / {}",
+        control_png.display(),
+        pipe_png.display(),
+        control_background_png.display(),
+        pipe_background_png.display()
+    );
+    Ok((
+        verdict,
+        answer,
+        json!({
+            "controlBackgroundPng": control_background_png.to_string_lossy(),
+            "pipeBackgroundPng": pipe_background_png.to_string_lossy(),
+            "backgroundsStable": backgrounds_stable,
+            "controlPng": control_png.to_string_lossy(),
+            "pipePng": pipe_png.to_string_lossy(),
+            "capturedRect": { "x": X, "y": Y, "w": W, "h": H },
+            "controlShowedAWindow": control_showed_a_window,
+            "pipeShowedAWindow": pipe_showed_a_window,
+            "capturesByteIdentical": identical,
+            "pipeUsedItsScratchProfile": pipe_udd,
+            "controlCmdline": control_cmdline,
+            "pipeCmdline": pipe_cmdline,
+            "enableAutomationPresent": automation_flag,
+            "humanObservation": ctx.infobar_observed,
+        }),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn q3_infobar(ctx: &Ctx) -> ProbeResult {
     std::fs::create_dir_all(&ctx.out_dir)?;
     let window_args = || {
@@ -583,7 +717,7 @@ fn q5_singleton(ctx: &Ctx) -> ProbeResult {
     let mut cursor = 0usize;
     let _ = browser.drain_events(&mut cursor);
 
-    let before = sys::brave_browser_pids();
+    let before = sys::browser_pids(&ctx.exe);
     let started = Instant::now();
     let second = std::process::Command::new(&ctx.exe)
         .arg(format!("--user-data-dir={}", profile.display()))
@@ -619,7 +753,7 @@ fn q5_singleton(ctx: &Ctx) -> ProbeResult {
     } else {
         None
     };
-    let after = sys::brave_browser_pids();
+    let after = sys::browser_pids(&ctx.exe);
     browser.shutdown();
 
     let forwarded = event.is_some() || polled.is_some();
@@ -656,6 +790,17 @@ fn q5_singleton(ctx: &Ctx) -> ProbeResult {
 
 // ------------------------------------------------------------------- Q7
 
+#[cfg(not(target_os = "linux"))]
+fn q7_app_id(_ctx: &Ctx) -> ProbeResult {
+    Ok((
+        Verdict::Inconclusive,
+        "Wayland-only question: there is no `app_id` on this platform and no Hyprland to ask."
+            .into(),
+        json!({ "linuxOnly": true }),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn q7_app_id(ctx: &Ctx) -> ProbeResult {
     let scratch = Scratch::new("q7", ctx.keep)?;
     let mut args = visual_base_args();
@@ -708,6 +853,16 @@ fn q7_app_id(ctx: &Ctx) -> ProbeResult {
 
 // ------------------------------------------------------------------- Q8
 
+#[cfg(not(target_os = "linux"))]
+fn q8_dunst_actions(_ctx: &Ctx) -> ProbeResult {
+    Ok((
+        Verdict::Inconclusive,
+        "dunst-specific question; the macOS approval channel is a separate work-unit (Q16).".into(),
+        json!({ "linuxOnly": true }),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn q8_dunst_actions(ctx: &Ctx) -> ProbeResult {
     let version = sys::stdout_of("dunst", &["--version"])
         .lines()
@@ -818,6 +973,7 @@ fn q8_dunst_actions(ctx: &Ctx) -> ProbeResult {
 
 /// Post a one-action notification and trigger it with `dunstctl action`,
 /// returning whatever key `notify-send --wait` printed.
+#[cfg(target_os = "linux")]
 fn q8_plumbing() -> io::Result<String> {
     let child = std::process::Command::new("notify-send")
         .args([
@@ -843,33 +999,80 @@ fn q8_plumbing() -> io::Result<String> {
 
 // ------------------------------------------------------------------- Q6// ------------------------------------------------------------------- Q6
 
+/// A cookie's identity, mirroring the cookie store's OWN unique index:
+/// `(host_key, top_frame_site_key, has_cross_site_ancestor, name, path,
+/// source_scheme, source_port)`.
+///
+/// Guessing at a subset is how this probe ended up inconclusive on a profile
+/// with CHIPS-partitioned cookies: `.youtube.com|YSC` exists several times
+/// over, distinguished only by its partition. Taking the schema's word for
+/// what makes a cookie unique removes the guesswork.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CookieId {
     host: String,
     name: String,
     path: String,
     port: i64,
-    /// `is_secure` in SQLite, `secure` over CDP. Part of the identity because
-    /// (host, name, path, port) alone is not unique.
-    secure: bool,
+    /// `source_scheme` in SQLite (0 Unset / 1 NonSecure / 2 Secure),
+    /// `sourceScheme` over CDP ("Unset" / "NonSecure" / "Secure"). This is
+    /// the field the index actually keys on — `is_secure` is NOT in it, and
+    /// substituting it was a guess dressed up as schema-mirroring.
+    source_scheme: String,
+    /// `top_frame_site_key` in SQLite, `partitionKey.topLevelSite` over CDP.
+    /// Empty means unpartitioned.
+    partition: String,
+    /// `has_cross_site_ancestor` in SQLite,
+    /// `partitionKey.hasCrossSiteAncestor` over CDP — but only meaningful for
+    /// a *partitioned* cookie. SQLite stores 1 for every unpartitioned row
+    /// while CDP omits `partitionKey` for them entirely, so comparing it
+    /// unconditionally mismatches every ordinary cookie. It is normalised to
+    /// false whenever `partition` is empty.
+    cross_site_ancestor: bool,
 }
 
+/// SQLite stores `source_scheme` as an int; CDP names it. Map to the CDP
+/// spelling so the two sides are comparable.
+fn source_scheme_name(raw: &str) -> String {
+    match raw {
+        "1" => "NonSecure",
+        "2" => "Secure",
+        _ => "Unset",
+    }
+    .to_string()
+}
+
+/// Case-fold only.
+///
+/// Stripping the leading dot — which an earlier version did, to "normalise"
+/// host_key against CDP's spelling — is lossy: the cookie store treats
+/// `.example.com` (a domain cookie) and `example.com` (a host cookie) as
+/// different rows, and collapsing them merged two real cookies into one
+/// identity. CDP reports the leading dot too, so there is nothing to
+/// normalise away.
 fn normalize_host(host: &str) -> String {
-    host.trim_start_matches('.').to_ascii_lowercase()
+    host.to_ascii_lowercase()
 }
 
 fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
-    let running = sys::brave_browser_pids();
-    if !running.is_empty() {
-        return Err(io::Error::other(format!(
-            "refusing to copy the profile while Brave is running (pids {running:?})"
-        )));
-    }
-    let real = real_profile_dir().ok_or_else(|| io::Error::other("no $HOME"))?;
+    let real = real_profile_dir().ok_or_else(|| {
+        io::Error::other(
+            "this browser has no known profile configuration, so there is nothing safe to copy; set BROWSER_EXECUTABLE to a browser the harness recognises",
+        )
+    })?;
     if !real.is_dir() {
         return Err(io::Error::other(format!(
             "real profile {} not found",
             real.display()
+        )));
+    }
+    // Only processes using the tree about to be copied matter. A headless
+    // daemon on its own throwaway profile cannot make the snapshot
+    // inconsistent, and refusing because of one would make this unrunnable on
+    // a real machine.
+    let running = sys::browser_pids_on_profile(&ctx.exe, &real);
+    if !running.is_empty() {
+        return Err(io::Error::other(format!(
+            "refusing to copy the profile while a browser is using it (pids {running:?}). Quit it completely and leave it closed until the copy finishes."
         )));
     }
     let singletons: Vec<String> = std::fs::read_dir(&real)?
@@ -883,19 +1086,34 @@ fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
         )));
     }
 
-    let scratch = Scratch::new("q6", ctx.keep)?;
+    // `--keep` is refused here: the staging copy is the user's real credential
+    // store, and leaving it behind for a later session is a standing
+    // data-exposure risk.
+    let scratch = Scratch::new("q6", false)?;
     let staging = scratch.child("profile");
-    let copy = sys::run(
-        "cp",
-        &["-a", &real.to_string_lossy(), &staging.to_string_lossy()],
-    )?;
-    if !copy.status.success() {
+    let (copy_command, copy_ok, copy_err) = copy_profile(&real, &staging)?;
+    if !copy_ok {
         return Err(io::Error::other(format!(
-            "cp -a failed: {}",
-            String::from_utf8_lossy(&copy.stderr)
+            "copying the profile failed ({copy_command}): {copy_err}"
         )));
     }
     let pruned = prune_copy(&staging)?;
+
+    // A multi-gigabyte copy takes long enough for the browser to be relaunched
+    // while it runs, which would leave an inconsistent SQLite/WAL snapshot.
+    // The pre-check cannot see that, so the guard runs again afterwards and
+    // the probe refuses to analyse a snapshot it cannot trust.
+    let running_after = sys::browser_pids_on_profile(&ctx.exe, &real);
+    let singletons_after: Vec<String> = std::fs::read_dir(&real)?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("Singleton"))
+        .collect();
+    if !running_after.is_empty() || !singletons_after.is_empty() {
+        return Err(io::Error::other(format!(
+            "the browser reappeared while the profile was being copied (pids {running_after:?}, singletons {singletons_after:?}); the snapshot is not trustworthy. Quit it and leave it closed until the copy finishes."
+        )));
+    }
 
     // Which profile directory is actually in use? Brave may be on "Profile 1".
     let local_state: Value = std::fs::read_to_string(staging.join("Local State"))
@@ -930,9 +1148,9 @@ fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
         if let Some(db) = &cookies_db {
             for row in sys::sqlite_query(
                 db,
-                "SELECT host_key, name, path, source_port, expires_utc, is_secure FROM cookies WHERE length(encrypted_value) > 0",
+                "SELECT host_key, name, path, source_port, expires_utc, source_scheme, top_frame_site_key, has_cross_site_ancestor FROM cookies WHERE length(encrypted_value) > 0",
             )? {
-                if row.len() < 6 {
+                if row.len() < 8 {
                     continue;
                 }
                 let expires: i64 = row[4].parse().unwrap_or(0);
@@ -948,12 +1166,15 @@ fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
                     expired += 1;
                     continue;
                 }
+                let partition = row[6].clone();
                 ids.push(CookieId {
                     host: normalize_host(&row[0]),
                     name: row[1].clone(),
                     path: row[2].clone(),
                     port: row[3].parse().unwrap_or(-1),
-                    secure: row[5] == "1",
+                    source_scheme: source_scheme_name(&row[5]),
+                    cross_site_ancestor: !partition.is_empty() && row[7] == "1",
+                    partition,
                 });
             }
         }
@@ -1013,11 +1234,22 @@ fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
             .cloned()
             .unwrap_or_default(),
         Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+            // Record what can be observed, not a diagnosis. A timeout says
+            // only that the browser stopped answering — a startup failure, a
+            // broken pipe or a hang would look the same.
+            let security_agent = sys::security_agent_running();
+            let alive = browser.is_alive();
+            let stderr_tail = tail_of(&browser.stderr_log, 15);
             browser.shutdown();
             return Ok((
                 Verdict::Inconclusive,
                 format!(
-                    "the browser stopped answering while reading cookies ({err}). This is what a LOCKED SESSION KEYRING looks like: Brave puts up a modal \"the login keyring did not get unlocked\" prompt and then completes no request and answers no CDP command. Unlock the keyring in the graphical session and re-run."
+                    "the browser stopped answering while reading cookies ({err}); still running: {alive}. A locked credential store looks exactly like this — on Linux a modal \"the login keyring did not get unlocked\" prompt, on macOS a Keychain authorization dialog — and while one is up the browser completes no request and answers no CDP command. Observation, not a diagnosis: a SecurityAgent process was {} at that moment.",
+                    if security_agent {
+                        "running"
+                    } else {
+                        "NOT running"
+                    }
                 ),
                 json!({
                     "realProfile": real.to_string_lossy(),
@@ -1026,7 +1258,9 @@ fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
                     "profiles": profiles,
                     "lastUsedProfile": last_used,
                     "perProfile": Value::Object(per_profile),
-                    "likelyCause": "locked session keyring",
+                    "securityAgentRunning": security_agent,
+                    "browserStillRunning": alive,
+                    "browserStderrTail": stderr_tail,
                 }),
             ));
         }
@@ -1034,20 +1268,37 @@ fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
     };
     let live: HashSet<CookieId> = cookies
         .iter()
-        .map(|c| CookieId {
-            host: normalize_host(c.get("domain").and_then(Value::as_str).unwrap_or("")),
-            name: c
-                .get("name")
+        .map(|c| {
+            let partition = c
+                .pointer("/partitionKey/topLevelSite")
                 .and_then(Value::as_str)
+                .or_else(|| c.get("partitionKey").and_then(Value::as_str))
                 .unwrap_or("")
-                .to_string(),
-            path: c
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            port: c.get("sourcePort").and_then(Value::as_i64).unwrap_or(-1),
-            secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
+                .to_string();
+            CookieId {
+                host: normalize_host(c.get("domain").and_then(Value::as_str).unwrap_or("")),
+                name: c
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                path: c
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                port: c.get("sourcePort").and_then(Value::as_i64).unwrap_or(-1),
+                source_scheme: c
+                    .get("sourceScheme")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unset")
+                    .to_string(),
+                cross_site_ancestor: !partition.is_empty()
+                    && c.pointer("/partitionKey/hasCrossSiteAncestor")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                partition,
+            }
         })
         .collect();
 
@@ -1141,6 +1392,7 @@ fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
             "realProfile": real.to_string_lossy(),
             "stagingProfile": staging.to_string_lossy(),
             "prunedFromCopy": pruned,
+            "copyCommand": copy_command,
             "profiles": profiles,
             "lastUsedProfile": last_used,
             "perProfile": Value::Object(per_profile),
@@ -1154,6 +1406,86 @@ fn q6_profile_copy(ctx: &Ctx) -> ProbeResult {
             "screenshots": Value::Object(screenshots),
         }),
     ))
+}
+
+/// Copy a real profile into `staging`.
+///
+/// Prefers `rsync` so the excluded trees are never written at all — the source
+/// here can be 9 GB — and falls back to `cp -a` plus the prune step. The
+/// excludes are directory-anchored rather than a broad `*Cache*` glob, which
+/// would also drop a non-cache file whose name merely contains "Cache".
+///
+/// Both paths carry a trailing slash on purpose: that is what makes rsync copy
+/// the source's *contents* into `staging` instead of nesting them under an
+/// extra directory component, and the caller depends on `<staging>/Local State`
+/// existing. That dependency is asserted rather than assumed.
+fn copy_profile(real: &Path, staging: &Path) -> io::Result<(String, bool, String)> {
+    crate::scratch::assert_safe_user_data_dir(staging)?;
+    std::fs::create_dir_all(staging)?;
+    let source = format!("{}/", real.display());
+    let dest = format!("{}/", staging.display());
+    const EXCLUDES: &[&str] = &[
+        "Singleton*",
+        "lockfile",
+        "/Crashpad/",
+        "/GrShaderCache/",
+        "/ShaderCache/",
+        "/GraphiteDawnCache/",
+        "/GPUPersistentCache/",
+        "/*/Cache/",
+        "/*/Code Cache/",
+        "/*/GPUCache/",
+        "/*/DawnGraphiteCache/",
+        "/*/DawnWebGPUCache/",
+        "/*/Service Worker/CacheStorage/",
+        "/*/Service Worker/ScriptCache/",
+    ];
+
+    if which_on_path("rsync").is_some() {
+        let mut args: Vec<String> = vec!["-a".into()];
+        for exclude in EXCLUDES {
+            args.push("--exclude".into());
+            args.push((*exclude).to_string());
+        }
+        args.push(source.clone());
+        args.push(dest.clone());
+        let printable = format!("rsync {}", args.join(" "));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = sys::run("rsync", &refs)?;
+        let ok = out.status.success();
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if ok && !staging.join("Local State").exists() {
+            return Err(io::Error::other(format!(
+                "{printable} reported success but {}/Local State is missing — the trailing-slash spelling is wrong",
+                staging.display()
+            )));
+        }
+        return Ok((printable, ok, err));
+    }
+
+    let out = sys::run("cp", &["-a", &source, &dest])?;
+    let printable = format!("cp -a {source} {dest}");
+    let ok = out.status.success();
+    // The same layout invariant as the rsync path: a copy that "succeeded"
+    // into the wrong nesting must not be analysed as if it were a profile.
+    if ok && !staging.join("Local State").exists() {
+        return Err(io::Error::other(format!(
+            "{printable} reported success but {}/Local State is missing — the copy landed in the wrong layout",
+            staging.display()
+        )));
+    }
+    Ok((
+        printable,
+        ok,
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ))
+}
+
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
 }
 
 /// Remove the files that must not travel with a profile copy. Operates only on
@@ -1252,10 +1584,18 @@ mod tests {
         assert_eq!(sys::report_param("/report", "tag"), None);
     }
 
+    /// The leading dot is significant: the cookie store keys on `host_key`,
+    /// where `.example.com` and `example.com` are different rows. Folding
+    /// them together merged two real cookies into one identity and showed up
+    /// as a phantom collision.
     #[test]
-    fn host_normalization_matches_sqlite_and_cdp_spellings() {
-        assert_eq!(normalize_host(".Example.COM"), "example.com");
-        assert_eq!(normalize_host("example.com"), "example.com");
+    fn host_normalization_is_case_only_and_keeps_the_leading_dot() {
+        assert_eq!(normalize_host(".Example.COM"), ".example.com");
+        assert_eq!(normalize_host("Example.COM"), "example.com");
+        assert_ne!(
+            normalize_host(".example.com"),
+            normalize_host("example.com")
+        );
     }
 
     #[test]
@@ -1280,5 +1620,37 @@ mod tests {
         for id in PROBE_IDS {
             assert_ne!(question_for(id), "unknown", "{id}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cookie_identity_tests {
+    /// `has_cross_site_ancestor` is stored as 1 for *every* unpartitioned row
+    /// in Chrome's cookie store, while CDP omits `partitionKey` for those
+    /// cookies entirely. Comparing the flag unconditionally therefore
+    /// mismatches every ordinary cookie — it collapsed a 171/171 result to
+    /// 14/178 — so it is normalised away when there is no partition.
+    fn normalized(partition: &str, raw_flag: bool) -> bool {
+        !partition.is_empty() && raw_flag
+    }
+
+    #[test]
+    fn cross_site_ancestor_is_ignored_for_unpartitioned_cookies() {
+        // SQLite side: unpartitioned rows carry 1.
+        assert!(!normalized("", true));
+        // CDP side: unpartitioned cookies carry no partitionKey at all.
+        assert!(!normalized("", false));
+        // Both therefore agree.
+        assert_eq!(normalized("", true), normalized("", false));
+    }
+
+    #[test]
+    fn cross_site_ancestor_still_distinguishes_partitioned_cookies() {
+        assert!(normalized("https://google.com", true));
+        assert!(!normalized("https://google.com", false));
+        assert_ne!(
+            normalized("https://google.com", true),
+            normalized("https://google.com", false)
+        );
     }
 }

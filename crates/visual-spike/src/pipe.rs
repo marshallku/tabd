@@ -46,10 +46,8 @@ pub fn visual_base_args() -> Vec<String> {
     args
 }
 
-pub fn brave_executable() -> PathBuf {
-    std::env::var_os("BROWSER_EXECUTABLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/usr/bin/brave"))
+pub fn browser_executable() -> PathBuf {
+    crate::browser::Browser::resolve().executable
 }
 
 #[derive(Default)]

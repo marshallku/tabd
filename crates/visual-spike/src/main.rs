@@ -5,6 +5,7 @@
 //! here ships: it is a separate crate precisely so the tabd binary, install.sh
 //! and CI stay untouched.
 
+mod browser;
 mod fixture;
 mod pipe;
 mod probes;
@@ -24,6 +25,10 @@ options:
   --interactive      also run probes that need a human click (q8)
   --keep             keep scratch profile directories for inspection
   --login-url <url>  a site you are already logged into, for q6's functional check
+  --infobar-observed yes|no
+                     your answer to q3's infobar question where the harness
+                     cannot capture a window itself (macOS)
+  --observe-secs <n> how long to leave a window up for you to look at
   --out-dir <dir>    where screenshots go (default: ./visual-spike-out)
 
 probes:
@@ -41,11 +46,13 @@ fn main() -> ExitCode {
 
     let mut selected: Vec<&'static str> = Vec::new();
     let mut ctx = Ctx {
-        exe: pipe::brave_executable(),
+        exe: pipe::browser_executable(),
         keep: false,
         interactive: false,
         login_url: None,
         out_dir: PathBuf::from("visual-spike-out"),
+        infobar_observed: None,
+        observe_secs: 12,
     };
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
@@ -54,6 +61,12 @@ fn main() -> ExitCode {
             "--interactive" => ctx.interactive = true,
             "--keep" => ctx.keep = true,
             "--login-url" => ctx.login_url = rest.next().cloned(),
+            "--infobar-observed" => ctx.infobar_observed = rest.next().cloned(),
+            "--observe-secs" => {
+                if let Some(secs) = rest.next().and_then(|v| v.parse().ok()) {
+                    ctx.observe_secs = secs;
+                }
+            }
             "--out-dir" => {
                 if let Some(dir) = rest.next() {
                     ctx.out_dir = PathBuf::from(dir);

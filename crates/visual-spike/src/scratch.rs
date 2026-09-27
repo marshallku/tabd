@@ -12,16 +12,22 @@ use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-/// The real, daily-use Brave profile. The spike must never launch a browser
-/// with it, nor delete anything under it; Q6 only ever `cp -a`s out of it.
+/// The real, daily-use profile of the browser being driven. The spike must
+/// never launch a browser with it, nor delete anything under it; the
+/// profile-copy probe only ever copies out of it.
 pub fn real_profile_dir() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    let candidate = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/BraveSoftware/Brave-Browser")
-    } else {
-        home.join(".config/BraveSoftware/Brave-Browser")
-    };
-    Some(candidate)
+    crate::browser::Browser::resolve().real_profile_dir
+}
+
+/// Every real profile directory this platform knows about, so the guard
+/// protects the ones we are *not* driving too — an override that points at
+/// Chrome must not make Brave's profile fair game for deletion.
+pub fn all_real_profile_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    crate::browser::known_browsers(home.as_deref())
+        .into_iter()
+        .filter_map(|b| b.real_profile_dir)
+        .collect()
 }
 
 /// Reject a user-data-dir that is the real profile, an ancestor of it, or a
@@ -29,32 +35,33 @@ pub fn real_profile_dir() -> Option<PathBuf> {
 /// alias cannot slip past; a path that does not exist yet is compared by its
 /// nearest existing ancestor plus the remaining components.
 pub fn assert_safe_user_data_dir(dir: &Path) -> io::Result<()> {
-    let Some(real) = real_profile_dir() else {
-        return Ok(());
-    };
-    // A missing real profile means nothing to protect.
-    let Ok(real) = real.canonicalize() else {
-        return Ok(());
-    };
     let candidate = resolve_as_far_as_possible(dir);
-
-    let bad = if candidate == real {
-        Some("is the real Brave profile")
-    } else if candidate.starts_with(&real) {
-        Some("is inside the real Brave profile")
-    } else if real.starts_with(&candidate) {
-        Some("is an ancestor of the real Brave profile")
-    } else {
-        None
-    };
-
-    match bad {
-        Some(why) => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("refusing to use {}: it {why}", candidate.display()),
-        )),
-        None => Ok(()),
+    for real in all_real_profile_dirs() {
+        // A missing real profile means nothing to protect.
+        let Ok(real) = real.canonicalize() else {
+            continue;
+        };
+        let bad = if candidate == real {
+            Some("is a real browser profile")
+        } else if candidate.starts_with(&real) {
+            Some("is inside a real browser profile")
+        } else if real.starts_with(&candidate) {
+            Some("is an ancestor of a real browser profile")
+        } else {
+            None
+        };
+        if let Some(why) = bad {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to use {}: it {why} ({})",
+                    candidate.display(),
+                    real.display()
+                ),
+            ));
+        }
     }
+    Ok(())
 }
 
 /// Canonicalize the longest existing prefix of `path` and re-append the rest,

@@ -1,6 +1,7 @@
 //! Small shells around the host tools the probes need (pgrep, hyprctl, grim,
 //! sqlite3, notify-send). Kept in one place so a probe body stays readable.
 
+#[cfg(target_os = "linux")]
 use serde_json::Value;
 use std::io;
 use std::path::Path;
@@ -18,19 +19,102 @@ pub fn stdout_of(program: &str, args: &[&str]) -> String {
     }
 }
 
-/// PIDs of Brave **browser** processes — the ones without a `--type=` switch.
-/// Renderers, zygotes and GPU processes all share the executable name, so a
-/// bare `pgrep -c brave` would count a single browser many times over.
-pub fn brave_browser_pids() -> Vec<u32> {
-    let Ok(out) = run("pgrep", &["-a", "brave"]) else {
+/// PIDs of **browser** processes for `executable` — the ones without a
+/// `--type=` switch.
+///
+/// Matching is on the resolved executable path, never on a name. Renderers,
+/// zygotes and GPU processes share the executable, so a name match would count
+/// one browser many times; worse, helpers like `chrome_crashpad_handler` share
+/// the *prefix*, and counting those would make the profile-copy probe refuse
+/// forever and make the singleton probe's before/after count depend on
+/// unrelated browser activity.
+pub fn browser_pids(executable: &Path) -> Vec<u32> {
+    // `pgrep -a` is the Linux spelling, `-fl` the BSD/macOS one; both print
+    // "<pid> <full command>".
+    let flag = if cfg!(target_os = "linux") {
+        "-a"
+    } else {
+        "-fl"
+    };
+    let exe = executable.to_string_lossy().to_string();
+    let Ok(out) = run("pgrep", &[flag, &exe]) else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter(|line| !line.contains("--type="))
-        .filter_map(|line| line.split_whitespace().next())
-        .filter_map(|pid| pid.parse::<u32>().ok())
+        .filter_map(|line| {
+            let (pid, command) = line.trim().split_once(char::is_whitespace)?;
+            // The command must BE the executable, not merely contain its name.
+            if !command.starts_with(&exe) {
+                return None;
+            }
+            if command.contains("--type=") {
+                return None;
+            }
+            pid.parse::<u32>().ok()
+        })
         .collect()
+}
+
+/// Capture a fixed screen rectangle on macOS.
+///
+/// No window id and no Accessibility grant are needed because the caller
+/// *places* the window itself (`--window-position` / `--window-size`) and then
+/// captures that same rectangle. What this cannot tell you on its own is
+/// whether a window was actually there, so callers pair it with a background
+/// frame — see the probe.
+#[cfg(not(target_os = "linux"))]
+pub fn screencapture_rect(x: i64, y: i64, w: i64, h: i64, out: &Path) -> io::Result<()> {
+    let geometry = format!("{x},{y},{w},{h}");
+    let out_str = out.to_string_lossy().to_string();
+    // -x: no camera sound. -o: omit window shadow, which is not part of the
+    // window and would differ with whatever is behind it.
+    let result = run("screencapture", &["-x", "-o", "-R", &geometry, &out_str])?;
+    if !result.status.success() {
+        return Err(io::Error::other(format!(
+            "screencapture -R {geometry} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        )));
+    }
+    if !out.exists() {
+        return Err(io::Error::other(format!(
+            "screencapture -R {geometry} wrote nothing (Screen Recording permission?)"
+        )));
+    }
+    Ok(())
+}
+
+/// Browser processes that are actually using `real_profile` — either because
+/// they were given it explicitly, or because they were given no
+/// `--user-data-dir` at all and therefore opened the default profile.
+///
+/// This is the guard the profile-copy probe needs. "Is any browser process
+/// running?" is too strict on a real machine: a headless daemon on its own
+/// throwaway profile cannot make the snapshot inconsistent, and refusing
+/// because of one would make the probe unrunnable. What matters is whether
+/// something is *writing the tree being copied*.
+pub fn browser_pids_on_profile(executable: &Path, real_profile: &Path) -> Vec<u32> {
+    browser_pids(executable)
+        .into_iter()
+        .filter(|pid| {
+            let blob = cmdline_of(*pid).join(" ");
+            if !blob.contains("--user-data-dir=") {
+                // No profile given: this is the default profile, which is the
+                // one being copied.
+                return true;
+            }
+            runs_with_profile(*pid, real_profile, None)
+        })
+        .collect()
+}
+
+/// Whether a macOS `SecurityAgent` process is running — the agent that
+/// presents Keychain authorization dialogs. Recorded as a plain observation;
+/// it is never by itself treated as proof that a prompt appeared.
+pub fn security_agent_running() -> bool {
+    run("pgrep", &["-x", "SecurityAgent"])
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Arguments of a process, from `/proc/<pid>/cmdline`.
@@ -43,18 +127,31 @@ pub fn brave_browser_pids() -> Vec<u32> {
 /// rather than a plausible-looking but wrong split. Callers must therefore
 /// use substring matching, not element equality — see [`user_data_dir_of`].
 pub fn cmdline_of(pid: u32) -> Vec<String> {
-    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-        return Vec::new();
-    };
-    let trimmed = raw.strip_suffix(&[0]).unwrap_or(&raw);
-    if trimmed.contains(&0) {
-        trimmed
-            .split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).to_string())
-            .collect()
-    } else {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return Vec::new();
+        };
+        let trimmed = raw.strip_suffix(&[0]).unwrap_or(&raw);
+        if trimmed.contains(&0) {
+            return trimmed
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).to_string())
+                .collect();
+        }
         vec![String::from_utf8_lossy(trimmed).to_string()]
+    }
+    // macOS has no /proc. `ps -o command=` yields exactly the space-joined
+    // blob the Chromium-rewritten Linux case already produces, so the single
+    // element shape — and `runs_with_profile`'s boundary rule — covers both.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = stdout_of("ps", &["-o", "command=", "-p", &pid.to_string()]);
+        if out.is_empty() || out.starts_with('<') {
+            return Vec::new();
+        }
+        vec![out]
     }
 }
 
@@ -81,6 +178,7 @@ pub fn runs_with_profile(pid: u32, dir: &Path, next: Option<&str>) -> bool {
         || next.is_some_and(|next| after.starts_with(&format!(" {next}")))
 }
 
+#[cfg(target_os = "linux")]
 pub fn hyprctl_clients() -> Option<Vec<Value>> {
     let out = run("hyprctl", &["clients", "-j"]).ok()?;
     if !out.status.success() {
@@ -94,6 +192,7 @@ pub fn hyprctl_clients() -> Option<Vec<Value>> {
 
 /// Wait for a Hyprland client whose `pid` is `pid` (or a descendant of it —
 /// Brave's window can belong to a child of the process we spawned).
+#[cfg(target_os = "linux")]
 pub fn wait_for_client(pid: u32, limit: Duration) -> Option<Value> {
     let deadline = Instant::now() + limit;
     loop {
@@ -119,6 +218,7 @@ pub fn wait_for_client(pid: u32, limit: Duration) -> Option<Value> {
 }
 
 /// Walk `/proc/<pid>/stat`'s ppid chain (bounded) looking for `ancestor`.
+#[cfg(target_os = "linux")]
 pub fn is_descendant_of(mut pid: u32, ancestor: u32) -> bool {
     for _ in 0..16 {
         let Some(ppid) = parent_pid(pid) else {
@@ -135,6 +235,7 @@ pub fn is_descendant_of(mut pid: u32, ancestor: u32) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 fn parent_pid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // `comm` can contain spaces and parens, so split at the LAST ')' — ppid is
@@ -143,6 +244,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
     after.split_whitespace().nth(1)?.parse().ok()
 }
 
+#[cfg(target_os = "linux")]
 pub fn active_workspace_id() -> Option<i64> {
     let out = run("hyprctl", &["activeworkspace", "-j"]).ok()?;
     serde_json::from_slice::<Value>(&out.stdout)
@@ -151,6 +253,7 @@ pub fn active_workspace_id() -> Option<i64> {
         .as_i64()
 }
 
+#[cfg(target_os = "linux")]
 fn client_workspace_id(client: &Value) -> Option<i64> {
     client.pointer("/workspace/id")?.as_i64()
 }
@@ -164,6 +267,7 @@ fn client_workspace_id(client: &Value) -> Option<i64> {
 /// not evidence that the right window was captured. A freshly launched browser
 /// window is focused by the compositor anyway, so there is no need to move the
 /// user's windows around; if it never becomes active, the capture is refused.
+#[cfg(target_os = "linux")]
 pub fn await_visible_active(client: &Value, limit: Duration) -> io::Result<Value> {
     let address = client
         .get("address")
@@ -204,6 +308,7 @@ pub fn await_visible_active(client: &Value, limit: Duration) -> io::Result<Value
     }
 }
 
+#[cfg(target_os = "linux")]
 fn active_window_address() -> Option<String> {
     let out = run("hyprctl", &["activewindow", "-j"]).ok()?;
     serde_json::from_slice::<Value>(&out.stdout)
@@ -215,6 +320,7 @@ fn active_window_address() -> Option<String> {
 
 /// Screenshot exactly the given Hyprland client's rectangle. `grim` has no
 /// "capture this window" switch — the geometry has to come from hyprctl.
+#[cfg(target_os = "linux")]
 pub fn grim_client(client: &Value, out: &Path) -> io::Result<()> {
     let at = client
         .get("at")
