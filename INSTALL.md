@@ -67,6 +67,25 @@ environment, install the runtime libs too — `apt install libnss3 libatk-bridge
 libdrm2 libxkbcommon0 libgbm1 libasound2` covers the usual gaps. On Arch they are
 mostly already present.
 
+## Visual mode (optional)
+
+Driving your everyday browser rather than a throwaway one. See
+[Visual mode](./README.md#visual-mode) in the README for what it does and how
+to use it; this is only what has to be on the machine.
+
+- **Linux** — nothing extra to write the launcher. All optional:
+  `--set-default` needs `xdg-settings` and the delivery check needs `xdg-mime`
+  (both from `xdg-utils`) plus `gio` (from GLib); `--enable-service` needs
+  systemd. `install` warns if the scheme registration fails and carries on.
+- **macOS** — `osacompile`, `codesign`, `PlistBuddy` and `lsregister`, all of
+  which ship with the OS. Nothing to install.
+- **Windows** — not supported. tabd is Unix-only.
+
+```bash
+tabd service install   # register with the OS; changes no defaults, starts nothing
+tabd service status    # what is installed, and whether tab restore is on
+```
+
 ## First run
 
 ```bash

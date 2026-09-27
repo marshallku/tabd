@@ -373,3 +373,18 @@ ran out of restart attempts and is sleeping between rounds. Check
 A long-running action is blocking the drain. Either wait, or
 `TABD_DRAIN_TIMEOUT_MS` is set too high. systemd's `TimeoutStopSec` is the
 hard cutoff — after it, systemd `SIGKILL`s the daemon.
+
+## Visual mode is owner-only
+
+`tabd` has a second mode that drives the human's everyday browser (their real
+profile and logins) instead of a throwaway one. It runs as a separate daemon
+with its own base directory, so it coexists with the headless one.
+
+**An agent cannot use it.** A visual daemon serves `daemon.ping`,
+`daemon.health`, `daemon.shutdown`, `browser.ensure` and `browser.status`, and
+rejects every other action with `errorCode: "visual_mode_unsupported"`. If you
+see that error, you have reached the wrong daemon: unset or change
+`$TABD_BASE_DIR`, or pass `--base-dir`, to get back to the headless one.
+
+Setting it up (`tabd service install`, `tabd profile import`) is an owner task
+and is documented in the project README, not here.

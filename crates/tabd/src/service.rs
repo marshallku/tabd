@@ -350,6 +350,30 @@ pub fn install(prefix: &Prefix, options: &Options) -> Result<()> {
             .display()
             .to_string()],
     );
+    if prefix.is_home() {
+        // Associate the *private* scheme only — never http/https, which is
+        // the user's default-browser choice. Declaring `MimeType=` in the
+        // desktop entry is not enough: `xdg-open tabd://…` looks up the
+        // default handler in `mimeapps.list`, and without this it falls
+        // through to `x-www-browser` and fails. Measured on Arch: the
+        // delivery check this command prints did nothing at all before this.
+        // Not `run_optional`: silently discarding a failure here means the
+        // delivery check printed below cannot work and nothing says why.
+        if let Err(err) = run_required(
+            "xdg-mime",
+            &[
+                "default".to_string(),
+                "tabd.desktop".to_string(),
+                format!("x-scheme-handler/{TEST_SCHEME}"),
+            ],
+        ) {
+            eprintln!(
+                "warning: could not register the {TEST_SCHEME}: scheme ({err:#}). Everything \
+                 else is installed; only the `gio open {TEST_SCHEME}://hello` delivery check \
+                 below will not work. Install xdg-utils for it."
+            );
+        }
+    }
 
     if options.enable_service {
         run_required("systemctl", &["--user", "daemon-reload"])?;
@@ -385,7 +409,11 @@ pub fn install(prefix: &Prefix, options: &Options) -> Result<()> {
     }
     eprintln!(
         "\nCheck url delivery without changing anything:\n\
-         \x20   xdg-open {TEST_SCHEME}://hello"
+         \x20   gio open {TEST_SCHEME}://hello\n\
+         (`gio`, not `xdg-open`: measured on xdg-utils 1.2.1, `xdg-open` routes any url it does\n\
+         not recognise straight to $BROWSER / x-www-browser and never consults the scheme\n\
+         handler, so it cannot see this. http/https are unaffected — those go through the\n\
+         default-browser setting above.)"
     );
     Ok(())
 }
@@ -929,8 +957,13 @@ pub fn status(prefix: &Prefix, base_dir: Option<&str>) -> Result<()> {
             None => println!("{:>9}  last url delivery: (log is empty)", "none"),
         },
         Err(_) => println!(
-            "{:>9}  last url delivery: none yet — try `open {TEST_SCHEME}://hello`",
-            "none"
+            "{:>9}  last url delivery: none yet — try `{} {TEST_SCHEME}://hello`",
+            "none",
+            if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "gio open"
+            }
         ),
     }
     let profile = crate::platform::visual_profile_dir()?;

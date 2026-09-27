@@ -34,16 +34,25 @@ enum DaemonCmd {
     Stop {
         #[arg(long)]
         base_dir: Option<String>,
+        /// Target the visual daemon rather than the headless one.
+        #[arg(long)]
+        visual: bool,
     },
     /// Send daemon.ping. Prints raw JSON response.
     Ping {
         #[arg(long)]
         base_dir: Option<String>,
+        /// Target the visual daemon rather than the headless one.
+        #[arg(long)]
+        visual: bool,
     },
     /// Send daemon.health. Prints raw JSON response.
     Health {
         #[arg(long)]
         base_dir: Option<String>,
+        /// Target the visual daemon rather than the headless one.
+        #[arg(long)]
+        visual: bool,
     },
 }
 
@@ -404,14 +413,28 @@ async fn run_daemon_cmd(cmd: DaemonCmd) -> Result<()> {
             };
             daemon::run_mode(base_dir.as_deref(), mode).await
         }
-        DaemonCmd::Stop { base_dir } => print_control(base_dir.as_deref(), "daemon.shutdown").await,
-        DaemonCmd::Ping { base_dir } => print_control(base_dir.as_deref(), "daemon.ping").await,
-        DaemonCmd::Health { base_dir } => print_control(base_dir.as_deref(), "daemon.health").await,
+        DaemonCmd::Stop { base_dir, visual } => {
+            print_control(base_dir.as_deref(), visual, "daemon.shutdown").await
+        }
+        DaemonCmd::Ping { base_dir, visual } => {
+            print_control(base_dir.as_deref(), visual, "daemon.ping").await
+        }
+        DaemonCmd::Health { base_dir, visual } => {
+            print_control(base_dir.as_deref(), visual, "daemon.health").await
+        }
     }
 }
 
-async fn print_control(base_dir: Option<&str>, action: &str) -> Result<()> {
-    let paths = daemon::resolve_paths(base_dir)?;
+async fn print_control(base_dir: Option<&str>, visual: bool, action: &str) -> Result<()> {
+    // `--visual` rather than making people spell out the visual base dir:
+    // there was no way to stop a visual daemon short of knowing that path,
+    // and it differs per platform and contains spaces on macOS.
+    let mode = if visual {
+        daemon::DaemonMode::Visual
+    } else {
+        daemon::DaemonMode::Headless
+    };
+    let paths = daemon::resolve_paths_for(base_dir, mode)?;
     let resp = daemon::send_control_action(&paths.socket_path, action).await?;
     // Unwrap the bridge envelope: emit only the `data` payload (or the error
     // text on failure) so the CLI output looks like a plain JSON response,

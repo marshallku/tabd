@@ -119,6 +119,13 @@ else
     grep -q "x-scheme-handler/https" "$DESKTOP" \
         && pass "desktop entry handles https" || fail "https handler" "$(cat "$DESKTOP")"
     [[ -f "$UNIT" ]] && pass "systemd unit installed" || fail "systemd unit" "missing"
+    # The printed delivery check must name an opener that actually works.
+    # Measured on xdg-utils 1.2.1: `xdg-open` sends any unrecognised url to
+    # $BROWSER / x-www-browser and never consults the scheme handler, so it
+    # cannot reach us; `gio open` does.
+    grep -q "gio open tabd://hello" <<<"$OUT" \
+        && pass "the delivery check names an opener that works" \
+        || fail "delivery-check hint" "$(grep -i 'tabd://hello' <<<"$OUT")"
     grep -q "PartOf=graphical-session.target" "$UNIT" \
         && pass "unit dies with the graphical session" || fail "PartOf" "$(cat "$UNIT")"
     # The install must not have *changed* whether anything is enabled. Asking

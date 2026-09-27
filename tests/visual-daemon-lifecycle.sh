@@ -227,6 +227,16 @@ done
 for _ in $(seq 1 20); do [[ -S "$BASE_A/daemon.sock" ]] || break; sleep 0.5; done
 [[ -S "$BASE_A/daemon.sock" ]] && fail "socket removed on exit" "still present" || pass "socket removed on exit"
 
+# `--visual` reaches the visual daemon without anyone having to know the
+# platform-specific base dir (which contains spaces on macOS). Uses the
+# default base dir, so only meaningful when one is actually running there —
+# assert the flag resolves a *different* path from the headless default.
+HEAD_SOCK="$("$BIN" daemon ping 2>&1 | head -c 200)"
+VIS_SOCK="$("$BIN" daemon ping --visual 2>&1 | head -c 200)"
+[[ "$HEAD_SOCK" != "$VIS_SOCK" ]] \
+    && pass "daemon --visual targets a different daemon than the headless default" \
+    || fail "--visual targeting" "both reported: $HEAD_SOCK"
+
 echo "== summary =="
 echo "passed: $PASS"
 echo "failed: $FAIL"

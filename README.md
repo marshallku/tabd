@@ -65,6 +65,7 @@ afterwards so it reloads skill metadata.
 | **Downloads** | `download-dir` (opt-in capture → known dir), `wait-download` |
 | **Secrets** | `secret-put`, `secret-list`, `secret-delete`, `type-secret` |
 | **Daemon** | `daemon start`, `daemon stop`, `daemon ping`, `daemon health` |
+| **Visual (owner)** | `browser`, `service install/uninstall/status`, `profile import/cutover/discard` — see [Visual mode](#visual-mode) |
 
 Every action that targets a specific tab accepts `--tab N` (1-based index).
 Defaults to the active tab.
@@ -104,6 +105,108 @@ tabd wait-url 'https://github.com/*' --pattern-type glob
 # 6. Stop when done.
 tabd daemon stop
 ```
+
+## Visual mode
+
+Everything above drives a **throwaway headless Chromium**. Visual mode is the
+other thing tabd can do: drive **your everyday browser** — your real profile,
+your logins, your extensions — over a pipe no other process can reach, so you
+can click a link and have it open there.
+
+It is owner-only today. A visual daemon serves `daemon.*` and `browser.*` and
+rejects every driver action with `visual_mode_unsupported`, so an agent cannot
+reach your browser through it. Connecting agents to it safely is a later
+phase.
+
+### Platforms
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| `tabd browser`, `service install` | yes | yes | no — tabd is Unix-only (unix sockets, `fork`/`exec`) |
+| Launcher it installs | `~/.local/share/applications/tabd.desktop` | `~/Applications/tabd.app` (generated with `osacompile`, ad-hoc signed) |  |
+| Background service (`--enable-service`) | systemd user unit | LaunchAgent (`Aqua` only) | |
+| Set as default browser | `--set-default` (needs `xdg-settings`) | manual, in System Settings — macOS has no supported non-interactive way | |
+
+Honouring `$XDG_DATA_HOME` / `$XDG_CONFIG_HOME` on Linux. `--enable-service`
+needs systemd; without it the files still install and `tabd browser` starts the
+daemon on demand.
+
+### Move your existing profile in — before you launch it
+
+Visual mode uses its own profile directory, empty to begin with. If you want
+your real one — cookies, logins, extensions — bring it across **first**:
+`cutover` publishes with an atomic rename onto an empty destination, so once
+you have launched the visual browser even once there is a profile in the way.
+
+**Quit your browser completely**, then:
+
+```bash
+tabd profile import      # copies to <profile>.staging; never touches the original
+# …follow the printed command to open the copy and check your logins…
+tabd profile cutover     # publishes it with one atomic rename
+tabd profile discard     # or throw the copy away
+```
+
+The original is only ever read, so a bad import costs a wasted copy. `import`
+refuses while a browser is running, aborts if one opens the profile mid-copy,
+and `cutover` refuses if the original changed in between.
+
+Already launched and now want to import? The destination is not empty, so
+`cutover` will refuse. Stop the visual daemon, move that profile aside, and
+import into the free slot:
+
+```bash
+tabd daemon stop --visual   # closes the browser too — they share a lifetime
+tabd service status         # prints the profile path; move it aside by hand
+tabd profile import && tabd profile cutover
+```
+
+### Use it
+
+```bash
+# 1. Register tabd with the OS. Does NOT change your default browser and does
+#    NOT start anything in the background — both are separate opt-ins.
+tabd service install
+tabd service status
+
+# 2. Bring your real profile across first, if you want it (previous section).
+
+# 3. Open something. Starts the visual daemon and the browser if needed.
+tabd browser https://example.com
+tabd browser                      # just bring the browser up
+```
+
+To have *clicked links* land in it, make tabd your default browser — Linux
+`tabd service install --set-default`, macOS System Settings → Desktop & Dock →
+Default web browser → tabd. Undo by picking your previous browser the same way.
+
+Check URL delivery works **without** changing your default, using a private
+scheme the installed launcher also claims:
+
+```bash
+gio open tabd://hello     # Linux  (not xdg-open — see below)
+open    tabd://hello      # macOS
+tabd service status       # shows the last delivery
+```
+
+On Linux this is deliberately `gio open`: measured on xdg-utils 1.2.1,
+`xdg-open` routes any URL whose scheme it does not recognise straight to
+`$BROWSER` / `x-www-browser` and never consults the scheme handler. http/https
+are unaffected — those go through the default-browser setting.
+
+### Two things worth knowing
+
+- **The daemon owns the browser.** They live and die together: if the daemon
+  stops, the browser closes.
+- **Turn on "Continue where you left off"** in the browser's startup settings.
+  Measured: without it, a browser that exits comes back with a single new-tab
+  page and no restore prompt — so a daemon crash loses your tabs. tabd cannot
+  set this for you (Chromium protects the preference); `tabd service status`
+  reports whether it is on.
+
+`navigator.webdriver` is `true` browser-wide while tabd drives it — an accepted
+trade-off of the pipe transport. Keep sensitive sites on your ordinary browser
+profile.
 
 ## Architecture
 
@@ -174,6 +277,8 @@ bash tests/spike-daemon-compat.sh                                       # 39 cas
 - [`architecture.md`](.claude/skills/tabd/architecture.md) — why `tabd` is shaped
   this way (daemon, multi-tab registry, reader task, supervisor, secrets
   vault).
+- [Visual mode](#visual-mode) — driving your everyday browser instead of a
+  throwaway one: `tabd browser`, `service install`, `profile import`.
 - [`operations.md`](.claude/skills/tabd/operations.md) — running `tabd` as a
   long-lived service: systemd user unit, launchd LaunchAgent, shell-rc
   fallback, drain semantics, health watchdog, troubleshooting.
