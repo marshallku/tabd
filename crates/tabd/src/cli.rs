@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -593,6 +593,222 @@ async fn render_result(resp: &Value, parsed: &ParsedArgs) -> Result<i32> {
         Some(v) => println!("{}", serde_json::to_string_pretty(v)?),
     }
     Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// `tabd browser` — the owner entry point
+// ---------------------------------------------------------------------------
+
+/// Open the human's browser, and the given urls in it.
+///
+/// This is what the default-browser registration calls: a `.desktop` file's
+/// `Exec=tabd browser %U` on Linux, the wrapper `.app`'s `on open location`
+/// handler on macOS. `%U` can hand over several urls at once, and zero urls
+/// means "just make sure the browser is up".
+///
+/// All the work happens in the daemon, over the pipe it already owns. The CLI
+/// deliberately does not spawn a browser itself: letting two `tabd browser`
+/// invocations race a launch, or relying on the Chromium singleton to forward
+/// argv to a running instance, is exactly what `browser.ensure`'s serialized
+/// lifecycle exists to avoid.
+pub async fn run_browser(urls: Vec<String>, base_dir: Option<&str>, json: bool) -> Result<i32> {
+    let paths = ensure_visual_daemon(base_dir).await?;
+    let resp = send_action(
+        &paths.socket_path,
+        "browser.ensure",
+        json!({ "urls": urls }),
+    )
+    .await?;
+
+    if json {
+        println!("{}", serde_json::to_string(&resp)?);
+    }
+
+    if !resp
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let code = resp.get("errorCode").and_then(Value::as_str);
+        if !json {
+            let message = resp
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            match code {
+                Some(c) => eprintln!("error: {message} [{c}]"),
+                None => eprintln!("error: {message}"),
+            }
+        }
+        return Ok(exit_code_for_error(code));
+    }
+
+    let data = resp.get("data").cloned().unwrap_or(Value::Null);
+    let launched = data
+        .get("launched")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let results = data
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut failed = 0usize;
+    for result in &results {
+        let url = result.get("url").and_then(Value::as_str).unwrap_or("?");
+        match result.get("status").and_then(Value::as_str) {
+            Some("failed") => {
+                failed += 1;
+                let why = result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                eprintln!("error: could not open {url}: {why}");
+            }
+            // "requested" is not "opened": the url went on the browser's
+            // command line during a launch, and nothing confirmed a target
+            // was created for it.
+            Some(status) if !json => println!("{status} {url}"),
+            _ => {}
+        }
+    }
+
+    if launched {
+        // Once per browser start, not once per clicked link. Measured:
+        // without this setting a browser that exits comes back with a single
+        // new-tab page and no restore prompt — and the daemon owns the pipe,
+        // so a daemon crash closes the browser. tabd cannot turn it on
+        // (Chromium MAC-protects the pref), so all it can do is say so.
+        //
+        // `unknown` warns too, and is the *normal* answer on a first launch:
+        // the profile has no `Preferences` yet because Chromium has not
+        // written one. Staying quiet there would mean never warning the one
+        // person who most needs it — someone setting the profile up.
+        match data.get("sessionRestore").and_then(Value::as_str) {
+            Some("off") => eprintln!(
+                "warning: this browser profile does not reopen its tabs on startup, so if the \
+                 tabd daemon stops your tabs are lost with no prompt. Turn on \
+                 \"Continue where you left off\" in the browser's startup settings."
+            ),
+            Some("unknown") => eprintln!(
+                "warning: could not read this profile's startup setting (a profile that has \
+                 never been launched has none yet). If the tabd daemon stops, the browser \
+                 closes with it — turn on \"Continue where you left off\" in the browser's \
+                 startup settings so your tabs come back."
+            ),
+            _ => {}
+        }
+        if !json && results.is_empty() {
+            println!("browser started");
+        }
+    } else if !json && results.is_empty() {
+        println!("browser already running");
+    }
+
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
+/// How long one health probe may take. A daemon can be listening and still
+/// never answer (wedged mid-launch, stopped in a debugger), and an unbounded
+/// probe would hang `tabd browser` — which, on macOS, also blocks the wrapper
+/// app's event queue and therefore every link clicked after it.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Overall budget for getting a visual daemon to answer, spawn included.
+const VISUAL_START_DEADLINE: Duration = Duration::from_secs(12);
+
+/// What is listening on a daemon socket, as far as `tabd browser` cares.
+enum Listening {
+    Visual,
+    /// A daemon answered, but it is not one we may drive.
+    WrongMode(String),
+    /// Nothing answered in time.
+    Nothing,
+}
+
+/// Probe a daemon socket. Reads `daemon.health` rather than `daemon.ping`
+/// because the question is "is this the *right* daemon" — `ping` would happily
+/// accept a headless one squatting on the same base dir.
+async fn probe_visual_daemon(socket_path: &Path) -> Listening {
+    let resp = match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        daemon::send_control_action(socket_path, "daemon.health"),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        _ => return Listening::Nothing,
+    };
+    match resp.pointer("/data/mode").and_then(Value::as_str) {
+        Some("visual") => Listening::Visual,
+        Some(other) => Listening::WrongMode(other.to_owned()),
+        // Answered, but not in a shape we recognize. Refusing is the safe
+        // reading: driving an unknown daemon is worse than saying so.
+        None => Listening::WrongMode("unrecognized".to_owned()),
+    }
+}
+
+fn wrong_mode_error(mode: &str, socket_path: &Path) -> anyhow::Error {
+    anyhow!(
+        "a {mode} daemon is listening on {} — `tabd browser` needs a visual one. \
+         Stop it, or pass --base-dir to use a different directory.",
+        socket_path.display()
+    )
+}
+
+/// Reach the visual daemon, starting it if it is not there.
+///
+/// Unlike [`ensure_daemon`] this waits only for *reachable*, never for
+/// `ready`: a visual daemon whose browser is closed is **intentionally** not
+/// ready, and `browser.ensure` is the thing that makes it ready again. Gating
+/// on readiness would mean a closed browser could never be reopened.
+async fn ensure_visual_daemon(base_dir: Option<&str>) -> Result<daemon::DaemonPaths> {
+    let paths = daemon::resolve_paths_for(base_dir, daemon::DaemonMode::Visual)?;
+
+    match probe_visual_daemon(&paths.socket_path).await {
+        Listening::Visual => return Ok(paths),
+        Listening::WrongMode(mode) => return Err(wrong_mode_error(&mode, &paths.socket_path)),
+        Listening::Nothing => {}
+    }
+
+    if std::env::var("TABD_NO_AUTO_SPAWN").is_ok() {
+        bail!(
+            "no visual daemon at {} and TABD_NO_AUTO_SPAWN is set",
+            paths.socket_path.display()
+        );
+    }
+
+    let exe = std::env::current_exe().context("current_exe")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon").arg("start").arg("--visual");
+    if let Some(b) = base_dir {
+        cmd.arg("--base-dir").arg(b);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .env("TABD_NO_AUTO_SPAWN", "1");
+    drop(cmd.spawn().context("spawn visual daemon")?); // detached; init reaps it
+
+    // The mode check repeats inside the loop, not just before the spawn: a
+    // headless daemon can bind the socket in the gap, and handing it
+    // `browser.ensure` would drive the wrong browser.
+    let deadline = Instant::now() + VISUAL_START_DEADLINE;
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        match probe_visual_daemon(&paths.socket_path).await {
+            Listening::Visual => return Ok(paths),
+            Listening::WrongMode(mode) => return Err(wrong_mode_error(&mode, &paths.socket_path)),
+            Listening::Nothing => {}
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "visual daemon did not answer at {} within {}s",
+                paths.socket_path.display(),
+                VISUAL_START_DEADLINE.as_secs()
+            );
+        }
+    }
 }
 
 /// Every daemon action the CLI can reach, for tests that must stay in step

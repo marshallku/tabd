@@ -63,6 +63,24 @@ enum Command {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// Open the human's everyday browser, and the given urls in it.
+    ///
+    /// This is the owner entry point the default-browser registration calls
+    /// (Linux `.desktop` `Exec=tabd browser %U`, macOS wrapper app). Starts
+    /// the visual daemon if it is not running. With no url it just makes sure
+    /// the browser is up.
+    Browser {
+        /// Urls to open. `http`, `https` and `file` only.
+        urls: Vec<String>,
+
+        /// Override the visual daemon's base directory.
+        #[arg(long)]
+        base_dir: Option<String>,
+
+        /// Print the raw daemon response instead of a human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Install the Claude Code / Codex CLI skill (SKILL.md + 4 docs) onto disk.
     Skill {
         #[command(subcommand)]
@@ -148,6 +166,17 @@ fn main() -> ExitCode {
         match cli.command {
             Command::Daemon { cmd } => match run_daemon_cmd(cmd).await {
                 Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    1
+                }
+            },
+            Command::Browser {
+                urls,
+                base_dir,
+                json,
+            } => match cli::run_browser(urls, base_dir.as_deref(), json).await {
+                Ok(code) => code,
                 Err(err) => {
                     eprintln!("error: {err:#}");
                     1

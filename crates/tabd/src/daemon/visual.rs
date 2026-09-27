@@ -292,6 +292,8 @@ pub(super) async fn handle_ensure(
             // every tab.
             return Ok(Some(json!({
                 "browserState": state.lifecycle.state().as_str(),
+                "launched": true,
+                "sessionRestore": platform::session_restore(&state.profile_dir).as_str(),
                 "results": urls.iter()
                     .map(|u| json!({ "url": u, "status": "requested" }))
                     .collect::<Vec<_>>(),
@@ -319,6 +321,11 @@ pub(super) async fn handle_ensure(
     }
     Ok(Some(json!({
         "browserState": state.lifecycle.state().as_str(),
+        // `false` means the browser was already up, which is what lets
+        // `tabd browser` warn about session restore once per browser start
+        // instead of on every link the human clicks.
+        "launched": false,
+        "sessionRestore": platform::session_restore(&state.profile_dir).as_str(),
         "results": results,
     })))
 }
