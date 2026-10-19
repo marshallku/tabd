@@ -32,6 +32,10 @@ pub(crate) enum ErrorCode {
     /// `daemon.*` and `browser.*` — the agent boundary from
     /// `docs/visual-mode-plan.md` §V2, enforced from V1.
     VisualModeUnsupported,
+    /// The action exists, but not on an attach daemon: its effect is
+    /// browser-wide (downloads, the profile's cookie jar) and cannot be
+    /// confined to the agent's own tabs.
+    AttachModeUnsupported,
     /// Another process already owns the browser profile.
     ProfileLocked,
     /// Anything not classified above.
@@ -51,6 +55,7 @@ impl ErrorCode {
             ErrorCode::OutputTooLarge => "output_too_large",
             ErrorCode::DaemonUnreachable => "daemon_unreachable",
             ErrorCode::VisualModeUnsupported => "visual_mode_unsupported",
+            ErrorCode::AttachModeUnsupported => "attach_mode_unsupported",
             ErrorCode::ProfileLocked => "profile_locked",
             ErrorCode::Internal => "internal",
         }
@@ -106,6 +111,8 @@ pub(crate) fn classify_error_code(message: &str) -> ErrorCode {
         ErrorCode::DaemonUnreachable
     } else if m.contains("is not available on a visual daemon") {
         ErrorCode::VisualModeUnsupported
+    } else if m.contains("is not available on an attach daemon") {
+        ErrorCode::AttachModeUnsupported
     } else if m.contains("already owns profile") {
         ErrorCode::ProfileLocked
     } else {

@@ -18,6 +18,16 @@ pub(super) async fn handle_navigate(
         .as_ref()
         .cloned()
         .ok_or_else(|| "cdp client not initialized".to_string())?;
+    // Attach mode has no bootstrap tab — the browser is the human's — so the
+    // first navigate (or one after the human closed the agent's tab) opens a
+    // tab in the agent window instead of failing.
+    if state.mode == DaemonMode::Attach && !client.has_active_tab().await {
+        let tid = client
+            .create_tab("about:blank")
+            .await
+            .map_err(|e| e.to_string())?;
+        client.set_active(&tid).await.map_err(|e| e.to_string())?;
+    }
     page::navigate_existing(&client, &url, 30_000)
         .await
         .map(|()| Some(json!({ "url": url })))

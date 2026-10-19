@@ -390,6 +390,8 @@ struct ParsedArgs {
     options: Map<String, Value>,
     json: bool,
     output: Option<String>,
+    /// `--attach`: drive the browser already open instead of the headless one.
+    attach: bool,
 }
 
 /// kebab-case → camelCase. Matches TS `camel()` helper.
@@ -455,6 +457,13 @@ fn parse_args(argv: &[String]) -> ParsedArgs {
         let a = &argv[i];
         if a == "--json" {
             p.json = true;
+            i += 1;
+            continue;
+        }
+        // Always bare: the generic `--flag value` rule would swallow the url
+        // in `tabd navigate --attach https://…`.
+        if a == "--attach" {
+            p.attach = true;
             i += 1;
             continue;
         }
@@ -943,9 +952,14 @@ pub(crate) fn dispatch_actions() -> Vec<&'static str> {
 /// synthesized error envelope so `render_result` stays the single rendering
 /// path (`--json` keeps emitting JSON even when the daemon is unreachable, and
 /// the exit code maps from `errorCode: "daemon_unreachable"`).
-async fn dispatch_action(base_dir: Option<&str>, action: &str, params: Value) -> Value {
+async fn dispatch_action(
+    base_dir: Option<&str>,
+    mode: daemon::DaemonMode,
+    action: &str,
+    params: Value,
+) -> Value {
     let result = async {
-        let paths = ensure_daemon(base_dir).await?;
+        let paths = ensure_daemon(base_dir, mode).await?;
         send_action(&paths.socket_path, action, params).await
     }
     .await;
@@ -984,11 +998,32 @@ async fn ping(socket_path: &Path) -> Result<()> {
         .map(|_| ())
 }
 
+/// `$TABD_ATTACH` set to anything but empty / `0` / `false`. Lets an agent's
+/// whole session target the attach daemon without `--attach` on every call.
+pub fn attach_from_env() -> bool {
+    std::env::var("TABD_ATTACH")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false"))
+        .unwrap_or(false)
+}
+
+/// Which daemon a driver command goes to: `--attach` / `$TABD_ATTACH` pick the
+/// attach daemon, otherwise the headless one, as always.
+fn driver_mode(parsed: &ParsedArgs) -> daemon::DaemonMode {
+    if parsed.attach || attach_from_env() {
+        daemon::DaemonMode::Attach
+    } else {
+        daemon::DaemonMode::Headless
+    }
+}
+
 /// Make sure a daemon is reachable at the given base_dir. If none is running
 /// and `TABD_NO_AUTO_SPAWN` is unset, spawn one in detached mode and poll
 /// until it's ready (or the deadline elapses).
-async fn ensure_daemon(base_dir: Option<&str>) -> Result<daemon::DaemonPaths> {
-    let paths = daemon::resolve_paths(base_dir)?;
+async fn ensure_daemon(
+    base_dir: Option<&str>,
+    mode: daemon::DaemonMode,
+) -> Result<daemon::DaemonPaths> {
+    let paths = daemon::resolve_paths_for(base_dir, mode)?;
 
     if ping(&paths.socket_path).await.is_ok() {
         return Ok(paths);
@@ -1006,6 +1041,9 @@ async fn ensure_daemon(base_dir: Option<&str>) -> Result<daemon::DaemonPaths> {
     let exe = std::env::current_exe().context("current_exe")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("daemon").arg("start");
+    if mode == daemon::DaemonMode::Attach {
+        cmd.arg("--attach");
+    }
     if let Some(b) = base_dir {
         cmd.arg("--base-dir").arg(b);
     }
@@ -1140,7 +1178,13 @@ pub async fn run(args: Vec<OsString>) -> Result<i32> {
         .and_then(|v| v.as_str().map(str::to_string));
 
     let params = Value::Object(parsed.options.clone());
-    let resp = dispatch_action(base_dir.as_deref(), spec.action, params).await;
+    let resp = dispatch_action(
+        base_dir.as_deref(),
+        driver_mode(&parsed),
+        spec.action,
+        params,
+    )
+    .await;
     render_result(&resp, &parsed).await
 }
 
@@ -1232,7 +1276,13 @@ async fn run_secret_put(args: &[String]) -> Result<i32> {
     if let Some(lbl) = label {
         params.insert("label".to_string(), Value::String(lbl));
     }
-    let resp = dispatch_action(base_dir.as_deref(), "secrets.put", Value::Object(params)).await;
+    let resp = dispatch_action(
+        base_dir.as_deref(),
+        driver_mode(&parsed),
+        "secrets.put",
+        Value::Object(params),
+    )
+    .await;
     render_result(&resp, &parsed).await
 }
 
@@ -1242,6 +1292,15 @@ async fn run_secret_put(args: &[String]) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn attach_flag_is_bare_and_never_swallows_a_positional() {
+        let p = parse_args(&args(&["--attach", "https://a.test/"]));
+        assert!(p.attach);
+        assert_eq!(p.positional, vec!["https://a.test/"]);
+        assert!(!p.options.contains_key("attach"));
+    }
+
     use super::*;
 
     fn args(v: &[&str]) -> Vec<String> {

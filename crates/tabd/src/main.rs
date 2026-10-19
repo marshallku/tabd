@@ -29,6 +29,13 @@ enum DaemonCmd {
         /// docs/visual-mode-plan.md.
         #[arg(long)]
         visual: bool,
+
+        /// Attach to the browser you already have open (Chrome 144+, with
+        /// chrome://inspect/#remote-debugging turned on) instead of launching
+        /// one. Agent tabs open in a window of their own; your tabs are never
+        /// listed or touched.
+        #[arg(long, conflicts_with = "visual")]
+        attach: bool,
     },
     /// Send daemon.shutdown to a running daemon.
     Stop {
@@ -37,6 +44,9 @@ enum DaemonCmd {
         /// Target the visual daemon rather than the headless one.
         #[arg(long)]
         visual: bool,
+        /// Target the attach daemon rather than the headless one.
+        #[arg(long, conflicts_with = "visual")]
+        attach: bool,
     },
     /// Send daemon.ping. Prints raw JSON response.
     Ping {
@@ -45,6 +55,9 @@ enum DaemonCmd {
         /// Target the visual daemon rather than the headless one.
         #[arg(long)]
         visual: bool,
+        /// Target the attach daemon rather than the headless one.
+        #[arg(long, conflicts_with = "visual")]
+        attach: bool,
     },
     /// Send daemon.health. Prints raw JSON response.
     Health {
@@ -53,6 +66,9 @@ enum DaemonCmd {
         /// Target the visual daemon rather than the headless one.
         #[arg(long)]
         visual: bool,
+        /// Target the attach daemon rather than the headless one.
+        #[arg(long, conflicts_with = "visual")]
+        attach: bool,
     },
 }
 
@@ -405,35 +421,69 @@ fn run_skill_cmd(cmd: SkillCmd) -> Result<()> {
 
 async fn run_daemon_cmd(cmd: DaemonCmd) -> Result<()> {
     match cmd {
-        DaemonCmd::Start { base_dir, visual } => {
-            let mode = if visual {
-                daemon::DaemonMode::Visual
-            } else {
-                daemon::DaemonMode::Headless
-            };
-            daemon::run_mode(base_dir.as_deref(), mode).await
+        DaemonCmd::Start {
+            base_dir,
+            visual,
+            attach,
+        } => daemon::run_mode(base_dir.as_deref(), daemon_mode(visual, attach)).await,
+        DaemonCmd::Stop {
+            base_dir,
+            visual,
+            attach,
+        } => {
+            print_control(
+                base_dir.as_deref(),
+                daemon_mode(visual, attach),
+                "daemon.shutdown",
+            )
+            .await
         }
-        DaemonCmd::Stop { base_dir, visual } => {
-            print_control(base_dir.as_deref(), visual, "daemon.shutdown").await
+        DaemonCmd::Ping {
+            base_dir,
+            visual,
+            attach,
+        } => {
+            print_control(
+                base_dir.as_deref(),
+                daemon_mode(visual, attach),
+                "daemon.ping",
+            )
+            .await
         }
-        DaemonCmd::Ping { base_dir, visual } => {
-            print_control(base_dir.as_deref(), visual, "daemon.ping").await
-        }
-        DaemonCmd::Health { base_dir, visual } => {
-            print_control(base_dir.as_deref(), visual, "daemon.health").await
+        DaemonCmd::Health {
+            base_dir,
+            visual,
+            attach,
+        } => {
+            print_control(
+                base_dir.as_deref(),
+                daemon_mode(visual, attach),
+                "daemon.health",
+            )
+            .await
         }
     }
 }
 
-async fn print_control(base_dir: Option<&str>, visual: bool, action: &str) -> Result<()> {
-    // `--visual` rather than making people spell out the visual base dir:
-    // there was no way to stop a visual daemon short of knowing that path,
-    // and it differs per platform and contains spaces on macOS.
-    let mode = if visual {
+/// `--visual` / `--attach` rather than making people spell out those base
+/// dirs: there was no way to stop a visual daemon short of knowing that path,
+/// and it differs per platform and contains spaces on macOS. `--attach` also
+/// follows `$TABD_ATTACH`, like the driver commands.
+fn daemon_mode(visual: bool, attach: bool) -> daemon::DaemonMode {
+    if visual {
         daemon::DaemonMode::Visual
+    } else if attach || cli::attach_from_env() {
+        daemon::DaemonMode::Attach
     } else {
         daemon::DaemonMode::Headless
-    };
+    }
+}
+
+async fn print_control(
+    base_dir: Option<&str>,
+    mode: daemon::DaemonMode,
+    action: &str,
+) -> Result<()> {
     let paths = daemon::resolve_paths_for(base_dir, mode)?;
     let resp = daemon::send_control_action(&paths.socket_path, action).await?;
     // Unwrap the bridge envelope: emit only the `data` payload (or the error

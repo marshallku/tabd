@@ -27,6 +27,7 @@ the daemon see [operations.md](operations.md).
 | `--out FILE` | For actions returning base64 data (`screenshot`), decode the bytes and write the file. Suppresses stdout payload. |
 | `--tab N` | Target tab by 1-based index. Most actions default to the active tab if omitted; a few require it (see [Tab semantics](#tab-semantics)). |
 | `--base-dir DIR` | Override `$TABD_BASE_DIR` for the socket/pid path. Useful for isolated daemons in CI. |
+| `--attach` | Send the action to the [attach daemon](#attach-mode) — the browser the user already has open — instead of the headless one. Same as `TABD_ATTACH=1`. Always a bare flag. |
 
 ### argv parsing
 
@@ -102,6 +103,7 @@ can branch without regex-matching the error prose. The exit code maps from it:
 | `vault_error` | 1 | Secrets vault locked / `TABD_VAULT_KEY` unset / unknown secret id |
 | `invalid_request` | 1 | Unknown action, malformed JSON, missing/invalid params → fix the call |
 | `output_too_large` | 1 | Non-string `eval` result exceeded `--max-chars` → narrow the expression or pass `--max-chars 0` |
+| `attach_mode_unsupported` | 1 | Browser-wide action refused on an attach daemon (`cookies-*`, `download-dir`, `downloads`, `wait-download`) → not available against the user's browser |
 | `internal` | 1 | Anything else |
 
 Exit `0` is success; exit `2` is reserved for client-side usage errors
@@ -166,6 +168,42 @@ tabd daemon health [--base-dir DIR]
 ```
 
 **Returns**: see [operations.md § Watching the daemon](operations.md#watching-the-daemon).
+An attach daemon adds `connected`, `endpoint` (the user-data-dir it found),
+`ownedTabs` and `notReadyReason`.
+
+All four take `--attach` to target the attach daemon (or `$TABD_ATTACH=1`).
+
+### Attach mode
+
+```bash
+tabd navigate https://example.com --attach      # or: export TABD_ATTACH=1
+```
+
+Drives the browser the user already has open instead of launching one.
+
+- **Enable once** in that browser: `chrome://inspect/#remote-debugging` →
+  "Allow remote debugging for this browser instance" (Chrome 144+). Chrome
+  then writes `<user-data-dir>/DevToolsActivePort`, and asks the user to
+  **Allow** each new connection.
+- **Lazy connect.** The daemon starts without connecting; the first driver
+  action connects and waits up to `$TABD_ATTACH_TIMEOUT_MS` (default 60000)
+  for the Allow click. A lost connection is not retried in the background —
+  the next action reconnects.
+- **Endpoint**: `$TABD_ATTACH_WS` (a loopback `ws://…/devtools/browser/…`) >
+  `$TABD_ATTACH_USER_DATA_DIR` > the first default user-data-dir (Chrome,
+  Chrome Beta/Canary, Chromium, Brave, Edge) whose `DevToolsActivePort`
+  answers. Stale files are skipped.
+- **Own tabs only.** `list-tabs`, `--tab N` and the active tab cover only tabs
+  this daemon opened and the tabs those open (popups, `target=_blank`), in
+  creation order. The user's tabs are never listed, attached or closed.
+- **Agent window.** The first tab opens a new window; later `open-tab`s are
+  placed beside an agent tab, so they stay in that window even when the user
+  clicked back into their own. `navigate` with no agent tab opens one.
+- **Refused** (`attach_mode_unsupported`): `cookies-get/set/delete`,
+  `download-dir`, `downloads`, `wait-download`. Storage/eval/navigation still
+  act on the real profile's origins — the user's sessions are live.
+- **`daemon stop --attach` only detaches.** The browser, the agent window and
+  its tabs stay open; a new connection does not own them.
 
 ---
 

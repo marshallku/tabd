@@ -237,6 +237,16 @@ pub struct TabRegistry {
     pub download_dir: Option<std::path::PathBuf>,
     /// Browser-global download history (newest last).
     pub downloads: Vec<DownloadEntry>,
+    /// `TabScope::Owned` only: every live target that belongs to us, attached
+    /// or not yet. Seeded by `create_tab` and grown by the reader as
+    /// `Target.targetCreated` reports a page whose opener is already here —
+    /// captured the moment the child appears, because by the next `list_tabs`
+    /// the opener may be gone and the link with it.
+    pub lineage: HashSet<String>,
+    /// `TabScope::Owned` only: `lineage` in the order each target became ours,
+    /// so `--tab N` stays put as tabs open. `Target.getTargets` lists newest
+    /// first, which would renumber every agent tab on each `open-tab`.
+    pub owned_order: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -349,6 +359,7 @@ impl Drop for PendingGuard {
 }
 
 pub struct CdpClient {
+    scope: TabScope,
     // Arc so the reader task shares the id space for its fire-and-forget
     // dialog responses (no collisions with dispatch()-issued ids).
     next_id: Arc<AtomicU64>,
@@ -378,6 +389,25 @@ struct InboundFrame {
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
 }
+
+/// Record `info` as ours when it is a page opened by a target we own (a
+/// `target=_blank` link the agent clicked, a popup its page raised). Pure, so
+/// the transitive rule is testable without a browser.
+/// Returns the adopted targetId.
+fn adopt_if_child(lineage: &mut HashSet<String>, info: &Value) -> Option<String> {
+    if info.get("type").and_then(Value::as_str) != Some("page") {
+        return None;
+    }
+    let opener = info.get("openerId").and_then(Value::as_str)?;
+    let tid = info.get("targetId").and_then(Value::as_str)?;
+    if !lineage.contains(opener) || !lineage.insert(tid.to_owned()) {
+        return None;
+    }
+    Some(tid.to_owned())
+}
+
+/// How long `create_tab` waits for the tab it asked an anchor to `window.open`.
+const WINDOW_OPEN_WAIT: Duration = Duration::from_secs(3);
 
 /// Current unix epoch in milliseconds (matches TS `Date.now()` field type).
 fn now_ms() -> u64 {
@@ -481,6 +511,21 @@ pub struct ConnectOptions {
     /// Create + attach an `about:blank` tab and seat it as active. True for
     /// headless (callers expect a tab to exist); false for visual.
     pub bootstrap_tab: bool,
+    /// Which page targets this client treats as its tabs.
+    pub scope: TabScope,
+}
+
+/// Which page targets a client lists and drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabScope {
+    /// Every page target in the browser — a throwaway headless browser has no
+    /// one else's tabs in it.
+    #[default]
+    All,
+    /// Only tabs this client opened, and the tabs those open in turn. Attach
+    /// mode: the browser is the human's, and their tabs are not ours to list,
+    /// index or close.
+    Owned,
 }
 
 /// One-shot "the transport ended" flag with a wakeup. Set by whichever reader
@@ -761,6 +806,33 @@ async fn route_frame(text: &str, ctx: &ReaderCtx) {
     let params = parsed.params.unwrap_or(Value::Null);
     let mut reg = ctx.registry.lock().await;
 
+    // Target discovery is only switched on for `TabScope::Owned`, so these
+    // never arrive on a headless client.
+    if method == "Target.targetCreated" {
+        if let Some(info) = params.get("targetInfo")
+            && let Some(tid) = adopt_if_child(&mut reg.lineage, info)
+        {
+            reg.owned_order.push(tid);
+        }
+        return;
+    }
+    if method == "Target.targetDestroyed" {
+        // Safe to forget: a child created before this point was already
+        // adopted from its own `targetCreated`, and nothing can name a
+        // destroyed target as its opener afterwards.
+        // The tab entry goes too, so a tab the human closed is not still
+        // "active" until the next `list_tabs` reconciles it.
+        if let Some(tid) = params.get("targetId").and_then(Value::as_str) {
+            reg.lineage.remove(tid);
+            reg.owned_order.retain(|t| t != tid);
+            reg.tabs.remove(tid);
+            if reg.active.as_deref() == Some(tid) {
+                reg.active = None;
+            }
+        }
+        return;
+    }
+
     // Browser-level download events carry NO sessionId and are
     // browser-global — handle them against the registry store
     // before the per-tab sessionId gate below.
@@ -1034,6 +1106,7 @@ impl CdpClient {
         Self::connect_with(ConnectOptions {
             transport: Transport::WebSocket(ws_url.to_owned()),
             bootstrap_tab: true,
+            scope: TabScope::All,
         })
         .await
     }
@@ -1045,6 +1118,7 @@ impl CdpClient {
         let ConnectOptions {
             transport,
             bootstrap_tab,
+            scope,
         } = opts;
 
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -1065,6 +1139,7 @@ impl CdpClient {
         let tasks = spawn_transport_tasks(transport, out_rx, ctx).await?;
 
         let client = CdpClient {
+            scope,
             next_id,
             out_tx: Mutex::new(Some(out_tx)),
             pending,
@@ -1129,6 +1204,19 @@ impl CdpClient {
         self.send("Runtime.enable", json!({})).await?;
         self.send("Network.enable", json!({})).await?;
         Ok(())
+    }
+
+    /// Switch on `Target.targetCreated` / `targetDestroyed`. `TabScope::Owned`
+    /// learns about the tabs its tabs open from these, so this has to run
+    /// before the first tab is created.
+    pub async fn enable_target_discovery(&self) -> Result<()> {
+        self.dispatch(
+            "Target.setDiscoverTargets",
+            json!({ "discover": true }),
+            ResolvedTarget::Root,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Resolves once the transport has ended — the browser closed its end of
@@ -1212,6 +1300,9 @@ impl CdpClient {
     /// the tab. Does NOT switch `active` — caller decides (3c open-tab spec
     /// sets active=true by default but other callers may differ).
     pub async fn create_tab(&self, url: &str) -> Result<String> {
+        if self.scope == TabScope::Owned {
+            return self.create_owned_tab(url).await;
+        }
         let target = self
             .dispatch(
                 "Target.createTarget",
@@ -1224,7 +1315,12 @@ impl CdpClient {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("Target.createTarget missing targetId"))?
             .to_owned();
+        self.attach_tab(&target_id).await?;
+        Ok(target_id)
+    }
 
+    /// Flatten-attach an existing page target, register it, enable domains.
+    async fn attach_tab(&self, target_id: &str) -> Result<()> {
         let attach = self
             .dispatch(
                 "Target.attachToTarget",
@@ -1242,16 +1338,130 @@ impl CdpClient {
         {
             let mut reg = self.registry.lock().await;
             reg.tabs
-                .insert(target_id.clone(), TabState::new(session_id));
+                .insert(target_id.to_owned(), TabState::new(session_id));
         }
 
-        self.send_to(&target_id, "Page.enable", json!({})).await?;
-        self.send_to(&target_id, "Runtime.enable", json!({}))
-            .await?;
-        self.send_to(&target_id, "Network.enable", json!({}))
-            .await?;
+        self.send_to(target_id, "Page.enable", json!({})).await?;
+        self.send_to(target_id, "Runtime.enable", json!({})).await?;
+        self.send_to(target_id, "Network.enable", json!({})).await?;
+        Ok(())
+    }
 
+    /// `TabScope::Owned` tab creation: every agent tab lands in one window of
+    /// its own, apart from the human's.
+    ///
+    /// A plain `Target.createTarget` opens in whichever window was last
+    /// active — the human's, as soon as they click back into it (measured,
+    /// Chrome 155). So the first tab gets a new window, and later ones are
+    /// `window.open`ed from a tab already in it, which Chrome places beside
+    /// the opener. The target is created blank and attached **before** it is
+    /// navigated, so its first request is already observed.
+    async fn create_owned_tab(&self, url: &str) -> Result<String> {
+        let opened = match self.anchor_tab().await {
+            Some(anchor) => self.open_beside(&anchor).await.ok().flatten(),
+            None => None,
+        };
+        let target_id = match opened {
+            Some(tid) => tid,
+            None => {
+                let target = self
+                    .dispatch(
+                        "Target.createTarget",
+                        json!({ "url": "about:blank", "newWindow": true }),
+                        ResolvedTarget::Root,
+                    )
+                    .await?;
+                target
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("Target.createTarget missing targetId"))?
+                    .to_owned()
+            }
+        };
+        {
+            let mut reg = self.registry.lock().await;
+            // The marker tab was already adopted from its `targetCreated` (its
+            // opener is ours); a new-window tab was not.
+            if reg.lineage.insert(target_id.clone()) {
+                reg.owned_order.push(target_id.clone());
+            }
+        }
+        self.attach_tab(&target_id).await?;
+        if !url.is_empty() && url != "about:blank" {
+            self.send_to(&target_id, "Page.navigate", json!({ "url": url }))
+                .await?;
+        }
         Ok(target_id)
+    }
+
+    /// The owned tab new tabs are opened beside: the active one if any.
+    async fn anchor_tab(&self) -> Option<String> {
+        let reg = self.registry.lock().await;
+        reg.active
+            .clone()
+            .filter(|tid| reg.tabs.contains_key(tid))
+            .or_else(|| reg.tabs.keys().next().cloned())
+    }
+
+    /// `window.open` a blank tab from `anchor` and return its targetId, or
+    /// `None` if it never showed up.
+    ///
+    /// The anchor runs a page we do not control, so two things are guarded:
+    /// the call goes through an isolated world (the page cannot have replaced
+    /// `window.open` there), and the new tab is recognised by a random marker
+    /// url that only this call knows — not by "some new child of the anchor",
+    /// which the page could race.
+    async fn open_beside(&self, anchor: &str) -> Result<Option<String>> {
+        let marker = format!("about:blank#tabd-{:016x}", rand::random::<u64>());
+        // For a page target the main frame id is the target id.
+        let world = self
+            .send_to(
+                anchor,
+                "Page.createIsolatedWorld",
+                json!({ "frameId": anchor, "worldName": "tabd-opener" }),
+            )
+            .await?;
+        let context_id = world
+            .get("executionContextId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("Page.createIsolatedWorld missing executionContextId"))?;
+        let marker_lit = serde_json::to_string(&marker)?;
+        self.send_to(
+            anchor,
+            "Runtime.evaluate",
+            json!({
+                "expression": format!("window.open({marker_lit}, '_blank', 'noopener'); 0"),
+                "contextId": context_id,
+                "userGesture": true,
+                "returnByValue": true,
+            }),
+        )
+        .await?;
+
+        let deadline = tokio::time::Instant::now() + WINDOW_OPEN_WAIT;
+        loop {
+            let response = self
+                .dispatch("Target.getTargets", json!({}), ResolvedTarget::Root)
+                .await?;
+            let found = response
+                .get("targetInfos")
+                .and_then(Value::as_array)
+                .and_then(|infos| {
+                    infos.iter().find(|info| {
+                        info.get("type").and_then(Value::as_str) == Some("page")
+                            && info.get("url").and_then(Value::as_str) == Some(marker.as_str())
+                    })
+                })
+                .and_then(|info| info.get("targetId").and_then(Value::as_str))
+                .map(str::to_owned);
+            if found.is_some() {
+                return Ok(found);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Close a tab. Best-effort CDP closeTarget; registry is cleaned up
@@ -1321,6 +1531,9 @@ impl CdpClient {
             reg.reconcile(&fresh_ids);
             reg.active.clone()
         };
+        if self.scope == TabScope::Owned {
+            fresh = self.owned_only(fresh).await;
+        }
         let active_id = active.as_deref();
 
         Ok(fresh
@@ -1335,6 +1548,57 @@ impl CdpClient {
                 }
             })
             .collect())
+    }
+
+    /// Narrow a `Target.getTargets` page list to the tabs we own, attaching
+    /// any child the reader adopted but nothing has attached yet. A child that
+    /// fails to attach (it closed in between) is simply not listed.
+    async fn owned_only(
+        &self,
+        fresh: Vec<(String, String, String)>,
+    ) -> Vec<(String, String, String)> {
+        let unattached: Vec<String> = {
+            let reg = self.registry.lock().await;
+            fresh
+                .iter()
+                .map(|(tid, _, _)| tid)
+                .filter(|tid| reg.lineage.contains(*tid) && !reg.tabs.contains_key(*tid))
+                .cloned()
+                .collect()
+        };
+        for tid in unattached {
+            if self.attach_tab(&tid).await.is_err() {
+                self.registry.lock().await.tabs.remove(&tid);
+            }
+        }
+        let mut reg = self.registry.lock().await;
+        let TabRegistry {
+            tabs,
+            owned_order,
+            lineage,
+            ..
+        } = &mut *reg;
+        owned_order.retain(|tid| lineage.contains(tid));
+        let mut owned: Vec<_> = fresh
+            .into_iter()
+            .filter(|(tid, _, _)| tabs.contains_key(tid))
+            .collect();
+        owned.sort_by_key(|(tid, _, _)| owned_order.iter().position(|o| o == tid));
+        owned
+    }
+
+    /// Whether the active tab is still a live, attached one — attach mode
+    /// opens a tab on `navigate` instead of failing when it is not.
+    pub async fn has_active_tab(&self) -> bool {
+        let reg = self.registry.lock().await;
+        reg.active
+            .as_ref()
+            .is_some_and(|tid| reg.tabs.contains_key(tid))
+    }
+
+    /// Number of attached tabs (attach-mode health).
+    pub async fn tab_count(&self) -> usize {
+        self.registry.lock().await.tabs.len()
     }
 
     /// Run a closure with shared access to one tab's state — used by monitor
@@ -1479,6 +1743,33 @@ fn build_frame(id: u64, method: &str, params: Value, session_id: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn children_of_owned_tabs_are_adopted_transitively() {
+        let mut lineage: HashSet<String> = ["agent".to_owned()].into_iter().collect();
+        let page = |tid: &str, opener: Option<&str>| {
+            let mut info = json!({ "type": "page", "targetId": tid });
+            if let Some(o) = opener {
+                info["openerId"] = json!(o);
+            }
+            info
+        };
+        // A link the agent opened in a new tab, and one that tab opened.
+        adopt_if_child(&mut lineage, &page("child", Some("agent")));
+        adopt_if_child(&mut lineage, &page("grandchild", Some("child")));
+        // The human's own tabs: no opener, or an opener that is not ours.
+        adopt_if_child(&mut lineage, &page("human", None));
+        adopt_if_child(&mut lineage, &page("human-popup", Some("human")));
+        // Not a page (a worker the agent's page started).
+        adopt_if_child(
+            &mut lineage,
+            &json!({ "type": "service_worker", "targetId": "sw", "openerId": "agent" }),
+        );
+        let mut got: Vec<_> = lineage.into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec!["agent", "child", "grandchild"]);
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -1872,6 +2163,7 @@ mod tests {
         let client = CdpClient::connect_with(ConnectOptions {
             transport: browser.take_transport().expect("pipe transport"),
             bootstrap_tab: false,
+            scope: TabScope::All,
         })
         .await
         .expect("cdp connect over pipe");
@@ -1942,6 +2234,7 @@ mod tests {
         let client = CdpClient::connect_with(ConnectOptions {
             transport: browser.take_transport().expect("transport"),
             bootstrap_tab: true,
+            scope: TabScope::All,
         })
         .await
         .expect("cdp connect");
@@ -1990,6 +2283,7 @@ mod tests {
         let client = CdpClient::connect_with(ConnectOptions {
             transport: browser.take_transport().expect("transport"),
             bootstrap_tab: true,
+            scope: TabScope::All,
         })
         .await
         .expect("cdp connect");

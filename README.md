@@ -65,6 +65,7 @@ afterwards so it reloads skill metadata.
 | **Downloads** | `download-dir` (opt-in capture → known dir), `wait-download` |
 | **Secrets** | `secret-put`, `secret-list`, `secret-delete`, `type-secret` |
 | **Daemon** | `daemon start`, `daemon stop`, `daemon ping`, `daemon health` |
+| **Attach** | `--attach` on any action / `TABD_ATTACH=1` — drive the browser you already have open, see [Attach mode](#attach-mode) |
 | **Visual (owner)** | `browser`, `service install/uninstall/status`, `profile import/cutover/discard` — see [Visual mode](#visual-mode) |
 
 Every action that targets a specific tab accepts `--tab N` (1-based index).
@@ -106,11 +107,57 @@ tabd wait-url 'https://github.com/*' --pattern-type glob
 tabd daemon stop
 ```
 
+## Attach mode
+
+Everything above drives a **throwaway headless Chromium**. Attach mode drives
+**the browser you already have open** — your profile, your logins, your
+extensions, no second copy of any of them — and lets an agent work in it the
+way Claude in Chrome does: it opens its own tabs and works there.
+
+**Turn it on once**, in that browser (Chrome 144+):
+`chrome://inspect/#remote-debugging` → *Allow remote debugging for this browser
+instance*. Then:
+
+```bash
+export TABD_ATTACH=1          # or pass --attach to each command
+tabd navigate https://github.com/notifications   # Chrome asks you to Allow, once per connection
+tabd get-text --selector main
+tabd open-tab https://example.com
+tabd daemon stop --attach     # detaches; your browser and tabs stay as they are
+```
+
+What the agent can and cannot reach:
+
+- **Its own window.** The first agent tab opens a new window; every later one
+  is placed in that same window, even after you click back into yours. Your
+  windows are never the target.
+- **Its own tabs only.** `list-tabs`, `--tab N` and the active tab cover only
+  tabs tabd opened and the tabs those open. Your tabs are never listed,
+  attached, or closed.
+- **Refused:** `cookies-*`, `download-dir`, `downloads`, `wait-download` — they
+  reach the whole profile, not a tab (`attach_mode_unsupported`).
+- **Not sandboxed from your accounts.** Pages it opens run with your real
+  sessions, and `eval`/`storage-*` act on those origins. Point it only at work
+  you would let it do.
+
+Chrome shows *"controlled by automated test software"* while tabd is attached.
+The browser is found through its `DevToolsActivePort`: `$TABD_ATTACH_WS`
+(loopback ws url) > `$TABD_ATTACH_USER_DATA_DIR` > the default Chrome, Chrome
+Beta/Canary, Chromium, Brave and Edge dirs, skipping stale files. The first
+action waits up to `$TABD_ATTACH_TIMEOUT_MS` (60 s) for you to click Allow.
+
+There is no real tab group: tab groups exist only in the extension API, not in
+the DevTools protocol, so the agent gets a window instead.
+
 ## Visual mode
 
-Everything above drives a **throwaway headless Chromium**. Visual mode is the
-other thing tabd can do: drive **your everyday browser** — your real profile,
-your logins, your extensions — over a pipe no other process can reach, so you
+> **Prefer [attach mode](#attach-mode)** unless you specifically want an
+> isolated, pipe-only browser. Visual mode runs a *second* browser on its own
+> profile, which means two browsers side by side and a copied profile that
+> drifts from the original.
+
+Visual mode is the other way tabd can drive a headed browser: it launches a
+browser on a tabd-owned profile over a pipe no other process can reach, so you
 can click a link and have it open there.
 
 It is owner-only today. A visual daemon serves `daemon.*` and `browser.*` and

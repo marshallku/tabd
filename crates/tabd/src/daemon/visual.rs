@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::browser::{LaunchSpec, VisualSpec};
-use crate::cdp::{CdpClient, ConnectOptions};
+use crate::cdp::{CdpClient, ConnectOptions, TabScope};
 use crate::platform;
 
 /// How long the post-connect CDP handshake may take. This is what catches a
@@ -427,6 +427,7 @@ async fn launch_inner(
         CdpClient::connect_with(ConnectOptions {
             transport,
             bootstrap_tab: false,
+            scope: TabScope::All,
         })
         .await?,
     );

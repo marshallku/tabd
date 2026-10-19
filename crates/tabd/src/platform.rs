@@ -46,6 +46,49 @@ pub fn visual_base_dir() -> Result<PathBuf> {
     }
 }
 
+/// Where the attach daemon keeps its state. A sibling of the visual tree, not
+/// inside it: the two are different daemons and coexist.
+pub fn attach_base_dir() -> Result<PathBuf> {
+    let visual = visual_base_dir()?;
+    Ok(visual.with_file_name("attach"))
+}
+
+/// The user-data-dirs attach mode looks in for a `DevToolsActivePort`, most
+/// likely first. Stable Chrome leads because that is the browser the
+/// `chrome://inspect/#remote-debugging` toggle was built for.
+pub fn attach_candidate_dirs() -> Result<Vec<PathBuf>> {
+    #[cfg(target_os = "macos")]
+    {
+        let root = home()?.join("Library/Application Support");
+        Ok([
+            "Google/Chrome",
+            "Google/Chrome Beta",
+            "Google/Chrome Canary",
+            "Chromium",
+            "BraveSoftware/Brave-Browser",
+            "Microsoft Edge",
+        ]
+        .iter()
+        .map(|d| root.join(d))
+        .collect())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let root = env_dir_or("XDG_CONFIG_HOME", ".config")?;
+        Ok([
+            "google-chrome",
+            "google-chrome-beta",
+            "google-chrome-unstable",
+            "chromium",
+            "BraveSoftware/Brave-Browser",
+            "microsoft-edge",
+        ]
+        .iter()
+        .map(|d| root.join(d))
+        .collect())
+    }
+}
+
 /// The `--user-data-dir` visual mode drives. `$TABD_VISUAL_PROFILE_DIR`
 /// overrides it; tests need that, and so does anyone keeping the profile on
 /// another disk.

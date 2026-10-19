@@ -18,7 +18,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 
 use crate::browser::{Browser, LaunchSpec};
-use crate::cdp::{CdpClient, ConnectOptions};
+use crate::cdp::{CdpClient, ConnectOptions, TabScope};
 use crate::cmd::page;
 use crate::platform;
 use platform::ProfileLock;
@@ -26,6 +26,7 @@ use visual::Lifecycle;
 
 // Domain handler submodules. Each accesses shared state/helpers via `use
 // super::*` and exposes its handlers as `pub(super)` for process_request.
+mod attach;
 mod capture;
 mod dom;
 mod emulation;
@@ -57,6 +58,10 @@ pub enum DaemonMode {
     /// The human's everyday browser: permanent profile, CDP over the debugging
     /// pipe, never restarted.
     Visual,
+    /// The browser the human already has open, reached through its
+    /// `DevToolsActivePort`. Never launched or closed by tabd; only the tabs
+    /// tabd opens are visible to it.
+    Attach,
 }
 
 impl DaemonMode {
@@ -64,12 +69,9 @@ impl DaemonMode {
         match self {
             DaemonMode::Headless => "headless",
             DaemonMode::Visual => "visual",
+            DaemonMode::Attach => "attach",
         }
     }
-}
-
-pub fn resolve_paths(override_base: Option<&str>) -> Result<DaemonPaths> {
-    resolve_paths_for(override_base, DaemonMode::Headless)
 }
 
 pub fn resolve_paths_for(override_base: Option<&str>, mode: DaemonMode) -> Result<DaemonPaths> {
@@ -81,6 +83,8 @@ pub fn resolve_paths_for(override_base: Option<&str>, mode: DaemonMode) -> Resul
         // Not `$XDG_RUNTIME_DIR`: a visual daemon is tied to the graphical
         // session's lifetime, and its log is worth keeping across a reboot.
         platform::visual_base_dir()?
+    } else if mode == DaemonMode::Attach {
+        platform::attach_base_dir()?
     } else if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(d).join("tabd")
     } else {
@@ -194,6 +198,8 @@ struct DaemonState {
     base_dir: Arc<PathBuf>,
     /// Visual browser state machine. Idle in headless mode.
     lifecycle: Arc<Lifecycle>,
+    /// Attach-mode connection gate. Idle in the other modes.
+    attach: Arc<attach::AttachState>,
     /// Held for as long as this daemon owns the visual profile.
     profile_lock: Arc<Mutex<Option<ProfileLock>>>,
     /// Why `ready` is false, when we know. `browser_closed` is the normal one
@@ -241,6 +247,7 @@ impl DaemonState {
             profile_dir: Arc::new(profile_dir),
             base_dir: Arc::new(base_dir),
             lifecycle: Arc::new(Lifecycle::default()),
+            attach: Arc::new(attach::AttachState::default()),
             profile_lock: Arc::new(Mutex::new(None)),
             not_ready_reason: Arc::new(Mutex::new(None)),
         }
@@ -336,6 +343,9 @@ impl DaemonState {
             // closes the browser. tabd cannot turn the pref on (Chromium MACs
             // it), so it reports, and `tabd browser` warns.
             body["sessionRestore"] = json!(platform::session_restore(&self.profile_dir).as_str());
+        }
+        if self.mode == DaemonMode::Attach {
+            attach::health_fields(self, &mut body).await;
         }
         success_response(id, body)
     }
@@ -792,14 +802,30 @@ async fn process_request(state: &DaemonState, line: &str) -> String {
         };
     }
 
-    // Driver actions: admit gate → wait_ready → action_mutex → handler.
+    // Attach mode serves the driver surface minus what is browser-wide.
+    // Refused before admission: a refusal costs nothing and should not raise
+    // the browser's connection prompt.
+    if state.mode == DaemonMode::Attach
+        && let Some(message) = attach::refusal(&req.action)
+    {
+        return error_response(&req.id, &message);
+    }
+
+    // Driver actions: admit gate → ready (attach: connect) → action_mutex → handler.
     let _guard = match state.try_admit() {
         Some(g) => g,
         None => {
             return error_response(&req.id, "daemon is shutting down (drain in progress)");
         }
     };
-    state.wait_ready().await;
+    if state.mode == DaemonMode::Attach {
+        if let Err(message) = attach::ensure_connected(state).await {
+            state.record_failure(&req.action, &message).await;
+            return error_response(&req.id, &message);
+        }
+    } else {
+        state.wait_ready().await;
+    }
     // Held for the entire handler, including polling sleeps inside waits. This is
     // a deliberate choice for linear, predictable action semantics (no action
     // interleaving into a tab another is mid-wait on); the long-wait worst case
@@ -1002,7 +1028,7 @@ pub async fn run_mode(override_base: Option<&str>, mode: DaemonMode) -> Result<(
 
     let profile_dir = match mode {
         DaemonMode::Visual => platform::visual_profile_dir()?,
-        DaemonMode::Headless => PathBuf::new(),
+        DaemonMode::Headless | DaemonMode::Attach => PathBuf::new(),
     };
     let state = DaemonState::with_mode(mode, profile_dir, paths.base_dir.clone());
     let boot_state = state.clone();
@@ -1015,6 +1041,10 @@ pub async fn run_mode(override_base: Option<&str>, mode: DaemonMode) -> Result<(
             // `tabd browser` works whether or not a browser is already there,
             // and a browser the human closed does not take the daemon with it.
             DaemonMode::Visual => write_pid_file(&boot_paths),
+            // Attach connects on the first driver action, not at boot: the
+            // connection raises a prompt in the human's browser, which should
+            // follow something the human asked for.
+            DaemonMode::Attach => write_pid_file(&boot_paths),
         };
         match booted {
             Ok(()) => {
@@ -1081,6 +1111,8 @@ pub async fn run_mode(override_base: Option<&str>, mode: DaemonMode) -> Result<(
     // live client, so the client cannot be torn down first.
     if state.mode == DaemonMode::Visual {
         visual::shutdown(&state).await;
+    } else if state.mode == DaemonMode::Attach {
+        attach::shutdown(&state).await;
     } else {
         if let Some(client) = state.client.lock().await.take() {
             let _ = client.close().await;
@@ -1100,6 +1132,7 @@ async fn boot_browser_and_cdp(state: &DaemonState, paths: &DaemonPaths) -> Resul
     let client = CdpClient::connect_with(ConnectOptions {
         transport,
         bootstrap_tab: true,
+        scope: TabScope::All,
     })
     .await?;
     write_pid_file(paths)?;
@@ -1253,6 +1286,40 @@ mod tests {
             PathBuf::from("/nonexistent/tabd-test-profile"),
             PathBuf::from("/nonexistent/tabd-test-base"),
         )
+    }
+
+    #[tokio::test]
+    async fn attach_daemon_refuses_browser_global_actions_without_connecting() {
+        // A refusal must not reach `ensure_connected`: nothing is listening
+        // here, so a connect attempt would surface as an attach error instead.
+        let state = DaemonState::with_mode(
+            DaemonMode::Attach,
+            PathBuf::new(),
+            PathBuf::from("/nonexistent/tabd-test-base"),
+        );
+        for action in ["cookies.get", "browser.setDownloadDir", "wait.download"] {
+            let line = json!({ "id": "t", "action": action }).to_string();
+            let resp: Value = serde_json::from_str(&process_request(&state, &line).await).unwrap();
+            assert_eq!(resp["success"], json!(false), "{action} was served");
+            assert_eq!(
+                resp["errorCode"],
+                json!("attach_mode_unsupported"),
+                "{resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_paths_are_separate_from_the_other_modes() {
+        if std::env::var_os("TABD_BASE_DIR").is_some() {
+            return; // an explicit base dir is shared by design
+        }
+        let attach = resolve_paths_for(None, DaemonMode::Attach).unwrap();
+        for other in [DaemonMode::Headless, DaemonMode::Visual] {
+            let other = resolve_paths_for(None, other).unwrap();
+            assert_ne!(attach.base_dir, other.base_dir);
+            assert_ne!(attach.socket_path, other.socket_path);
+        }
     }
 
     #[tokio::test]
@@ -1438,7 +1505,7 @@ mod tests {
 
     #[test]
     fn resolve_paths_override_wins() {
-        let p = resolve_paths(Some("/tmp/test-base")).unwrap();
+        let p = resolve_paths_for(Some("/tmp/test-base"), DaemonMode::Headless).unwrap();
         assert_eq!(p.base_dir, PathBuf::from("/tmp/test-base"));
         assert_eq!(p.socket_path, PathBuf::from("/tmp/test-base/daemon.sock"));
         assert_eq!(p.pid_path, PathBuf::from("/tmp/test-base/daemon.pid"));

@@ -1,6 +1,6 @@
 ---
 name: tabd
-description: 헤드리스 브라우저(tabd)로 웹 페이지 자동화. 사용자가 "이 사이트의 데이터", "로그인", "스크래핑", "API 응답 캡쳐", "스크린샷", "쿠키", "form 자동 채우기", "페이지 모니터링" 같은 작업을 요청하거나 chromium이 필요한 모든 상황에서 사용. SSH 친화적 단일 Rust binary, daemon-shared chromium.
+description: 헤드리스 브라우저(tabd)로 웹 페이지 자동화. 사용자가 "이 사이트의 데이터", "로그인", "스크래핑", "API 응답 캡쳐", "스크린샷", "쿠키", "form 자동 채우기", "페이지 모니터링" 같은 작업을 요청하거나 chromium이 필요한 모든 상황에서 사용. 사용자가 "내 Chrome에서/내 계정으로" 작업을 원하면 --attach로 사용자가 띄운 Chrome에 붙는다. SSH 친화적 단일 Rust binary, daemon-shared chromium.
 user-invocable: false
 allowed-tools: Bash, Read
 effort: low
@@ -130,6 +130,24 @@ trap 'tabd daemon stop --base-dir "$BASE" 2>/dev/null; rm -rf "$BASE"' EXIT
 ```
 
 세부 패턴은 cookbook §6.
+
+## 사용자의 Chrome에서 작업 (attach mode)
+
+사용자가 "내 브라우저에서", "로그인돼 있는 내 계정으로" 처럼 **이미 띄워둔 Chrome**에서 작업하길 원하면 `--attach` (또는 `TABD_ATTACH=1`):
+
+```bash
+export TABD_ATTACH=1                       # 이 세션의 모든 tabd 호출이 attach daemon으로
+tabd navigate https://github.com/notifications   # 사용자 Chrome에 에이전트 전용 창이 열림
+tabd get-text --selector main
+tabd open-tab https://mail.google.com      # 같은 에이전트 창에 탭 추가
+```
+
+- 전제: 사용자가 Chrome 144+에서 `chrome://inspect/#remote-debugging` → "Allow remote debugging for this browser instance" 를 켜 둠. 첫 연결 때 Chrome이 **Allow 대화상자**를 띄우므로 사용자에게 "Chrome에서 Allow 눌러주세요"라고 알릴 것 (최대 60s 대기, `TABD_ATTACH_TIMEOUT_MS`).
+- 에이전트는 **자기가 연 탭(+그 탭이 연 팝업)만** 본다. `list-tabs`·`--tab N` 에 사용자 탭은 안 나옴. 사용자 탭을 쓰고 싶으면 그 URL을 `navigate` 로 새로 열 것.
+- 거부되는 액션 (`attach_mode_unsupported`, exit 1): `cookies-*`, `download-dir`, `downloads`, `wait-download` — 실제 프로필 전체에 영향.
+- 실제 계정으로 동작한다. 메일 발송·결제·삭제 같은 되돌릴 수 없는 행동은 실행 전에 사용자 확인.
+- `tabd daemon stop --attach` 는 연결만 끊음 (Chrome·탭 유지). 재연결하면 이전 탭은 더 이상 에이전트 소유가 아님.
+- 에러 "no running browser to attach to" → 사용자에게 위 토글을 켜달라고 요청.
 
 ## 출력 다루기
 
