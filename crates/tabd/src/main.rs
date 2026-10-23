@@ -232,7 +232,7 @@ enum SkillCmd {
 
 fn main() -> ExitCode {
     quiet_broken_pipe();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(hoist_leading_attach(std::env::args_os().collect()));
 
     // Runtime sizing by command. Every path is IO-bound (the heavy lifting is
     // in Chromium, reached over a socket), so worker threads buy little:
@@ -336,6 +336,22 @@ fn main() -> ExitCode {
 /// daemon outright rather than producing the `EPIPE` the transport is written
 /// to handle. So the signal disposition is left alone and only the specific
 /// panic is intercepted.
+/// `tabd --attach navigate …` reads as naturally as `tabd navigate … --attach`,
+/// but clap only knows `--attach` on the subcommands. Move leading copies to
+/// the end, where both the daemon subcommands and the driver parser accept it.
+fn hoist_leading_attach(mut args: Vec<OsString>) -> Vec<OsString> {
+    let leading = args
+        .iter()
+        .skip(1)
+        .take_while(|a| a.as_os_str() == "--attach")
+        .count();
+    if leading > 0 && leading + 1 < args.len() {
+        args.drain(1..=leading);
+        args.push("--attach".into());
+    }
+    args
+}
+
 fn quiet_broken_pipe() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -503,4 +519,32 @@ async fn print_control(
     let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
     println!("{}", serde_json::to_string(&data)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn leading_attach_moves_after_the_command() {
+        assert_eq!(
+            hoist_leading_attach(os(&["tabd", "--attach", "navigate", "https://a.test/"])),
+            os(&["tabd", "navigate", "https://a.test/", "--attach"])
+        );
+        assert_eq!(
+            hoist_leading_attach(os(&["tabd", "--attach", "daemon", "stop"])),
+            os(&["tabd", "daemon", "stop", "--attach"])
+        );
+        // Already trailing, or nothing after it: left for the parsers as-is.
+        let trailing = os(&["tabd", "navigate", "https://a.test/", "--attach"]);
+        assert_eq!(hoist_leading_attach(trailing.clone()), trailing);
+        assert_eq!(
+            hoist_leading_attach(os(&["tabd", "--attach"])),
+            os(&["tabd", "--attach"])
+        );
+    }
 }
